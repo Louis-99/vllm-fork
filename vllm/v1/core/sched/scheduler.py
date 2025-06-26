@@ -202,6 +202,8 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        has_prefill_sched = False
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -229,6 +231,9 @@ class Scheduler(SchedulerInterface):
                  new_encoder_budget) = self._try_schedule_encoder_inputs(
                      request, request.num_computed_tokens, num_new_tokens,
                      encoder_budget)
+                
+            if num_new_tokens > 1:
+                has_prefill_sched = True
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -335,7 +340,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
-            while self.waiting and token_budget > 0:
+            while self.waiting and token_budget > 0 and not has_prefill_sched:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -480,6 +485,7 @@ class Scheduler(SchedulerInterface):
                         req_index)
                 req_index += 1
                 self.running.append(request)
+                has_prefill_sched = True
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
