@@ -1458,21 +1458,23 @@ class LLMEngine:
         metrics = {}
         metrics['step_time_ns'] = int(step_end_time - step_start_time)
         metrics['num_tokens'] = int(scheduler_outputs.num_batched_tokens)
-        metrics['num_prefill'] = int(scheduler_outputs.num_prefill_groups)
-        metrics['num_request'] = int(scheduler_outputs.running_queue_size)
-        ctx_prefill = 0
+        ctx_prefill = []
         ctx_decode = 0
-        num_prefill_token = 0
+        num_prefill = []
+        num_decode = 0
         for seq_group in scheduler_outputs.scheduled_seq_groups:
             seq = seq_group.seq_group.seqs[0]
             if seq_group.seq_group.is_prefill():
-                num_prefill_token += seq_group.token_chunk_size
-                ctx_prefill += seq.data.get_num_computed_tokens()
+                num_prefill.append(seq_group.token_chunk_size)
+                ctx_prefill.append(seq.data.get_num_computed_tokens())
             else:
                 ctx_decode += seq.data.get_num_computed_tokens()
+                num_decode += 1
         metrics['ctx_prefill'] = ctx_prefill
         metrics['ctx_decode'] = ctx_decode
-        metrics['num_prefill_tokens'] = num_prefill_token
+        metrics['num_prefill'] = num_prefill
+        metrics['num_request'] = num_decode
+
 
         metric_logger.info(json.dumps(metrics))
 

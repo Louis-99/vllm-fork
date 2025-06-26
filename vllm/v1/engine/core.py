@@ -245,9 +245,9 @@ class EngineCore:
         step_end_time_ns = time.perf_counter_ns()
         
         num_decode = 0
-        num_prefill = 0
+        num_prefill = []
         ctx_decode = 0
-        ctx_prefill = 0
+        ctx_prefill = []
         for req in itertools.chain(
             scheduler_output.scheduled_new_reqs, 
             scheduler_output.scheduled_cached_reqs):
@@ -257,13 +257,13 @@ class EngineCore:
                 num_decode += 1
                 ctx_decode += num_ctx_tokens
             elif num_new_tokens > 1:
-                num_prefill += 1
-                ctx_prefill += num_ctx_tokens
+                num_prefill.append(num_new_tokens)
+                ctx_prefill.append(num_ctx_tokens)
 
         metrics = {
             'step_time_ns': step_end_time_ns - step_beg_time_ns,
             'num_tokens': scheduler_output.total_num_scheduled_tokens,
-            'num_request': num_decode + num_prefill,
+            'num_decode': num_decode,
             'num_prefill': num_prefill,
             'ctx_prefill': ctx_prefill,
             'ctx_decode': ctx_decode,
