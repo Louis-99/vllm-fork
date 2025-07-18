@@ -73,12 +73,12 @@ _O = TypeVar("_O", RequestOutput, PoolingRequestOutput)
 _R = TypeVar("_R", default=Any)
 
 # Logger to profile iterations
-METRIC_LOGGER_FILE = os.environ.get('METRIC_LOG', default='metric.log')
-metric_logging_file_handler = logging.FileHandler(METRIC_LOGGER_FILE)
-metric_logger = logging.getLogger('metric_logger')
-metric_logger.addHandler(metric_logging_file_handler)
-metric_logger.propagate = False
-metric_logger.setLevel(logging.INFO)
+# METRIC_LOGGER_FILE = os.environ.get('METRIC_LOG', default='metric.log')
+# metric_logging_file_handler = logging.FileHandler(METRIC_LOGGER_FILE)
+# metric_logger = logging.getLogger('metric_logger')
+# metric_logger.addHandler(metric_logging_file_handler)
+# metric_logger.propagate = False
+# metric_logger.setLevel(logging.INFO)
 
 @dataclass
 class SchedulerOutputState:
@@ -1277,7 +1277,7 @@ class LLMEngine:
                 "Pipeline parallelism is only supported through AsyncLLMEngine "
                 "as performance will be severely degraded otherwise.")
         
-        step_start_time = time.perf_counter_ns()
+        # step_start_time = time.perf_counter_ns()
 
         # For llm_engine, there is no pipeline parallel support, so the engine
         # used is always 0.
@@ -1451,32 +1451,32 @@ class LLMEngine:
             self.model_executor.stop_remote_worker_execution_loop()
             
             # Flush metric results in case the engine is killed
-            metric_logging_file_handler.flush()
+            # metric_logging_file_handler.flush()
         
         # dump iteration metrics through metric_logger
-        step_end_time = time.perf_counter_ns()
-        metrics = {}
-        metrics['step_time_ns'] = int(step_end_time - step_start_time)
-        metrics['num_tokens'] = int(scheduler_outputs.num_batched_tokens)
-        ctx_prefill = []
-        ctx_decode = 0
-        num_prefill = []
-        num_decode = 0
-        for seq_group in scheduler_outputs.scheduled_seq_groups:
-            seq = seq_group.seq_group.seqs[0]
-            if seq_group.seq_group.is_prefill():
-                num_prefill.append(seq_group.token_chunk_size)
-                ctx_prefill.append(seq.data.get_num_computed_tokens())
-            else:
-                ctx_decode += seq.data.get_num_computed_tokens()
-                num_decode += 1
-        metrics['ctx_prefill'] = ctx_prefill
-        metrics['ctx_decode'] = ctx_decode
-        metrics['num_prefill'] = num_prefill
-        metrics['num_request'] = num_decode
+        # step_end_time = time.perf_counter_ns()
+        # metrics = {}
+        # metrics['step_time_ns'] = int(step_end_time - step_start_time)
+        # metrics['num_tokens'] = int(scheduler_outputs.num_batched_tokens)
+        # ctx_prefill = []
+        # ctx_decode = 0
+        # num_prefill = []
+        # num_decode = 0
+        # for seq_group in scheduler_outputs.scheduled_seq_groups:
+        #     seq = seq_group.seq_group.seqs[0]
+        #     if seq_group.seq_group.is_prefill():
+        #         num_prefill.append(seq_group.token_chunk_size)
+        #         ctx_prefill.append(seq.data.get_num_computed_tokens())
+        #     else:
+        #         ctx_decode += seq.data.get_num_computed_tokens()
+        #         num_decode += 1
+        # metrics['ctx_prefill'] = ctx_prefill
+        # metrics['ctx_decode'] = ctx_decode
+        # metrics['num_prefill'] = num_prefill
+        # metrics['num_request'] = num_decode
 
 
-        metric_logger.info(json.dumps(metrics))
+        # metric_logger.info(json.dumps(metrics))
 
         return ctx.request_outputs
 
