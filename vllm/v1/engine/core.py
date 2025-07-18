@@ -46,7 +46,7 @@ from vllm.version import __version__ as VLLM_VERSION
 
 import json
 import itertools
-from vllm.engine.llm_engine import metric_logger
+# from vllm.engine.llm_engine import metric_logger
 
 logger = init_logger(__name__)
 
@@ -231,7 +231,7 @@ class EngineCore:
         was executed.
         """
 
-        step_beg_time_ns = time.perf_counter_ns()
+        # step_beg_time_ns = time.perf_counter_ns()
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
@@ -242,33 +242,33 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
         
-        step_end_time_ns = time.perf_counter_ns()
+        # step_end_time_ns = time.perf_counter_ns()
         
-        num_decode = 0
-        num_prefill = []
-        ctx_decode = 0
-        ctx_prefill = []
-        for req in itertools.chain(
-            scheduler_output.scheduled_new_reqs, 
-            scheduler_output.scheduled_cached_reqs):
-            num_new_tokens = scheduler_output.num_scheduled_tokens[req.req_id]
-            num_ctx_tokens = req.num_computed_tokens
-            if num_new_tokens == 1:
-                num_decode += 1
-                ctx_decode += num_ctx_tokens
-            elif num_new_tokens > 1:
-                num_prefill.append(num_new_tokens)
-                ctx_prefill.append(num_ctx_tokens)
+        # num_decode = 0
+        # num_prefill = []
+        # ctx_decode = 0
+        # ctx_prefill = []
+        # for req in itertools.chain(
+        #     scheduler_output.scheduled_new_reqs, 
+        #     scheduler_output.scheduled_cached_reqs):
+        #     num_new_tokens = scheduler_output.num_scheduled_tokens[req.req_id]
+        #     num_ctx_tokens = req.num_computed_tokens
+        #     if num_new_tokens == 1:
+        #         num_decode += 1
+        #         ctx_decode += num_ctx_tokens
+        #     elif num_new_tokens > 1:
+        #         num_prefill.append(num_new_tokens)
+        #         ctx_prefill.append(num_ctx_tokens)
 
-        metrics = {
-            'step_time_ns': step_end_time_ns - step_beg_time_ns,
-            'num_tokens': scheduler_output.total_num_scheduled_tokens,
-            'num_decode': num_decode,
-            'num_prefill': num_prefill,
-            'ctx_prefill': ctx_prefill,
-            'ctx_decode': ctx_decode,
-        }
-        metric_logger.info(json.dumps(metrics))
+        # metrics = {
+        #     'step_time_ns': step_end_time_ns - step_beg_time_ns,
+        #     'num_tokens': scheduler_output.total_num_scheduled_tokens,
+        #     'num_decode': num_decode,
+        #     'num_prefill': num_prefill,
+        #     'ctx_prefill': ctx_prefill,
+        #     'ctx_decode': ctx_decode,
+        # }
+        # metric_logger.info(json.dumps(metrics))
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
