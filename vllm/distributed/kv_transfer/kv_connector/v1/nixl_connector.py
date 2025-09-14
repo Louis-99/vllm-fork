@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
-Transfer = tuple[int, float]  # (xfer_handle, start_time)
+Transfer = tuple[Future[int], float]  # (fut_xfer_handle, start_time)
 EngineId = str
 ReqId = str
 
@@ -435,7 +435,7 @@ class NixlConnectorWorker:
         self.block_size = vllm_config.cache_config.block_size
 
         # Agent.
-        self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), nixl_agent_config(num_threads=4))
+        self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), nixl_agent_config(num_threads=8))
         # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
         self._remote_agents: dict[EngineId, dict[int, str]] = defaultdict(dict)
 
@@ -521,6 +521,10 @@ class NixlConnectorWorker:
         self._handshake_futures: dict[EngineId, Future[dict[int, str]]] = {}
         # Protects _handshake_futures and _remote_agents.
         self._handshake_lock = threading.RLock()
+
+        # Yunzhao: even through NIXL transfer is async, it is too slow
+        # So we run it on another thread
+        self._transfer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vllm-nixl-transfer")
 
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
@@ -1080,7 +1084,7 @@ class NixlConnectorWorker:
         return notified_req_ids
 
     def _pop_done_transfers(
-            self, transfers: dict[str, list[tuple[int, float]]]) -> set[str]:
+            self, transfers: dict[str, list[Transfer]]) -> set[str]:
         """
         Pop completed xfers by checking for DONE state.
         Args:
@@ -1091,7 +1095,11 @@ class NixlConnectorWorker:
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = False
-            for handle, _xfer_stime in handles:
+            for fut_handle, _xfer_stime in handles:
+                if not fut_handle.done():
+                    in_progress = True
+                    continue
+                handle = fut_handle.result()
                 xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 if xfer_state == "DONE":
                     self.nixl_wrapper.release_xfer_handle(handle)
@@ -1243,12 +1251,17 @@ class NixlConnectorWorker:
         )
 
         # Begin async xfer.
-        self.nixl_wrapper.transfer(handle)
+        # It is too slow, we put it on another thread
+        # self.nixl_wrapper.transfer(handle)
+        def call_transfer(handle: int):
+            self.nixl_wrapper.transfer(handle)
+            return handle
+        fut_handle = self._transfer_executor.submit(call_transfer, handle)
 
         # Use handle to check completion in future step().
         # TODO (NickLucche) surface xfer elapsed time
         self._recving_transfers[request_id].append(
-            (handle, time.perf_counter()))
+            (fut_handle, time.perf_counter()))
 
     def _get_block_descs_ids(self,
                              engine_id: str,
