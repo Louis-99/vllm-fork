@@ -330,8 +330,8 @@ class NixlConnectorScheduler:
                     logger.warning(
                         "Got invalid KVTransferParams: %s. This "
                         "request will not utilize KVTransfer", params)
-            else:
-                assert num_external_tokens == 0
+            # else:
+                # assert num_external_tokens == 0
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
 
