@@ -614,7 +614,7 @@ class NixlConnectorWorker:
         else:
             rev_tp_ratio = divide(remote_tp_size, self._tp_size[self.engine_id])
             for i in range(rev_tp_ratio):
-                p_remote_ranks.append(self.tp_rank * tp_ratio + i)
+                p_remote_ranks.append(self.tp_rank * rev_tp_ratio + i)
 
         for p_remote_rank in p_remote_ranks:
             start_time = time.perf_counter()
@@ -968,7 +968,7 @@ class NixlConnectorWorker:
                 # Heterogeneous TP expects same kv_cache_layout.
                 assert nixl_agent_meta.kv_cache_layout == self.kv_cache_layout
 
-            assert nixl_agent_meta.block_len == self.block_len * tp_ratio, (
+            assert nixl_agent_meta.block_len == self.block_len * tp_ratio // rev_tp_ratio, (
                 "Remote P worker KV layer cache must be of shape [2, N, "
                 "local_kv_heads*tp_ratio, block_size, head_dim] and same dtype."
             )
@@ -988,7 +988,7 @@ class NixlConnectorWorker:
         # rank. With heterogeneous TP, prepare the descriptors by splitting the
         # P KV cache along kv_head dim, of D worker's kv_head size (D>P).
         # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].
-        kv_block_len = self.get_backend_aware_kv_block_len()
+        kv_block_len = divide(self.get_backend_aware_kv_block_len(), rev_tp_ratio)
         rank_offset = self.tp_rank % tp_ratio * kv_block_len \
             if not (self.use_mla or is_kv_replicated) else 0
         # Register all remote blocks, but only the corresponding kv heads.
@@ -1018,8 +1018,8 @@ class NixlConnectorWorker:
         # Register with NIXL.
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data,
                                                  self.nixl_memory_type)
-        self.dst_xfer_side_handles[engine_id][remote_tp_rank].append(
-            self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs))
+        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = \
+            self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
 
         return remote_agent_name
 
