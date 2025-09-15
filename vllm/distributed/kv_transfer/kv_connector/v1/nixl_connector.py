@@ -484,9 +484,6 @@ class NixlConnectorWorker:
         # Note: host xfer buffer ops when use_host_buffer is True
         self.copy_blocks: Optional[CopyBlocksOp] = None
 
-        # Map of engine_id -> kv_caches_base_addr. For TP case, each local
-        # rank will still only pull from a single remote TP worker.
-        self.kv_caches_base_addr: dict[EngineId, list[int]] = {}
 
         # Number of NIXL regions. Currently one region per cache
         # (so 1 per layer for MLA, otherwise 2 per layer)
@@ -494,9 +491,10 @@ class NixlConnectorWorker:
         self.num_layers = 0
 
         # nixl_prepped_dlist_handle.
-        self.src_xfer_side_handle: int = 0
-        # Map of engine_id -> nixl_prepped_dlist_handle (int)].
-        self.dst_xfer_side_handles: dict[EngineId, int] = {}
+        # rev_tp_ratio -> lnixl_prepped_dlist_handle
+        self.src_xfer_side_handle: dict[int, int] = {}
+        # Map of engine_id -> dict[rank, nixl_prepped_dlist_handle (int)].
+        self.dst_xfer_side_handles: dict[EngineId, dict[int, int]] = defaultdict(dict)
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
@@ -530,6 +528,8 @@ class NixlConnectorWorker:
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
+        self.num_local_kv_heads = self.model_config.get_num_kv_heads( \
+            self.vllm_config.parallel_config)
 
         # TODO(mgoin): remove this once we have hybrid memory allocator
         # Optimization for models with local attention (Llama 4)
@@ -598,45 +598,56 @@ class NixlConnectorWorker:
     ) -> dict[int, str]:
         """Do a NIXL handshake with a remote instance."""
 
-        start_time = time.perf_counter()
-
         # NOTE(rob): we need each rank to have a unique port. This is
         # a hack to keep us moving. We will switch when moving to etcd
         # or where we have a single ZMQ socket in the scheduler.
 
         # Handshake only with the remote TP rank that current local rank will
         # pull from. With homogeneous TP it happens to be the same rank_i.
-        tp_ratio = self._tp_size[self.engine_id] // remote_tp_size
-        p_remote_rank = self.tp_rank // tp_ratio
-        path = make_zmq_path("tcp", host, port + p_remote_rank)
-        logger.debug("Querying metadata on path: %s at remote rank %s", path,
-                     p_remote_rank)
 
-        # Send query for the request.
-        with zmq_ctx(zmq.REQ, path) as sock:
-            sock.send(GET_META_MSG)
-            metadata_bytes = sock.recv()
-            decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-            metadata = decoder.decode(metadata_bytes)
-            got_metadata_time = time.perf_counter()
-            logger.debug("NIXL handshake: get metadata took: %s",
-                         got_metadata_time - start_time)
+        p_remote_ranks = []
+        ret = {}
+        # Yunzhao: tp_ratio can < 1, we need more p_remote_rank in this case
+        if self._tp_size[self.engine_id] >= remote_tp_size:
+            tp_ratio = self._tp_size[self.engine_id] // remote_tp_size
+            p_remote_ranks.append(self.tp_rank // tp_ratio)
+        else:
+            rev_tp_ratio = divide(remote_tp_size, self._tp_size[self.engine_id])
+            for i in range(rev_tp_ratio):
+                p_remote_ranks.append(self.tp_rank * tp_ratio + i)
 
-            # Ensure engine id matches.
-            if metadata.engine_id != expected_engine_id:
-                raise RuntimeError(f"Remote NIXL agent engine ID mismatch. "
-                                   f"Expected {expected_engine_id},"
-                                   f"received {metadata.engine_id}.")
+        for p_remote_rank in p_remote_ranks:
+            start_time = time.perf_counter()
+            path = make_zmq_path("tcp", host, port + p_remote_rank)
+            logger.debug("Querying metadata on path: %s at remote rank %s", path,
+                        p_remote_rank)
 
-            # Register Remote agent.
-            remote_agent_name = self.add_remote_agent(metadata, p_remote_rank,
-                                                      remote_tp_size)
-            setup_agent_time = time.perf_counter()
-            logger.debug("NIXL handshake: add agent took: %s",
-                         setup_agent_time - got_metadata_time)
+            # Send query for the request.
+            with zmq_ctx(zmq.REQ, path) as sock:
+                sock.send(GET_META_MSG)
+                metadata_bytes = sock.recv()
+                decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
+                metadata: NixlAgentMetadata = decoder.decode(metadata_bytes)
+                got_metadata_time = time.perf_counter()
+                logger.debug("NIXL handshake: get metadata took: %s",
+                            got_metadata_time - start_time)
 
-        # Remote rank -> agent name.
-        return {p_remote_rank: remote_agent_name}
+                # Ensure engine id matches.
+                if metadata.engine_id != expected_engine_id:
+                    raise RuntimeError(f"Remote NIXL agent engine ID mismatch. "
+                                    f"Expected {expected_engine_id},"
+                                    f"received {metadata.engine_id}.")
+
+                # Register Remote agent.
+                remote_agent_name = self.add_remote_agent(metadata, p_remote_rank,
+                                                        remote_tp_size)
+                setup_agent_time = time.perf_counter()
+                logger.debug("NIXL handshake: add agent took: %s",
+                            setup_agent_time - got_metadata_time)
+            # Remote rank -> agent name.
+            ret[p_remote_rank] = remote_agent_name
+
+        return ret
 
     def initialize_host_xfer_buffer(
             self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -747,7 +758,6 @@ class NixlConnectorWorker:
                 caches_data.append(
                     (base_addr, tensor_size_bytes, self.tp_rank, ""))
 
-        self.kv_caches_base_addr[self.engine_id] = seen_base_addresses
         self.num_regions = len(caches_data)
         self.num_layers = len(xfer_buffers.keys())
 
@@ -778,38 +788,52 @@ class NixlConnectorWorker:
             self.num_regions *= 2
 
         kv_block_len = self.get_backend_aware_kv_block_len()
-        # Register local/src descr for NIXL xfer.
-        blocks_data = []
-        for base_addr in seen_base_addresses:
-            # NOTE With heter-TP, more blocks are prepared than what are
-            # needed as self.num_blocks >= nixl_agent_meta.num_blocks. We
-            # could create fewer, but then _get_block_descs_ids needs to
-            # select agent_meta.num_blocks instead of self.num_blocks for
-            # local descr, and that makes handling regular flow less clean.
-            for block_id in range(self.num_blocks):
-                block_offset = block_id * self.block_len
-                addr = base_addr + block_offset
-                # (addr, len, device id)
-                blocks_data.append((addr, kv_block_len, self.tp_rank))
 
-            if self._use_flashinfer:
-                # Separate and interleave K/V regions to maintain the same
-                # descs ordering. This is needed for selecting contiguous heads
-                # when split across TP ranks.
+        def create_local_xfer_handle(rev_tp_ratio: int) -> int:
+            # Register local/src descr for NIXL xfer.
+            blocks_data = []
+            for base_addr in seen_base_addresses:
+                # NOTE With heter-TP, more blocks are prepared than what are
+                # needed as self.num_blocks >= nixl_agent_meta.num_blocks. We
+                # could create fewer, but then _get_block_descs_ids needs to
+                # select agent_meta.num_blocks instead of self.num_blocks for
+                # local descr, and that makes handling regular flow less clean.
                 for block_id in range(self.num_blocks):
                     block_offset = block_id * self.block_len
                     addr = base_addr + block_offset
-                    # Register addresses for V cache (K registered first).
-                    v_addr = addr + kv_block_len
-                    blocks_data.append((v_addr, kv_block_len, self.tp_rank))
-        logger.debug("Created %s blocks for src engine %s and rank %s",
-                     len(blocks_data), self.engine_id, self.tp_rank)
+                    # divide blocks along kv_heads dim into segments
+                    segment_len = divide(kv_block_len, rev_tp_ratio)
+                    # (addr, len, device id)
+                    for i in range(rev_tp_ratio):
+                        blocks_data.append(
+                            (addr + segment_len * i, segment_len, self.tp_rank))
 
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data,
-                                                 self.nixl_memory_type)
-        # NIXL_INIT_AGENT to be used for preparations of local descs.
-        self.src_xfer_side_handle = self.nixl_wrapper.prep_xfer_dlist(
-            "NIXL_INIT_AGENT", descs)
+                if self._use_flashinfer:
+                    # Separate and interleave K/V regions to maintain the same
+                    # descs ordering. This is needed for selecting contiguous heads
+                    # when split across TP ranks.
+                    for block_id in range(self.num_blocks):
+                        block_offset = block_id * self.block_len
+                        addr = base_addr + block_offset
+                        # Register addresses for V cache (K registered first).
+                        v_addr = addr + kv_block_len
+                        segment_len = divide(kv_block_len, rev_tp_ratio)
+                        for i in range(rev_tp_ratio):
+                            blocks_data.append(
+                                (v_addr + segment_len * i, segment_len, self.tp_rank))
+            logger.debug("Created %s blocks for src engine %s and rank %s",
+                        len(blocks_data), self.engine_id, self.tp_rank)
+
+            descs = self.nixl_wrapper.get_xfer_descs(blocks_data,
+                                                    self.nixl_memory_type)
+            # NIXL_INIT_AGENT to be used for preparations of local descs.
+            return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+        
+        # TODO: (Yunzhao) This does not consider when tp size > num kv heads
+        for possible_rev_tp_ratio in range(1, self.num_local_kv_heads + 1):
+            if self.num_local_kv_heads % possible_rev_tp_ratio == 0:
+                self.src_xfer_side_handle[possible_rev_tp_ratio] = \
+                    create_local_xfer_handle(possible_rev_tp_ratio)
 
         # TODO(mgoin): Hybrid memory allocator is currently disabled for
         # models with local attention (Llama 4). Can remove this once enabled.
@@ -835,7 +859,7 @@ class NixlConnectorWorker:
         metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
-            kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id],
+            kv_caches_base_addr=seen_base_addresses,
             num_blocks=self.num_blocks,
             block_len=self.block_len,
             attn_backend_name=self.backend_name,
@@ -908,8 +932,15 @@ class NixlConnectorWorker:
 
         # Number of D TP workers reading from a single P TP worker. This is
         # 1 when P and D `--tensor-parallel-size` match.
-        tp_ratio = divide(self._tp_size[self.engine_id],
-                          self._tp_size[engine_id])
+
+        if self._tp_size[self.engine_id] >= self._tp_size[engine_id]: 
+            tp_ratio = divide(self._tp_size[self.engine_id],
+                            self._tp_size[engine_id])
+            rev_tp_ratio = 1
+        else:
+            tp_ratio = 1
+            rev_tp_ratio = divide(self._tp_size[engine_id],
+                                self._tp_size[self.engine_id])
         assert tp_ratio > 0, "Decode TP cannot be smaller than prefill TP"
         assert not self._use_pallas_v1 or tp_ratio == 1, \
                "TPU (pallas_v1) DOES NOT support heterogeneous TP yet."
@@ -918,13 +949,17 @@ class NixlConnectorWorker:
         total_num_kv_heads = self.model_config.get_total_num_kv_heads()
         is_kv_replicated = self._tp_size[engine_id] // total_num_kv_heads >= 1
 
+        assert not is_kv_replicated or rev_tp_ratio == 1, \
+            "Yunzhao: KV cache replication is not supported yet."
+
         if self.use_mla or is_kv_replicated:
             # With MLA the only difference is in the number of blocks.
+            # TODO: Yunzhao: consider rev TP ratio > 1 later
             remote_block_size = nixl_agent_meta.block_len // (
                 self.slot_size_bytes)
             assert self.block_len == nixl_agent_meta.block_len
         else:
-            remote_block_size = nixl_agent_meta.block_len // (
+            remote_block_size = nixl_agent_meta.block_len * rev_tp_ratio // (
                 self.slot_size_bytes * tp_ratio)
             if self._use_flashinfer:
                 # With flashinfer, KV are sent in the same message.
@@ -953,8 +988,6 @@ class NixlConnectorWorker:
         # rank. With heterogeneous TP, prepare the descriptors by splitting the
         # P KV cache along kv_head dim, of D worker's kv_head size (D>P).
         # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].
-        self.kv_caches_base_addr[
-            engine_id] = nixl_agent_meta.kv_caches_base_addr
         kv_block_len = self.get_backend_aware_kv_block_len()
         rank_offset = self.tp_rank % tp_ratio * kv_block_len \
             if not (self.use_mla or is_kv_replicated) else 0
@@ -985,9 +1018,8 @@ class NixlConnectorWorker:
         # Register with NIXL.
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data,
                                                  self.nixl_memory_type)
-        self.dst_xfer_side_handles[
-            engine_id] = self.nixl_wrapper.prep_xfer_dlist(
-                remote_agent_name, descs)
+        self.dst_xfer_side_handles[engine_id][remote_tp_rank].append(
+            self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs))
 
         return remote_agent_name
 
@@ -1095,7 +1127,7 @@ class NixlConnectorWorker:
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = False
-            for fut_handle, _xfer_stime in handles:
+            for fut_handle, _xfer_stime in handles.copy():
                 if not fut_handle.done():
                     in_progress = True
                     continue
@@ -1103,6 +1135,7 @@ class NixlConnectorWorker:
                 xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 if xfer_state == "DONE":
                     self.nixl_wrapper.release_xfer_handle(handle)
+                    handles.remove((fut_handle, _xfer_stime))
                 elif xfer_state == "PROC":
                     in_progress = True
                     continue
@@ -1172,8 +1205,14 @@ class NixlConnectorWorker:
 
         # Number of D TP workers that will read from dst P. Propagate tp_ratio
         # on notification so that dst worker can wait before freeing blocks.
-        tp_ratio = self._tp_size[
-            self.engine_id] // self._tp_size[dst_engine_id]
+        if self._tp_size[self.engine_id] >= self._tp_size[dst_engine_id]:
+            tp_ratio = self._tp_size[
+                self.engine_id] // self._tp_size[dst_engine_id]
+            rev_tp_ratio = 1
+        else:
+            tp_ratio = 1
+            rev_tp_ratio = self._tp_size[
+                dst_engine_id] // self._tp_size[self.engine_id]
         notif_id = f"{request_id}:{tp_ratio}".encode()
 
         # Full prefix cache hit: do not need to read remote blocks,
@@ -1192,8 +1231,9 @@ class NixlConnectorWorker:
             remote_block_ids = remote_block_ids[-num_local_blocks:]
 
         # Get side handles.
-        local_xfer_side_handle = self.src_xfer_side_handle
-        remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id]
+        local_xfer_side_handle = self.src_xfer_side_handle[rev_tp_ratio]
+        remote_xfer_side_handles = [v for (_, v) in sorted(self.dst_xfer_side_handles[dst_engine_id].items())]
+        assert rev_tp_ratio == len(remote_xfer_side_handles)
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
@@ -1240,28 +1280,30 @@ class NixlConnectorWorker:
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
-        # Prepare transfer with Nixl.
-        handle = self.nixl_wrapper.make_prepped_xfer(
-            "READ",
-            local_xfer_side_handle,
-            local_block_descs_ids,
-            remote_xfer_side_handle,
-            remote_block_descs_ids,
-            notif_msg=notif_id,
-        )
-
-        # Begin async xfer.
-        # It is too slow, we put it on another thread
-        # self.nixl_wrapper.transfer(handle)
         def call_transfer(handle: int):
             self.nixl_wrapper.transfer(handle)
             return handle
-        fut_handle = self._transfer_executor.submit(call_transfer, handle)
+        
+        # Prepare transfer with Nixl.
+        for i in range(rev_tp_ratio):
+            handle = self.nixl_wrapper.make_prepped_xfer(
+                "READ",
+                local_xfer_side_handle,
+                local_block_descs_ids * rev_tp_ratio + i,
+                remote_xfer_side_handles[i],
+                remote_block_descs_ids,
+                notif_msg=notif_id,
+            )
 
-        # Use handle to check completion in future step().
-        # TODO (NickLucche) surface xfer elapsed time
-        self._recving_transfers[request_id].append(
-            (fut_handle, time.perf_counter()))
+            # Begin async xfer.
+            # It is too slow, we put it on another thread
+            # self.nixl_wrapper.transfer(handle)
+            fut_handle = self._transfer_executor.submit(call_transfer, handle)
+
+            # Use handle to check completion in future step().
+            # TODO (NickLucche) surface xfer elapsed time
+            self._recving_transfers[request_id].append(
+                (fut_handle, time.perf_counter()))
 
     def _get_block_descs_ids(self,
                              engine_id: str,
