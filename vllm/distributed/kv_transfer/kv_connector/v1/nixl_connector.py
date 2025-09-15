@@ -409,6 +409,10 @@ class NixlConnectorScheduler:
             # Prefill request on remote. It will be read from D upon completion
             self._reqs_need_send[request.request_id] = time.perf_counter(
             ) + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+        else:
+            # workaround for a bug when block_ids is empty
+            del self._reqs_to_send[request.request_id]
+            return False, None
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
