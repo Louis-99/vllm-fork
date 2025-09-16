@@ -100,6 +100,7 @@ class IterationStats:
         self.n_params_iter: list[int] = []
         self.time_to_first_tokens_iter: list[float] = []
         self.inter_token_latencies_iter: list[float] = []
+        self.req_ids: list[str] = []
         self.waiting_lora_adapters: dict[str, int] = {}
         self.running_lora_adapters: dict[str, int] = {}
 
@@ -110,7 +111,9 @@ class IterationStats:
     def update_from_output(self, output: "EngineCoreOutput",
                            engine_core_timestamp: float, is_prefilling: bool,
                            prompt_len: int, req_stats: RequestStateStats,
+                           request_id: str,
                            lora_stats: Optional[LoRAStats]):
+        self.req_ids.append(request_id)
         num_new_generation_tokens = len(output.new_token_ids)
 
         self.num_generation_tokens += num_new_generation_tokens
