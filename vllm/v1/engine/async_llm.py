@@ -4,6 +4,7 @@ import asyncio
 import os
 import socket
 import time
+import multiprocessing
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
 from typing import Any, Optional, Union
@@ -23,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.platforms.nvml_power_monitor import start_nvml_power_monitor
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
@@ -153,6 +155,19 @@ class AsyncLLM(EngineClient):
                 client_count=client_count,
             )
             self.logger_manager.log_engine_initialized()
+        
+        # power logs
+        if vllm_config.log_power:
+            self.power_monitor_process = multiprocessing.Process(
+                    target=start_nvml_power_monitor,
+                    kwargs={
+                        'interval': 0.01,
+                        'csv_filename':
+                        f"{vllm_config.log_dir}/power_log.csv",
+                        'power_queue': None,
+                    },
+                    daemon=True)
+            self.power_monitor_process.start()
 
         self.output_handler: Optional[asyncio.Task] = None
         try:
@@ -249,6 +264,10 @@ class AsyncLLM(EngineClient):
 
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC."""
+
+        if self.power_monitor_process:
+            self.power_monitor_process.kill()
+            self.power_monitor_process.join()
 
         shutdown_prometheus()
 

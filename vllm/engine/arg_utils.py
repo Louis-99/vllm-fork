@@ -470,6 +470,10 @@ class EngineArgs:
 
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
+    
+    # added args
+    log_dir: str = "./logs"
+    log_power: bool = False
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -923,6 +927,13 @@ class EngineArgs:
         parser.add_argument('--disable-log-stats',
                             action='store_true',
                             help='Disable logging statistics.')
+
+        # added arguments
+        parser.add_argument("--log-dir", default='./logs')
+        parser.add_argument("--log-power",
+                            default=False,
+                            action='store_true',
+                            help="Log power consumption metrics on rank 0")
 
         return parser
 
@@ -1434,6 +1445,8 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
+            log_dir=self.log_dir,
+            log_power=self.log_power,
         )
 
         return config

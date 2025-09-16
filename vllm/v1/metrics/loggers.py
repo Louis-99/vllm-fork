@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 import logging
+from pathlib import Path
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Optional, Union
+
+import pandas as pd
 
 import prometheus_client
 
@@ -600,6 +606,78 @@ PromMetric = Union[
     prometheus_client.Histogram,
 ]
 
+class CSVLogger(StatLoggerBase):
+    """
+    Logs to CSV. Writes are incremental to avoid blocking.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, engine_index: int = 0) -> None:
+        self.filename = Path(
+            vllm_config.log_dir) / f'engine_{engine_index}.csv'
+        self.persist_to_disk_every = 10
+
+        self.filename.parent.mkdir(parents=True, exist_ok=True)
+        if self.filename.exists():
+            self.filename.unlink()
+        self.iter = 0
+        self.csv_buf: list[dict] = []
+        self.buf_lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.engine_index = engine_index
+
+        atexit.register(self._flush_remaining_sync)
+
+    def increment_counter_and_maybe_persist_to_disk(self):
+        self.iter += 1
+        if self.iter % self.persist_to_disk_every == 0:
+            self.persist_to_disk()
+
+    def persist_to_disk(self):
+        with self.buf_lock:
+            data_to_write = self.csv_buf.copy()
+            self.csv_buf.clear()
+
+        if not data_to_write:
+            return
+
+        self.executor.submit(self._write_to_csv, data_to_write)
+
+    def _write_to_csv(self, data: list[dict]):
+        file_exists = self.filename.exists()
+        pd.DataFrame(data).to_csv(self.filename,
+                                  mode='a',
+                                  header=not file_exists,
+                                  index=False)
+        logger.info("CSVLogger persisted %d entries to disk", len(data))
+
+    def record(self,
+               engine_idx: Optional[int],
+               scheduler_stats: Optional[SchedulerStats],
+               iteration_stats: Optional[IterationStats],
+               ):
+        engine_idx = engine_idx if engine_idx is not None else self.engine_index
+        if scheduler_stats is not None:
+            stats = {
+                'engine_index': engine_idx,
+                'num_running_reqs': scheduler_stats.num_running_reqs,
+                'num_waiting_reqs': scheduler_stats.num_waiting_reqs,
+            }
+
+            with self.buf_lock:
+                self.csv_buf.append(stats)
+        self.increment_counter_and_maybe_persist_to_disk()
+
+    def log_engine_initialized(self):
+        pass
+
+    def _flush_remaining_sync(self):
+        with self.buf_lock:
+            data_to_write = self.csv_buf.copy()
+            self.csv_buf.clear()
+
+        if data_to_write:
+            self._write_to_csv(data_to_write)
+        self.executor.shutdown(wait=True)
 
 def make_per_engine(metric: PromMetric, engine_idxs: list[int],
                     model_name: str) -> dict[int, PromMetric]:
@@ -667,6 +745,7 @@ class StatLoggerManager:
                     "disabling stats logging to avoid incomplete stats.")
             else:
                 factories.append(LoggingStatLogger)
+                factories.append(CSVLogger)
 
         # engine_idx: StatLogger
         self.per_engine_logger_dict: dict[int, list[StatLoggerBase]] = {}
@@ -699,10 +778,11 @@ class StatLoggerManager:
 
         per_engine_loggers = self.per_engine_logger_dict[engine_idx]
         for logger in per_engine_loggers:
-            logger.record(scheduler_stats, iteration_stats, engine_idx)
+            logger.record(scheduler_stats=scheduler_stats,
+                          iteration_stats=iteration_stats, engine_idx=engine_idx)
 
-        self.prometheus_logger.record(scheduler_stats, iteration_stats,
-                                      engine_idx)
+        self.prometheus_logger.record(scheduler_stats=scheduler_stats,
+                          iteration_stats=iteration_stats, engine_idx=engine_idx)
 
     def log(self):
         for per_engine_loggers in self.per_engine_logger_dict.values():

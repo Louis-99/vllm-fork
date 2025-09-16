@@ -3197,6 +3197,11 @@ class VllmConfig:
     instance_id: str = ""
     """The ID of the vLLM instance."""
 
+    log_dir: str = "./logs"
+    """The directory to store the logs."""
+    log_power: bool = False
+    """Whether to log power usage metrics."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

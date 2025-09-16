@@ -3,6 +3,7 @@
 
 from collections.abc import Mapping
 from copy import copy
+import multiprocessing
 from typing import Any, Callable, Optional, Union
 
 from typing_extensions import TypeVar
@@ -16,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.platforms.nvml_power_monitor import start_nvml_power_monitor
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
@@ -30,7 +32,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.processor import Processor
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import (PrometheusStatLogger, StatLoggerBase,
-                                     StatLoggerFactory)
+                                     CSVLogger, StatLoggerFactory)
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 
@@ -73,7 +75,20 @@ class LLMEngine:
         self.log_stats = log_stats
         self.stat_logger: Optional[StatLoggerBase] = None
         if self.log_stats:
-            self.stat_logger = PrometheusStatLogger(vllm_config)
+            # self.stat_logger = PrometheusStatLogger(vllm_config)
+            self.stat_logger = CSVLogger(vllm_config)
+
+        if vllm_config.log_power:
+            self.power_monitor_process = multiprocessing.Process(
+                    target=start_nvml_power_monitor,
+                    kwargs={
+                        'interval': 0.01,
+                        'csv_filename':
+                        f"{vllm_config.log_dir}/power_log.csv",
+                        'power_queue': None,
+                    },
+                    daemon=True)
+            self.power_monitor_process.start()
 
         # important: init dp group before init the engine_core
         # In the decoupled engine case this is handled in EngineCoreProc.
