@@ -411,7 +411,7 @@ class NixlConnectorScheduler:
             ) + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
         else:
             # workaround for a bug when block_ids is empty
-            del self._reqs_to_send[request.request_id]
+            self._reqs_need_send.pop(request.request_id, None)
             return False, None
 
         return delay_free_blocks, dict(
