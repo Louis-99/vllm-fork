@@ -154,6 +154,13 @@ class AsyncLLM(EngineClient):
             )
             self.logger_manager.log_engine_initialized()
 
+        if envs.VLLM_STATS_STORE_PORT > 0:
+            from torch.distributed import TCPStore
+            logger.info(f"Starting stats store at port {envs.VLLM_STATS_STORE_PORT}")
+            self.stats_store = TCPStore("localhost", envs.VLLM_STATS_STORE_PORT, is_master=True)
+        else:
+            self.stats_store = None
+
         self.output_handler: Optional[asyncio.Task] = None
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
@@ -433,6 +440,7 @@ class AsyncLLM(EngineClient):
         output_processor = self.output_processor
         log_stats = self.log_stats
         logger_manager = self.logger_manager
+        stats_store = self.stats_store
 
         async def output_handler():
             try:
@@ -478,6 +486,13 @@ class AsyncLLM(EngineClient):
                             scheduler_stats=outputs.scheduler_stats,
                             iteration_stats=iteration_stats,
                         )
+                    
+                    # 5) Update stats store for global scheduler
+                    if stats_store is not None and outputs.scheduler_stats is not None:
+                        stats_keys = ["kv_cache_usage", "num_running_reqs", "num_waiting_reqs", "num_uncomputed_tokens"]
+                        stats_values = [str(getattr(outputs.scheduler_stats, key)) for key in stats_keys]
+                        stats_store.multi_set(stats_keys, stats_values)
+                    
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)

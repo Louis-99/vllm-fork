@@ -177,6 +177,7 @@ if TYPE_CHECKING:
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
 
+    VLLM_STATS_STORE_PORT: int = 0 # 0 means does not start stats store
 
 def get_default_cache_root():
     return os.getenv(
@@ -1250,6 +1251,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME":
     lambda: os.getenv("VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
                       "VLLM_OBJECT_STORAGE_SHM_BUFFER"),
+
+    "VLLM_STATS_STORE_PORT":
+    lambda: int(os.getenv("VLLM_STATS_STORE_PORT", "0")),
 }
 
 # --8<-- [end:env-vars-definition]

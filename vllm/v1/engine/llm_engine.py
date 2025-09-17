@@ -123,6 +123,13 @@ class LLMEngine:
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 
+        if envs.VLLM_STATS_STORE_PORT != 0:
+            from torch.distributed import TCPStore
+            logger.info(f"Starting stats store at port {envs.VLLM_STATS_STORE_PORT}")
+            self.stats_store = TCPStore("localhost", envs.VLLM_STATS_STORE_PORT, is_master=True)
+        else:
+            self.stats_store = None
+
     @classmethod
     def from_vllm_config(
         cls,
@@ -262,6 +269,12 @@ class LLMEngine:
             assert outputs.scheduler_stats is not None
             self.stat_logger.record(scheduler_stats=outputs.scheduler_stats,
                                     iteration_stats=iteration_stats)
+            
+        # 5) Update stats store for global scheduler
+        if self.stats_store is not None:
+            stats_keys = ["kv_cache_usage", "num_running_reqs", "num_waiting_reqs", "num_uncomputed_tokens"]
+            stats_values = [str(getattr(outputs.scheduler_stats, key)) for key in stats_keys]
+            self.stats_store.multi_set(stats_keys, stats_values)
 
         return processed_outputs.request_outputs
 

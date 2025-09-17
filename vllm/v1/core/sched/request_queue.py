@@ -58,6 +58,11 @@ class RequestQueue(ABC):
         pass
 
     @abstractmethod
+    def get_num_uncomputed_tokens(self) -> int:
+        """Get the total number of uncomputed tokens in the queue."""
+        pass
+
+    @abstractmethod
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
         pass
@@ -81,13 +86,20 @@ class RequestQueue(ABC):
 class FCFSRequestQueue(deque[Request], RequestQueue):
     """A first-come-first-served queue that supports deque operations."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.num_uncomputed_tokens = 0
+
     def add_request(self, request: Request) -> None:
         """Add a request to the queue according to FCFS policy."""
         self.append(request)
+        self.num_uncomputed_tokens += request.num_tokens - request.num_computed_tokens
 
     def pop_request(self) -> Request:
         """Pop a request from the queue according to FCFS policy."""
-        return self.popleft()
+        req = self.popleft()
+        self.num_uncomputed_tokens -= req.num_tokens - req.num_computed_tokens
+        return req
 
     def peek_request(self) -> Request:
         """Peek at the next request in the queue without removing it."""
@@ -98,15 +110,18 @@ class FCFSRequestQueue(deque[Request], RequestQueue):
     def prepend_request(self, request: Request) -> None:
         """Prepend a request to the front of the queue."""
         self.appendleft(request)
+        self.num_uncomputed_tokens += request.num_tokens - request.num_computed_tokens
 
     def prepend_requests(self, requests: RequestQueue) -> None:
         """Prepend all requests from another queue to the front of this
         queue."""
         self.extendleft(reversed(requests))
+        self.num_uncomputed_tokens += requests.get_num_uncomputed_tokens()
 
     def remove_request(self, request: Request) -> None:
         """Remove a specific request from the queue."""
         self.remove(request)
+        self.num_uncomputed_tokens -= request.num_tokens - request.num_computed_tokens
 
     def remove_requests(self, requests: Iterable[Request]) -> None:
         """Remove multiple specific requests from the queue."""
@@ -114,10 +129,16 @@ class FCFSRequestQueue(deque[Request], RequestQueue):
         filtered_requests = [
             req for req in self if req not in requests_to_remove
         ]
+        self.num_uncomputed_tokens = sum(
+            req.num_tokens - req.num_computed_tokens for req in filtered_requests)
         # deque does not support in-place filtering, so we need to clear
         # and extend
         self.clear()
         self.extend(filtered_requests)
+    
+    def get_num_uncomputed_tokens(self) -> int:
+        """Get the total number of uncomputed tokens in the queue."""
+        return self.num_uncomputed_tokens
 
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
@@ -147,17 +168,20 @@ class PriorityRequestQueue(RequestQueue):
 
     def __init__(self) -> None:
         self._heap: list[tuple[int, float, Request]] = []
+        self.num_uncomputed_tokens = 0
 
     def add_request(self, request: Request) -> None:
         """Add a request to the queue according to priority policy."""
         heapq.heappush(self._heap,
                        (request.priority, request.arrival_time, request))
+        self.num_uncomputed_tokens += request.num_tokens - request.num_computed_tokens
 
     def pop_request(self) -> Request:
         """Pop a request from the queue according to priority policy."""
         if not self._heap:
             raise IndexError("pop from empty heap")
         _, _, request = heapq.heappop(self._heap)
+        self.num_uncomputed_tokens -= request.num_tokens - request.num_computed_tokens
         return request
 
     def peek_request(self) -> Request:
@@ -173,6 +197,7 @@ class PriorityRequestQueue(RequestQueue):
         Note: In a priority queue, there is no concept of prepending to the 
         front. Requests are ordered by (priority, arrival_time)."""
         self.add_request(request)
+        self.num_uncomputed_tokens += request.num_tokens - request.num_computed_tokens
 
     def prepend_requests(self, requests: RequestQueue) -> None:
         """Add all requests from another queue according to priority policy.
@@ -181,11 +206,13 @@ class PriorityRequestQueue(RequestQueue):
         front. Requests are ordered by (priority, arrival_time)."""
         for request in requests:
             self.add_request(request)
+        self.num_uncomputed_tokens += requests.get_num_uncomputed_tokens()
 
     def remove_request(self, request: Request) -> None:
         """Remove a specific request from the queue."""
         self._heap = [(p, t, r) for p, t, r in self._heap if r != request]
         heapq.heapify(self._heap)
+        self.num_uncomputed_tokens -= request.num_tokens - request.num_computed_tokens
 
     def remove_requests(self, requests: Iterable[Request]) -> None:
         """Remove multiple specific requests from the queue."""
@@ -193,6 +220,12 @@ class PriorityRequestQueue(RequestQueue):
         self._heap = [(p, t, r) for p, t, r in self._heap
                       if r not in requests_to_remove]
         heapq.heapify(self._heap)
+        self.num_uncomputed_tokens = sum(
+            req.num_tokens - req.num_computed_tokens for _, _, req in self._heap)
+
+    def get_num_uncomputed_tokens(self) -> int:
+        """Get the total number of uncomputed tokens in the queue."""
+        return self.num_uncomputed_tokens
 
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
