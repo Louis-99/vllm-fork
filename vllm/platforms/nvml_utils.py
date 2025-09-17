@@ -139,11 +139,11 @@ def _get_gpu_handles():
 
 @contextmanager
 def timeit(name='Unnamed code block'):
-    start_time = time.perf_counter()
+    start_time = time.time()
     try:
         yield
     finally:
-        end_time = time.perf_counter()
+        end_time = time.time()
         elapsed_time = end_time - start_time
         logger.info('[%s] execution time: %f', name, elapsed_time)
 
