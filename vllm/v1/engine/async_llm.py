@@ -46,6 +46,8 @@ from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
+from concurrent.futures import ThreadPoolExecutor
+
 logger = init_logger(__name__)
 
 
@@ -157,9 +159,12 @@ class AsyncLLM(EngineClient):
         if envs.VLLM_STATS_STORE_PORT > 0:
             from torch.distributed import TCPStore
             logger.info(f"Starting stats store at port {envs.VLLM_STATS_STORE_PORT}")
+            self.stats_store_executor = ThreadPoolExecutor(max_workers=1)
             self.stats_store = TCPStore("localhost", envs.VLLM_STATS_STORE_PORT, is_master=True)
+            self.stats_keys = ["kv_cache_usage", "num_running_reqs", "num_waiting_reqs", "num_uncomputed_tokens"]
+            self.stats_store.multi_set(self.stats_keys, ["0"] * len(self.stats_keys))
         else:
-            self.stats_store = None
+            self.stats_store_executor = None
 
         self.output_handler: Optional[asyncio.Task] = None
         try:
@@ -440,7 +445,11 @@ class AsyncLLM(EngineClient):
         output_processor = self.output_processor
         log_stats = self.log_stats
         logger_manager = self.logger_manager
-        stats_store = self.stats_store
+        stats_store_executor = self.stats_store_executor
+        if self.stats_store_executor is not None:
+            stats_store = self.stats_store
+            stats_keys = self.stats_keys
+
 
         async def output_handler():
             try:
@@ -489,9 +498,8 @@ class AsyncLLM(EngineClient):
                     
                     # 5) Update stats store for global scheduler
                     if stats_store is not None and outputs.scheduler_stats is not None:
-                        stats_keys = ["kv_cache_usage", "num_running_reqs", "num_waiting_reqs", "num_uncomputed_tokens"]
                         stats_values = [str(getattr(outputs.scheduler_stats, key)) for key in stats_keys]
-                        stats_store.multi_set(stats_keys, stats_values)
+                        stats_store_executor.submit(stats_store.multi_set, stats_keys, stats_values)
                     
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")

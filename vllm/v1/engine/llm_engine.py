@@ -34,6 +34,8 @@ from vllm.v1.metrics.loggers import (PrometheusStatLogger, StatLoggerBase,
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 
+from concurrent.futures import ThreadPoolExecutor
+
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
@@ -126,9 +128,12 @@ class LLMEngine:
         if envs.VLLM_STATS_STORE_PORT != 0:
             from torch.distributed import TCPStore
             logger.info(f"Starting stats store at port {envs.VLLM_STATS_STORE_PORT}")
+            self.stats_store_executor = ThreadPoolExecutor(max_workers=1)
             self.stats_store = TCPStore("localhost", envs.VLLM_STATS_STORE_PORT, is_master=True)
+            self.stats_keys = ["kv_cache_usage", "num_running_reqs", "num_waiting_reqs", "num_uncomputed_tokens"]
+            self.stats_store.multi_set(self.stats_keys, ["0"] * len(self.stats_keys))
         else:
-            self.stats_store = None
+            self.stats_store_executor = None
 
     @classmethod
     def from_vllm_config(
@@ -271,10 +276,9 @@ class LLMEngine:
                                     iteration_stats=iteration_stats)
             
         # 5) Update stats store for global scheduler
-        if self.stats_store is not None:
-            stats_keys = ["kv_cache_usage", "num_running_reqs", "num_waiting_reqs", "num_uncomputed_tokens"]
-            stats_values = [str(getattr(outputs.scheduler_stats, key)) for key in stats_keys]
-            self.stats_store.multi_set(stats_keys, stats_values)
+        if self.stats_store_executor is not None:
+            stats_values = [str(getattr(outputs.scheduler_stats, key)) for key in self.stats_keys]
+            self.stats_store_executor.submit(self.stats_store.multi_set, self.stats_keys, stats_values)
 
         return processed_outputs.request_outputs
 
