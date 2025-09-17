@@ -277,8 +277,8 @@ class LLMEngine:
             
         # 5) Update stats store for global scheduler
         if self.stats_store_executor is not None:
-            stats_values = [str(getattr(outputs.scheduler_stats, key)) for key in self.stats_keys]
-            self.stats_store_executor.submit(self.stats_store.multi_set, self.stats_keys, stats_values)
+            self.stats_store_executor.submit(lambda: self.stats_store.multi_set(
+                self.stats_keys, [str(getattr(outputs.scheduler_stats, key)) for key in self.stats_keys]))
 
         return processed_outputs.request_outputs
 

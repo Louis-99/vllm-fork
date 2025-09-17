@@ -14,6 +14,8 @@ from fastapi.responses import StreamingResponse
 
 from torch.distributed import TCPStore
 
+from concurrent.futures import ThreadPoolExecutor
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -29,10 +31,13 @@ class Scheduler:
         self.current_idx = 0
         assert set(stats_keys) <= VALID_STATS_KEYS
         self.stats_keys = stats_keys
-        
+        self.stats_store_executor = ThreadPoolExecutor()
+
+    def _get_store_stats(self, store: TCPStore) -> tuple:
+        return tuple(map(float, store.multi_get(self.stats_keys)))
 
     def schedule(self, request: Request) -> dict:
-        stats_values = [tuple(map(float, store.multi_get(self.stats_keys))) for store in self.stats_stores]
+        stats_values = list(self.stats_store_executor.map(self._get_store_stats, self.stats_stores))
         
         self.current_idx = (self.current_idx + 1) % self.num_instances
         min_value = stats_values[self.current_idx]

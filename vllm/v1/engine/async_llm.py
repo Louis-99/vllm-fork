@@ -498,8 +498,8 @@ class AsyncLLM(EngineClient):
                     
                     # 5) Update stats store for global scheduler
                     if stats_store is not None and outputs.scheduler_stats is not None:
-                        stats_values = [str(getattr(outputs.scheduler_stats, key)) for key in stats_keys]
-                        stats_store_executor.submit(stats_store.multi_set, stats_keys, stats_values)
+                        stats_store_executor.submit(lambda: stats_store.multi_set(
+                            stats_keys, [str(getattr(outputs.scheduler_stats, key)) for key in stats_keys]))
                     
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
