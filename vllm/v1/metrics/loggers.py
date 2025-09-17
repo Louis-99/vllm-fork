@@ -651,9 +651,9 @@ class CSVLogger(StatLoggerBase):
         logger.info("CSVLogger persisted %d entries to disk", len(data))
 
     def record(self,
-               engine_idx: Optional[int],
                scheduler_stats: Optional[SchedulerStats],
                iteration_stats: Optional[IterationStats],
+               engine_idx: Optional[int]=0,
                ):
         engine_idx = engine_idx if engine_idx is not None else self.engine_index
         if scheduler_stats is not None and iteration_stats is not None:
