@@ -76,10 +76,10 @@ class NvmlPowerMonitor:
 
             logger.info('Monitoring power and frequency for %d GPUs...',
                         len(handles))
-            last_log_time = time.perf_counter()
+            last_log_time = time.time()
 
             while not self.stop_monitoring:
-                timestamp = time.perf_counter()
+                timestamp = time.time()
                 readings = [timestamp]
                 total_power = 0
                 for handle in handles:

@@ -100,7 +100,8 @@ class IterationStats:
         self.n_params_iter: list[int] = []
         self.time_to_first_tokens_iter: list[float] = []
         self.inter_token_latencies_iter: list[float] = []
-        self.req_ids: list[str] = []
+        self.req_ids_tbt: list[str] = []
+        self.req_ids_ttft: list[str] = []
         self.waiting_lora_adapters: dict[str, int] = {}
         self.running_lora_adapters: dict[str, int] = {}
 
@@ -113,11 +114,11 @@ class IterationStats:
                            prompt_len: int, req_stats: RequestStateStats,
                            request_id: str,
                            lora_stats: Optional[LoRAStats]):
-        self.req_ids.append(request_id)
         num_new_generation_tokens = len(output.new_token_ids)
 
         self.num_generation_tokens += num_new_generation_tokens
         if is_prefilling:
+            self.req_ids_ttft.append(request_id)
             self.num_prompt_tokens += prompt_len
 
             first_token_latency = self._time_since(req_stats.arrival_time)
@@ -136,6 +137,7 @@ class IterationStats:
             req_stats.first_token_ts = engine_core_timestamp
         else:
             itl = engine_core_timestamp - req_stats.last_token_ts
+            self.req_ids_tbt.append(request_id)
             self.inter_token_latencies_iter.append(itl)
 
         req_stats.last_token_ts = engine_core_timestamp

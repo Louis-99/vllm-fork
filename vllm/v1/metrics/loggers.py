@@ -670,7 +670,8 @@ class CSVLogger(StatLoggerBase):
                 "max_num_generation_tokens_iter": (
                     iteration_stats.max_num_generation_tokens_iter
                 ),
-                "request_ids": iteration_stats.req_ids,
+                "request_ids_iter_ttft": iteration_stats.req_ids_ttft,
+                "request_ids_iter_tbt": iteration_stats.req_ids_tbt,
                 "time_to_first_tokens_iter": (
                     iteration_stats.time_to_first_tokens_iter
                 ),
