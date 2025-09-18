@@ -145,28 +145,27 @@ def calc_perf_stats_single_instance(root_name: str,
         for req_id_row, tbts_row in df_perf_metric_prefill_steady[['request_ids_iter_tbt_evald', 'inter_token_latencies_iter_evald']].itertuples(index=False, name=None):
             for id, tbts in zip(req_id_row, tbts_row):
                 tbts_dict[id].append(tbts)
-    else:
-        for req_id_ttft_row, tbts_row, req_id_tbt_row, ttft_row in df_perf_metric_decode_steady[['request_ids_iter_tbt_evald', 'inter_token_latencies_iter_evald', 'request_ids_iter_ttft_evald', 'time_to_first_tokens_iter_evald']].itertuples(index=False, name=None):
+    elif "decode" in root_name:
+        for req_id_tbt_row, tbts_row, req_id_ttft_row, ttft_row in df_perf_metric_decode_steady[['request_ids_iter_tbt_evald', 'inter_token_latencies_iter_evald', 'request_ids_iter_ttft_evald', 'time_to_first_tokens_iter_evald']].itertuples(index=False, name=None):
             for id_tbt, tbts in zip(req_id_tbt_row, tbts_row):
                 tbts_dict[id_tbt].append(tbts)
-            # add ttft as well
-            for id_ttft, ttft in zip(req_id_ttft_row, ttft_row):
-                tbts_dict[id_ttft].append(ttft)
+            # add ttft as well if you want to include queueing time in tpot
+            # for id_ttft, ttft in zip(req_id_ttft_row, ttft_row):
+            #     tbts_dict[id_ttft].append(ttft)
     tpot_list = [sum(tbts)/len(tbts) for tbts in tbts_dict.values() if len(tbts) > 0]
 
     if 'prefill' in root_name:
         total_prefilled = sum(df_perf_metric_prefill_steady['num_prompt_tokens'].to_list())
         total_decoded = sum(df_perf_metric_prefill_steady['num_generation_tokens'].to_list())
+    else:
+        total_prefilled = sum(df_perf_metric_decode_steady['num_prompt_tokens'].to_list())
+        total_decoded = sum(df_perf_metric_decode_steady['num_generation_tokens'].to_list())
 
     
     running_list = []
     waiting_list = []
     kv_usage_list = []
-    if "prefill_and_decode" in root_name:
-        running_list = df_perf_metric_prefill_steady['num_running_reqs'].to_list()
-        waiting_list = df_perf_metric_prefill_steady['num_waiting_reqs'].to_list()
-        kv_usage_list = df_perf_metric_prefill_steady['KV_usage_perc'].to_list()
-    elif "prefill" in root_name:
+    if "prefill" in root_name:
         running_list = df_perf_metric_prefill_steady['num_running_reqs'].to_list()
         waiting_list = df_perf_metric_prefill_steady['num_waiting_reqs'].to_list()
         kv_usage_list = df_perf_metric_prefill_steady['KV_usage_perc'].to_list()
