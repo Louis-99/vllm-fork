@@ -93,7 +93,8 @@ class IterationStats:
     def __init__(self):
         self.iteration_timestamp = time.time()
         self.num_generation_tokens = 0
-        self.num_prompt_tokens = 0
+        self.num_prompt_tokens: int = 0
+        self.num_prompt_tokens_reqs: list[int] = []
         self.num_preempted_reqs = 0
         self.finished_requests: list[FinishedRequestStats] = []
         self.max_num_generation_tokens_iter: list[int] = []
@@ -111,7 +112,8 @@ class IterationStats:
 
     def update_from_output(self, output: "EngineCoreOutput",
                            engine_core_timestamp: float, is_prefilling: bool,
-                           prompt_len: int, req_stats: RequestStateStats,
+                           prompt_len: int,
+                           req_stats: RequestStateStats,
                            request_id: str,
                            lora_stats: Optional[LoRAStats]):
         num_new_generation_tokens = len(output.new_token_ids)
@@ -119,6 +121,7 @@ class IterationStats:
         self.num_generation_tokens += num_new_generation_tokens
         if is_prefilling:
             self.req_ids_ttft.append(request_id)
+            self.num_prompt_tokens_reqs.append(prompt_len)
             self.num_prompt_tokens += prompt_len
 
             first_token_latency = self._time_since(req_stats.arrival_time)
@@ -138,6 +141,7 @@ class IterationStats:
         else:
             itl = engine_core_timestamp - req_stats.last_token_ts
             self.req_ids_tbt.append(request_id)
+            self.num_prompt_tokens_reqs.append(prompt_len)
             self.inter_token_latencies_iter.append(itl)
 
         req_stats.last_token_ts = engine_core_timestamp

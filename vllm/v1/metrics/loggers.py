@@ -664,7 +664,7 @@ class CSVLogger(StatLoggerBase):
                 'num_waiting_reqs': scheduler_stats.num_waiting_reqs,
                 "KV_usage_perc": scheduler_stats.kv_cache_usage,
                 "num_generation_tokens": iteration_stats.num_generation_tokens,
-                "num_prompt_tokens": iteration_stats.num_prompt_tokens,
+                "num_prompt_tokens_reqs": iteration_stats.num_prompt_tokens_reqs,
                 "num_preempted_reqs": iteration_stats.num_preempted_reqs,
                 'finished_requests': len(iteration_stats.finished_requests),
                 "max_num_generation_tokens_iter": (
