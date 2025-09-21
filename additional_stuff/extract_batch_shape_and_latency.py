@@ -16,6 +16,7 @@ from parse_vllm_output import load_logs_prefill_decode_power_logs
 @dataclass
 class LatencyAndShape:
     batch_size: int
+    input_len_sum: int
     input_len_mean: int
     input_len_std: float
     latency_prefill_s: float
@@ -54,6 +55,7 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
         latency_prefill_s = np.mean(row.time_to_first_tokens_iter_evald)
 
         lat_and_shape = LatencyAndShape(
+            input_len_sum=sum(row.num_prompt_tokens_reqs_evald),
             batch_size=batch_size,
             input_len_mean=input_len_mean,
             input_len_std=input_len_std,
@@ -86,12 +88,14 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
 
         # Compute statistics
         batch_size = len(row.num_prompt_tokens_reqs_evald)
+        input_len_sum = sum(inputs)
         input_len_mean = np.mean(inputs)
         input_len_std = np.std(inputs)
         latency_decode_s = np.mean(row.inter_token_latencies_iter_evald)
 
         lat_and_shape = LatencyAndShape(
             batch_size=batch_size,
+            input_len_sum=input_len_sum,
             input_len_mean=input_len_mean,
             input_len_std=input_len_std,
             latency_prefill_s=np.nan,
@@ -163,7 +167,7 @@ if __name__ == '__main__':
         merged_stats_prefill = {}
         merged_stats_decode = {}
         for stats in stats_list:
-            key = (stats.batch_size, stats.input_len_mean, stats.input_len_std)
+            key = (stats.batch_size, stats.input_len_sum, stats.input_len_mean, stats.input_len_std)
             if not np.isnan(stats.latency_prefill_s):
                 if key not in merged_stats_prefill:
                     merged_stats_prefill[key] = []
@@ -178,13 +182,14 @@ if __name__ == '__main__':
             latencies_decode = merged_stats_decode.get(key, [])
             merged_stats_rows.append({
                 'batch_size': key[0],
-                'input_len_mean': key[1],
-                'input_len_std': key[2],
-                'latency_prefill_s': np.mean(latencies_prefill) if latencies_prefill else np.nan,
-                'latency_decode_s': np.mean(latencies_decode) if latencies_decode else np.nan
+                'input_len_sum': key[1],
+                'input_len_mean': key[2],
+                'input_len_std': key[3],
+                'latency_prefill_s': np.median(latencies_prefill) if latencies_prefill else np.nan,
+                'latency_decode_s': np.median(latencies_decode) if latencies_decode else np.nan
             })
         merged_stats_df = pd.DataFrame(merged_stats_rows, columns=[
-            'batch_size', 'input_len_mean', 'input_len_std',
+            'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std',
             'latency_prefill_s', 'latency_decode_s'])
 
     df_stats = pd.DataFrame(merged_stats_df)
