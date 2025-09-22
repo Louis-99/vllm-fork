@@ -15,6 +15,7 @@ from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
 
 import msgspec
+import torch
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -161,6 +162,10 @@ class EngineCore:
 
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
+                        
+        # Initialize CUDA timing events for step_with_batch_queue performance monitoring
+        self.step_start_event: Optional[torch.cuda.Event] = None
+        self.step_end_event: Optional[torch.cuda.Event] = None
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -323,6 +328,15 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
+        # Start CUDA timing event for step_with_batch_queue
+        if torch.cuda.is_available():
+            self.step_start_event = torch.cuda.Event(enable_timing=True)
+            self.step_end_event = torch.cuda.Event(enable_timing=True)
+            self.step_start_event.record()
+        else:
+            self.step_start_event = None
+            self.step_end_event = None
+        
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -330,7 +344,7 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
-
+        
         model_executed = False
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
@@ -344,12 +358,18 @@ class EngineCore:
                 and not batch_queue[-1][0].done():
                 # Don't block on next worker response unless the queue is full
                 # or there are no more requests to schedule.
+                # Record end event before early return
+                if self.step_end_event is not None:
+                    self.step_end_event.record()
                 return None, True
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
+            # Record end event before early return
+            if self.step_end_event is not None:
+                self.step_end_event.record()
             return None, False
 
         # Block until the next result is available.
@@ -360,6 +380,10 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)
 
+        # Record end event before return
+        if self.step_end_event is not None:
+            self.step_end_event.record()
+        
         return engine_core_outputs, model_executed
 
     def shutdown(self):
@@ -763,8 +787,25 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+        
+        # Calculate step timing from CUDA events if available
+        step_timing_ms = None
+        if (hasattr(self, 'step_start_event') and hasattr(self, 'step_end_event') 
+            and self.step_start_event is not None and self.step_end_event is not None):
+            try:
+                # Synchronize to ensure events are recorded
+                torch.cuda.synchronize()
+                step_timing_ms = self.step_start_event.elapsed_time(self.step_end_event)
+            except Exception:
+                # If timing fails for any reason, just continue without timing
+                step_timing_ms = None
+        
         # Put EngineCoreOutputs into the output queue.
         for output in (outputs.items() if outputs else ()):
+            # Add timing information to the outputs
+            engine_index, engine_core_outputs = output
+            if step_timing_ms is not None:
+                engine_core_outputs.step_timing_ms = step_timing_ms
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)

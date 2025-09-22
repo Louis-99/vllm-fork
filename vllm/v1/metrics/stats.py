@@ -105,6 +105,8 @@ class IterationStats:
         self.req_ids_ttft: list[str] = []
         self.waiting_lora_adapters: dict[str, int] = {}
         self.running_lora_adapters: dict[str, int] = {}
+        # CUDA timing for step_with_batch_queue function
+        self.step_with_batch_queue_time_ms: Optional[float] = None
 
     def _time_since(self, start: float) -> float:
         """Calculate an interval relative to this iteration's timestamp."""

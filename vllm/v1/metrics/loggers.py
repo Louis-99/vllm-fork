@@ -678,6 +678,7 @@ class CSVLogger(StatLoggerBase):
                 "inter_token_latencies_iter": (
                     iteration_stats.inter_token_latencies_iter
                 ),
+                "step_with_batch_queue_time_ms": iteration_stats.step_with_batch_queue_time_ms
             }
 
             with self.buf_lock:

@@ -167,6 +167,9 @@ class EngineCoreOutputs(
     # In DP case, used to signal that a request was received for an
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: Optional[int] = None
+    
+    # Timing information for step_with_batch_queue function
+    step_timing_ms: Optional[float] = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:
