@@ -1166,7 +1166,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     if replication_times > 1:
         new_input_requests = input_requests[:replication_offset]
         for i in range(replication_offset, len(input_requests), replication_len):
-            new_input_requests.extend(input_requests[i : i + replication_len] * 2)
+            new_input_requests.extend(input_requests[i : i + replication_len] * replication_times)
         input_requests = new_input_requests
 
     goodput_config_dict = check_goodput_args(args)
