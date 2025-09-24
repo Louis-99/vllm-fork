@@ -1071,6 +1071,23 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "in seconds (default: 600 seconds / 10 minutes).",
     )
 
+    parser.add_argument(
+        "--replication-times",
+        type=int,
+        default=1,
+    )
+
+    parser.add_argument(
+        "--replication-len",
+        type=int,
+        default=1,
+    )
+
+    parser.add_argument(
+        "--replication-offset",
+        type=int,
+        default=0,
+    )
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
     return asyncio.run(main_async(args))
@@ -1141,6 +1158,17 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     # Load the dataset.
     input_requests = get_samples(args, tokenizer)
+
+    replication_times: int = args.replication_times
+    replication_len: int = args.replication_len
+    replication_offset: int = args.replication_offset
+
+    if replication_times > 1:
+        new_input_requests = input_requests[:replication_offset]
+        for i in range(replication_offset, len(input_requests), replication_len):
+            new_input_requests.extend(input_requests[i : i + replication_len] * 2)
+        input_requests = new_input_requests
+
     goodput_config_dict = check_goodput_args(args)
 
     # Collect the sampling parameters.
