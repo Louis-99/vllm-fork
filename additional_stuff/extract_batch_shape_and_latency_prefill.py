@@ -169,7 +169,7 @@ if __name__ == '__main__':
     merged_stats_rows = []
     for key in set(merged_stats_prefill.keys()).union(set(merged_stats_power.keys())):
         latencies_prefill = merged_stats_prefill.get(key, [])
-        latencies_decode = merged_stats_power.get(key, [])
+        powers = merged_stats_power.get(key, [])
         merged_stats_rows.append({
             'batch_size': key[0],
             'input_len_sum': key[1],
@@ -177,7 +177,7 @@ if __name__ == '__main__':
             'input_len_std': key[3],
             'latency_prefill_s': np.median(latencies_prefill) if latencies_prefill else np.nan,
             'latency_decode_s': np.nan,
-            'power_w': np.median(latencies_decode) if latencies_decode else np.nan,
+            'power_w': np.median(powers) if powers else np.nan,
             'freq_mhz': key[4]
         })
     merged_stats_df = pd.DataFrame(merged_stats_rows, columns=[
