@@ -55,30 +55,31 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
     df_perf_metric_decode_steady['request_ids_iter_tbt_evald'] = df_perf_metric_decode_steady['request_ids_iter_tbt'].apply(eval)
     df_perf_metric_decode_steady['inter_token_latencies_iter_evald'] = df_perf_metric_decode_steady['inter_token_latencies_iter'].apply(eval)
     df_perf_metric_decode_steady['num_prompt_tokens_reqs_evald'] = df_perf_metric_decode_steady['num_prompt_tokens_reqs'].apply(eval)
-
     num_computed_dict = {}
+    num_computed_tokens_list = [[] for _ in range(len(df_perf_metric_decode_steady))]
     #first get num_computed_tokens for each req in each row
     for row in df_perf_metric_decode_steady.itertuples():
         if len(row.request_ids_iter_tbt_evald) == 0:
             continue
-        for ID, in_len in zip(row.request_ids_iter_tbt_evald, row.num_prompt_tokens_reqs_evald):
-            if ID not in num_computed_dict:
-                num_computed_dict[ID] = in_len + 1
-            else:
-                num_computed_dict[ID] = num_computed_dict[ID] + 1
-    df_perf_metric_decode_steady['num_computed_tokens_reqs_evald'] = df_perf_metric_decode_steady['request_ids_iter_tbt_evald'].apply(
-        lambda reqs: [num_computed_dict[ID] for ID in reqs] if reqs else []
-    )
+        else:
+            for ID, in_len in zip(row.request_ids_iter_tbt_evald, row.num_prompt_tokens_reqs_evald):
+                if ID not in num_computed_dict:
+                    num_computed_dict[ID] = in_len + 1
+                else:
+                    num_computed_dict[ID] = num_computed_dict[ID] + 1
+            num_computed_tokens_list[row.Index] = [num_computed_dict[ID] for ID in row.request_ids_iter_tbt_evald]
+    df_perf_metric_decode_steady['num_computed_tokens_reqs_evald'] = num_computed_tokens_list
+    print(df_perf_metric_decode_steady['num_computed_tokens_reqs_evald'])
 
     lat_and_shape_list = []
 
     start_time = df_perf_metric_decode_steady['now'].min()
     end_time = df_perf_metric_decode_steady['now'].max()
     df_power = df_power[(df_power['Timestamp'] >= start_time) & (df_power['Timestamp'] <= end_time)]
-    
-    window = 0.5  # 0.5 second windows
+
+    window = 0.3  # seconds
     start_subsection = df_power['Timestamp'].min()
-    end_subsection = start_subsection + window  # 0.5 second windows
+    end_subsection = start_subsection + window  # 
     while end_subsection <= df_power['Timestamp'].max():
         df_power_sub = df_power[(df_power['Timestamp'] >= start_subsection) & (df_power['Timestamp'] < end_subsection)]
         df_decode_sub = df_perf_metric_decode_steady[(df_perf_metric_decode_steady['now'] >= start_subsection) & (df_perf_metric_decode_steady['now'] < end_subsection)]
@@ -103,7 +104,7 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
             continue
         input_len_sum = int(np.median([sum(lens) for lens in input_lens]))
         input_len_mean = float(np.median([np.mean(lens) for lens in input_lens]))
-        input_len_std = float(np.std([np.mean(lens) for lens in input_lens]))
+        input_len_std = float(np.median([np.std(lens) for lens in input_lens]))
         latencies = df_decode_sub['inter_token_latencies_iter_evald'].dropna().tolist()
         latency_decode_s = np.median([np.median(lats) for lats in latencies])
 
@@ -187,6 +188,7 @@ if __name__ == '__main__':
     # merge prefill and decode for same batch shape, input lengths
     merged_stats_decode = {}
     merged_stats_power = {}
+    merged_stats_rows = []
     for stats in stats_list:
         freq = int(round(stats.freq_mhz / 10.0) * 10) if not np.isnan(stats.freq_mhz) else np.nan
         key = (stats.batch_size, stats.input_len_sum, stats.input_len_mean, stats.input_len_std, freq)
@@ -197,7 +199,7 @@ if __name__ == '__main__':
             merged_stats_power[key] = []
         merged_stats_power[key].append(stats.power_w)
 
-    merged_stats_rows = []
+    
     for key in set(merged_stats_power.keys()).union(set(merged_stats_decode.keys())):
         power = merged_stats_power.get(key, [])
         latencies_decode = merged_stats_decode.get(key, [])
@@ -216,5 +218,5 @@ if __name__ == '__main__':
         'latency_prefill_s', 'latency_decode_s', 'power_w', 'freq_mhz'])
 
     df_stats = pd.DataFrame(merged_stats_df)
-    df_stats = df_stats.sort_values(by=['batch_size', 'input_len_mean']).reset_index(drop=True)
+    df_stats = df_stats.sort_values(by=['batch_size', 'input_len_sum', 'input_len_mean']).reset_index(drop=True)
     df_stats.to_csv(expr_root / 'metrics.csv', index=False)
