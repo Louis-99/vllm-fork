@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
         decoder_base_url = f'http://{host}:{port}/v1'
         app.state.decode_clients.append({
             'client':
-            httpx.AsyncClient(timeout=None, base_url=decoder_base_url),
+            httpx.AsyncClient(timeout=None, base_url=decoder_base_url, limits=httpx.Limits(max_keepalive_connections=512, max_connections=512)),
             'host':
             host,
             'port':
