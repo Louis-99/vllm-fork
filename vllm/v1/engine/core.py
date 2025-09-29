@@ -164,8 +164,8 @@ class EngineCore:
                         self.step_with_batch_queue)
                         
         # Initialize CUDA timing events for step_with_batch_queue performance monitoring
-        self.step_start_event: Optional[torch.cuda.Event] = None
-        self.step_end_event: Optional[torch.cuda.Event] = None
+        self.step_start_events: queue[torch.cuda.Event] = queue.Queue(4)
+        self.step_end_events: queue[torch.cuda.Event] = queue.Queue(4)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -330,13 +330,13 @@ class EngineCore:
         """
         # Start CUDA timing event for step_with_batch_queue
         if torch.cuda.is_available():
-            self.step_start_event = torch.cuda.Event(enable_timing=True)
-            self.step_end_event = torch.cuda.Event(enable_timing=True)
-            self.step_start_event.record()
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            end_event = torch.cuda.Event(enable_timing=True)
         else:
-            self.step_start_event = None
-            self.step_end_event = None
-        
+            self.step_start_events = queue.Queue(4)
+            self.step_end_events = queue.Queue(4)
+
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -358,18 +358,12 @@ class EngineCore:
                 and not batch_queue[-1][0].done():
                 # Don't block on next worker response unless the queue is full
                 # or there are no more requests to schedule.
-                # Record end event before early return
-                if self.step_end_event is not None:
-                    self.step_end_event.record()
                 return None, True
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
-            # Record end event before early return
-            if self.step_end_event is not None:
-                self.step_end_event.record()
             return None, False
 
         # Block until the next result is available.
@@ -381,8 +375,9 @@ class EngineCore:
             scheduler_output, model_output)
 
         # Record end event before return
-        if self.step_end_event is not None:
-            self.step_end_event.record()
+        end_event.record()
+        self.step_start_events.put(start_event)
+        self.step_end_events.put(end_event)
         
         return engine_core_outputs, model_executed
 
@@ -790,12 +785,12 @@ class EngineCoreProc(EngineCore):
         
         # Calculate step timing from CUDA events if available
         step_timing_ms = None
-        if (hasattr(self, 'step_start_event') and hasattr(self, 'step_end_event') 
-            and self.step_start_event is not None and self.step_end_event is not None):
+        if self.step_start_events.qsize() > 3 and self.step_end_events.qsize() > 3:
             try:
-                # Synchronize to ensure events are recorded
-                torch.cuda.synchronize()
-                step_timing_ms = self.step_start_event.elapsed_time(self.step_end_event)
+                
+                start_event = self.step_start_events.get(block=False)
+                end_event = self.step_end_events.get(block=False)
+                step_timing_ms = start_event.elapsed_time(end_event)
             except Exception:
                 # If timing fails for any reason, just continue without timing
                 step_timing_ms = None
