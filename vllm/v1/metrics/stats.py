@@ -107,6 +107,9 @@ class IterationStats:
         self.running_lora_adapters: dict[str, int] = {}
         # CUDA timing for step_with_batch_queue function
         self.step_with_batch_queue_time_ms: Optional[float] = None
+        self.prefill_cpu_time: Optional[float] = None
+
+    last_iter: float = 0.0
 
     def _time_since(self, start: float) -> float:
         """Calculate an interval relative to this iteration's timestamp."""
@@ -147,6 +150,9 @@ class IterationStats:
             self.inter_token_latencies_iter.append(itl)
 
         req_stats.last_token_ts = engine_core_timestamp
+        
+        self.prefill_cpu_time = engine_core_timestamp - IterationStats.last_iter
+        IterationStats.last_iter = engine_core_timestamp
 
     def update_from_events(self, req_id: str, events: list["EngineCoreEvent"],
                            is_prefilling: bool, req_stats: RequestStateStats,
