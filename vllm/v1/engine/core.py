@@ -13,6 +13,8 @@ from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
+import torch
+import torch.cuda.nvtx as nvtx
 
 import msgspec
 import torch
@@ -164,8 +166,8 @@ class EngineCore:
                         self.step_with_batch_queue)
                         
         # Initialize CUDA timing events for step_with_batch_queue performance monitoring
-        self.step_start_events: queue[torch.cuda.Event] = queue.Queue(5)
-        self.step_end_events: queue[torch.cuda.Event] = queue.Queue(5)
+        self.step_start_events: queue[torch.cuda.Event] = queue.Queue(10)
+        self.step_end_events: queue[torch.cuda.Event] = queue.Queue(10)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -337,9 +339,14 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
         
         model_executed = False
         if self.scheduler.has_requests():
+            start_event.record()
+            self.step_start_events.put(start_event)
             scheduler_output = self.scheduler.schedule()
             future = self.model_executor.execute_model(scheduler_output,
                                                        non_block=True)
@@ -366,6 +373,9 @@ class EngineCore:
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)
+        
+        end_event.record()
+        self.step_end_events.put(end_event)
         
         return engine_core_outputs, model_executed
 
@@ -765,46 +775,38 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
+
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        end_event = torch.cuda.Event(enable_timing=True)
-
         # Step the engine core.
         outputs, model_executed = self.step_fn()
-
-        # Record end event before return
-        end_event.record()
-        self.step_start_events.put(start_event)
-        self.step_end_events.put(end_event)
         
-        # Calculate step timing from CUDA events if available
-        step_timing_ms = None
-        if self.step_start_events.qsize() > 3 and self.step_end_events.qsize() > 3:
-            try:
-                
-                start_event = self.step_start_events.get(block=False)
-                end_event = self.step_end_events.get(block=False)
-                step_timing_ms = start_event.elapsed_time(end_event)
-            except Exception:
-                # If timing fails for any reason, just continue without timing
-                step_timing_ms = None
+        # --- Compute elapsed time if enough events ---
+        step_timing_ms = 0.0
+        if self.step_end_events.qsize() > 1:
+            start_event = self.step_start_events.get()
+            end_event = self.step_end_events.get()
+            step_timing_ms = start_event.elapsed_time(end_event)
+            
         else:
-            print("Not enough CUDA events to calculate step timing")
-        
-        # Put EngineCoreOutputs into the output queue.
+            if self.step_start_events.qsize() > self.step_end_events.qsize():
+                start_event = self.step_start_events.get()
+
+        # --- Attach timing info to outputs ---
+        index = 0
         for output in (outputs.items() if outputs else ()):
-            # Add timing information to the outputs
             engine_index, engine_core_outputs = output
-            if step_timing_ms is not None:
+            if step_timing_ms > 0.0:
                 engine_core_outputs.step_timing_ms = step_timing_ms
             self.output_queue.put_nowait(output)
-        # Post-step hook.
+
         self.post_step(model_executed)
 
+        
+
         return model_executed
+
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
