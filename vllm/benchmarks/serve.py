@@ -44,8 +44,11 @@ from vllm.benchmarks.lib.utils import (convert_to_pytorch_benchmark_format,
                                        write_to_json)
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
+import pandas as pd
+
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
+SKIP_RUN = True
 
 class TaskType(Enum):
     GENERATION = "generation"
@@ -410,88 +413,88 @@ async def benchmark(
         raise ValueError(f"Unknown endpoint_type: {endpoint_type}")
 
     # Reuses connections across requests to reduce TLS handshake overhead.
-    connector = aiohttp.TCPConnector(
-        limit=max_concurrency or 0,
-        limit_per_host=max_concurrency or 0,
-        ttl_dns_cache=300,
-        use_dns_cache=True,
-        keepalive_timeout=60,
-        enable_cleanup_closed=True,
-        force_close=False,
-        ssl=("https://" in api_url),
-    )
+    # connector = aiohttp.TCPConnector(
+    #     limit=max_concurrency or 0,
+    #     limit_per_host=max_concurrency or 0,
+    #     ttl_dns_cache=300,
+    #     use_dns_cache=True,
+    #     keepalive_timeout=60,
+    #     enable_cleanup_closed=True,
+    #     force_close=False,
+    #     ssl=("https://" in api_url),
+    # )
 
-    session = aiohttp.ClientSession(
-        connector=connector,
-        trust_env=True,
-        timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
-    )
+    # session = aiohttp.ClientSession(
+    #     connector=connector,
+    #     trust_env=True,
+    #     timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
+    # )
 
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len, test_mm_content = (
-        input_requests[0].prompt,
-        input_requests[0].prompt_len,
-        input_requests[0].expected_output_len,
-        input_requests[0].multi_modal_data,
-    )
+    # print("Starting initial single prompt test run...")
+    # test_prompt, test_prompt_len, test_output_len, test_mm_content = (
+    #     input_requests[0].prompt,
+    #     input_requests[0].prompt_len,
+    #     input_requests[0].expected_output_len,
+    #     input_requests[0].multi_modal_data,
+    # )
 
-    assert (
-        test_mm_content is None
-        or isinstance(test_mm_content, dict)
-        or (
-            isinstance(test_mm_content, list)
-            and all(isinstance(item, dict) for item in test_mm_content)
-        )
-    ), "multi_modal_data must be a dict or list[dict]"
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-        extra_headers=extra_headers,
-        extra_body=extra_body,
-    )
+    # assert (
+    #     test_mm_content is None
+    #     or isinstance(test_mm_content, dict)
+    #     or (
+    #         isinstance(test_mm_content, list)
+    #         and all(isinstance(item, dict) for item in test_mm_content)
+    #     )
+    # ), "multi_modal_data must be a dict or list[dict]"
+    # test_input = RequestFuncInput(
+    #     model=model_id,
+    #     model_name=model_name,
+    #     prompt=test_prompt,
+    #     api_url=api_url,
+    #     prompt_len=test_prompt_len,
+    #     output_len=test_output_len,
+    #     logprobs=logprobs,
+    #     multi_modal_content=test_mm_content,
+    #     ignore_eos=ignore_eos,
+    #     extra_headers=extra_headers,
+    #     extra_body=extra_body,
+    # )
 
-    test_output = await wait_for_endpoint(
-        request_func,
-        test_input,
-        session,
-        timeout_seconds=ready_check_timeout_sec,
-    )
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
+    # test_output = await wait_for_endpoint(
+    #     request_func,
+    #     test_input,
+    #     session,
+    #     timeout_seconds=ready_check_timeout_sec,
+    # )
+    # if not test_output.success:
+    #     raise ValueError(
+    #         "Initial test run failed - Please make sure benchmark arguments "
+    #         f"are correctly specified. Error: {test_output.error}")
+    # else:
+    #     print("Initial test run completed. Starting main benchmark run...")
 
-    if lora_modules:
-        # For each input request, choose a LoRA module at random.
-        lora_modules = iter(
-            [random.choice(lora_modules) for _ in range(len(input_requests))])
+    # if lora_modules:
+    #     # For each input request, choose a LoRA module at random.
+    #     lora_modules = iter(
+    #         [random.choice(lora_modules) for _ in range(len(input_requests))])
 
-    if profile:
-        print("Starting profiler...")
-        profile_input = RequestFuncInput(model=model_id,
-                                         model_name=model_name,
-                                         prompt=test_prompt,
-                                         api_url=base_url + "/start_profile",
-                                         prompt_len=test_prompt_len,
-                                         output_len=test_output_len,
-                                         logprobs=logprobs,
-                                         multi_modal_content=test_mm_content,
-                                         ignore_eos=ignore_eos,
-                                         extra_headers=extra_headers,
-                                         extra_body=extra_body)
-        profile_output = await request_func(
-            request_func_input=profile_input, session=session)
-        if profile_output.success:
-            print("Profiler started")
+    # if profile:
+    #     print("Starting profiler...")
+    #     profile_input = RequestFuncInput(model=model_id,
+    #                                      model_name=model_name,
+    #                                      prompt=test_prompt,
+    #                                      api_url=base_url + "/start_profile",
+    #                                      prompt_len=test_prompt_len,
+    #                                      output_len=test_output_len,
+    #                                      logprobs=logprobs,
+    #                                      multi_modal_content=test_mm_content,
+    #                                      ignore_eos=ignore_eos,
+    #                                      extra_headers=extra_headers,
+    #                                      extra_body=extra_body)
+    #     profile_output = await request_func(
+    #         request_func_input=profile_input, session=session)
+    #     if profile_output.success:
+    #         print("Profiler started")
 
     distribution = ("Poisson process" if burstiness == 1.0
                     else "Gamma distribution")
@@ -537,6 +540,11 @@ async def benchmark(
             "timestamp": datetime.now().isoformat(),
         })
 
+    input_len_list = []
+    output_len_list = []
+    data_time_list = []
+    data_start_time = None
+
     async for request, current_request_rate in get_request(
             input_requests, request_rate, burstiness, ramp_up_strategy,
             ramp_up_start_rps, ramp_up_end_rps):
@@ -562,27 +570,45 @@ async def benchmark(
             req_lora_module = next(lora_modules)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
-        request_func_input = RequestFuncInput(model=req_model_id,
-                                              model_name=req_model_name,
-                                              prompt=prompt,
-                                              api_url=api_url,
-                                              prompt_len=prompt_len,
-                                              output_len=output_len,
-                                              logprobs=logprobs,
-                                              multi_modal_content=mm_content,
-                                              ignore_eos=ignore_eos,
-                                              extra_headers=extra_headers,
-                                              extra_body=extra_body,
-                                              request_id=request_id,)
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input,
-                                     session=session,
-                                     pbar=pbar)))
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+        cur_time = time.perf_counter()
+        if data_start_time is None:
+            data_start_time = cur_time
+        data_time_list.append(cur_time - data_start_time)
+        input_len_list.append(prompt_len)
+        output_len_list.append(output_len)
+
+        pbar.update()
+        # request_func_input = RequestFuncInput(model=req_model_id,
+        #                                       model_name=req_model_name,
+        #                                       prompt=prompt,
+        #                                       api_url=api_url,
+        #                                       prompt_len=prompt_len,
+        #                                       output_len=output_len,
+        #                                       logprobs=logprobs,
+        #                                       multi_modal_content=mm_content,
+        #                                       ignore_eos=ignore_eos,
+        #                                       extra_headers=extra_headers,
+        #                                       extra_body=extra_body,
+        #                                       request_id=request_id,)
+        # tasks.append(
+        #     asyncio.create_task(
+        #         limited_request_func(request_func_input=request_func_input,
+        #                              session=session,
+        #                              pbar=pbar)))
+    # outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if pbar is not None:
         pbar.close()
+
+    df = pd.DataFrame({
+        'time': data_time_list,
+        'input_len': input_len_list,
+        'output_len': output_len_list,
+    })
+
+    df.to_csv('trace.csv', index=False)
+    
+    return {}
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
