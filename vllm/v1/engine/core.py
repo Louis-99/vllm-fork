@@ -164,8 +164,8 @@ class EngineCore:
                         self.step_with_batch_queue)
                         
         # Initialize CUDA timing events for step_with_batch_queue performance monitoring
-        self.step_start_events: queue[torch.cuda.Event] = queue.Queue(4)
-        self.step_end_events: queue[torch.cuda.Event] = queue.Queue(4)
+        self.step_start_events: queue[torch.cuda.Event] = queue.Queue(5)
+        self.step_end_events: queue[torch.cuda.Event] = queue.Queue(5)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -328,14 +328,7 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
-        # Start CUDA timing event for step_with_batch_queue
-        if torch.cuda.is_available():
-            start_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-            end_event = torch.cuda.Event(enable_timing=True)
-        else:
-            self.step_start_events = queue.Queue(4)
-            self.step_end_events = queue.Queue(4)
+        
 
         batch_queue = self.batch_queue
         assert batch_queue is not None
@@ -373,11 +366,6 @@ class EngineCore:
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)
-
-        # Record end event before return
-        end_event.record()
-        self.step_start_events.put(start_event)
-        self.step_end_events.put(end_event)
         
         return engine_core_outputs, model_executed
 
@@ -780,8 +768,17 @@ class EngineCoreProc(EngineCore):
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        end_event = torch.cuda.Event(enable_timing=True)
+
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+
+        # Record end event before return
+        end_event.record()
+        self.step_start_events.put(start_event)
+        self.step_end_events.put(end_event)
         
         # Calculate step timing from CUDA events if available
         step_timing_ms = None
@@ -794,6 +791,8 @@ class EngineCoreProc(EngineCore):
             except Exception:
                 # If timing fails for any reason, just continue without timing
                 step_timing_ms = None
+        else:
+            print("Not enough CUDA events to calculate step timing")
         
         # Put EngineCoreOutputs into the output queue.
         for output in (outputs.items() if outputs else ()):
