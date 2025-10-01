@@ -375,7 +375,8 @@ class EngineCore:
             scheduler_output, model_output)
         
         end_event.record()
-        self.step_end_events.put(end_event)
+        if self.step_start_events.qsize() >= self.step_end_events.qsize()+1:
+            self.step_end_events.put(end_event)
         
         return engine_core_outputs, model_executed
 
@@ -785,16 +786,18 @@ class EngineCoreProc(EngineCore):
         # --- Compute elapsed time if enough events ---
         step_timing_ms = 0.0
         if self.step_end_events.qsize() > 1:
-            start_event = self.step_start_events.get()
-            end_event = self.step_end_events.get()
-            step_timing_ms = start_event.elapsed_time(end_event)
-            
-        else:
-            if self.step_start_events.qsize() > self.step_end_events.qsize():
-                start_event = self.step_start_events.get()
+            start_event = self.step_start_events.get(block=False)
+            end_event = self.step_end_events.get(block=False)
+            if start_event is not None and end_event is not None:
+                try:
+                    step_timing_ms = start_event.elapsed_time(end_event)
+                except Exception as e:
+                    logger.warning("Failed to get step timing: %s", str(e))
+                    self.step_start_events.put(start_event)
+                    for _ in range(self.step_start_events.qsize()-1):
+                        self.step_start_events.put(self.step_start_events.get())
 
         # --- Attach timing info to outputs ---
-        index = 0
         for output in (outputs.items() if outputs else ()):
             engine_index, engine_core_outputs = output
             if step_timing_ms > 0.0:
