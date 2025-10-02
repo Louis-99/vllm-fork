@@ -8,12 +8,15 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
 import time
+import numpy as np
 
 import joblib
 import skl2onnx
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 import onnxruntime as ort
+from skl2onnx.common.data_types import StringTensorType
+from sklearn.neural_network import MLPRegressor
 
 def load_and_prepare(path, model, tp=None):
     df = pd.read_csv(path)
@@ -24,48 +27,46 @@ def load_and_prepare(path, model, tp=None):
     for c in ["batch_size", "input_len_sum", "input_len_mean", "input_len_std", "latency_prefill_s", "latency_decode_s", "tp_degree", "freq_mhz"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-            if df[c].dtype == float:
-                df[c] = df[c].apply(lambda x: int(x * 1000) / 1000 if pd.notnull(x) else x)
     
     df["model"] = model
 
     # ensure monotonic increase of both input_len_mean and latency columns per batch size
-    df = df.sort_values(by=["model", 'batch_size', 'input_len_mean', 'input_len_std']).reset_index(drop=True)
-    for bs in df['batch_size'].unique():
-        mask = df['batch_size'] == bs
-        df_bs = df[mask]
-        # Ensure monotonicity of latency_prefill_s
-        last_val = None
-        middle_val = None
-        for i, row in df_bs.iterrows():
-            val = row["latency_prefill_s"]
-            if pd.isna(val):
-                last_val = middle_val
-                middle_val = None
-                continue
-            if last_val is not None and middle_val is not None and (val < middle_val or val < last_val) and (abs(val - middle_val) < abs(val - last_val)):
-                df_bs.at[i, "latency_prefill_s"] = pd.NA
-            elif last_val is not None and middle_val is not None and (val < middle_val or val < last_val) and (abs(val - middle_val) > abs(val - last_val)):
-                df_bs.at[i-1, "latency_prefill_s"] = pd.NA
-            last_val = middle_val
-            middle_val = val
-        # Ensure monotonicity of latency_prefill_s
-        last_val = None
-        middle_val = None
-        for i, row in df_bs.iterrows():
-            val = row["latency_decode_s"]
-            if pd.isna(val):
-                last_val = middle_val
-                middle_val = None
-                continue
-            if last_val is not None and middle_val is not None and (val < middle_val or val < last_val) and (abs(val - middle_val) < abs(val - last_val)):
-                df_bs.at[i, "latency_decode_s"] = pd.NA
-            elif last_val is not None and middle_val is not None and (val < middle_val or val < last_val) and (abs(val - middle_val) > abs(val - last_val)):
-                df_bs.at[i-1, "latency_decode_s"] = pd.NA
-            last_val = middle_val
-            middle_val = val
-        # put back
-        df.loc[mask, :] = df_bs
+    # df = df.sort_values(by=["model", 'batch_size', 'input_len_mean', 'input_len_std']).reset_index(drop=True)
+    # for bs in df['batch_size'].unique():
+    #     mask = df['batch_size'] == bs
+    #     df_bs = df[mask]
+    #     # Ensure monotonicity of latency_prefill_s
+    #     last_val = None
+    #     middle_val = None
+    #     for i, row in df_bs.iterrows():
+    #         val = row["latency_prefill_s"]
+    #         if pd.isna(val):
+    #             last_val = middle_val
+    #             middle_val = None
+    #             continue
+    #         if last_val is not None and middle_val is not None and (val < middle_val or val < last_val) and (abs(val - middle_val) < abs(val - last_val)):
+    #             df_bs.at[i, "latency_prefill_s"] = pd.NA
+    #         elif last_val is not None and middle_val is not None and (val < middle_val or val < last_val) and (abs(val - middle_val) > abs(val - last_val)):
+    #             df_bs.at[i-1, "latency_prefill_s"] = pd.NA
+    #         last_val = middle_val
+    #         middle_val = val
+    #     # Ensure monotonicity of latency_prefill_s
+    #     last_val = None
+    #     middle_val = None
+    #     for i, row in df_bs.iterrows():
+    #         val = row["latency_decode_s"]
+    #         if pd.isna(val):
+    #             last_val = middle_val
+    #             middle_val = None
+    #             continue
+    #         if last_val is not None and middle_val is not None and (val < middle_val or val < last_val) and (abs(val - middle_val) < abs(val - last_val)):
+    #             df_bs.at[i, "latency_decode_s"] = pd.NA
+    #         elif last_val is not None and middle_val is not None and (val < middle_val or val < last_val) and (abs(val - middle_val) > abs(val - last_val)):
+    #             df_bs.at[i-1, "latency_decode_s"] = pd.NA
+    #         last_val = middle_val
+    #         middle_val = val
+    #     # put back
+    #     df.loc[mask, :] = df_bs
 
     return df
 
@@ -73,9 +74,12 @@ def build_pipeline(target_col):
     # onehot encode model, scale numeric features
     cat_cols = ["model"]
     num_cols = ["batch_size", "input_len_sum", "input_len_mean", "input_len_std", "tp_degree", "freq_mhz"]
+    # pre = ColumnTransformer([
+    #     ("ohe_model", OneHotEncoder(handle_unknown="ignore"), cat_cols)
+    # ], remainder="passthrough")
     pre = ColumnTransformer([
         ("ohe_model", OneHotEncoder(handle_unknown="ignore"), cat_cols)
-    ], remainder="passthrough")
+    ], remainder=StandardScaler())
     if target_col == "latency_decode_s":
         est = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
     else:
@@ -101,12 +105,16 @@ def train_and_save(df):
         mae = mean_absolute_error(y_test, y_pred)
         mape = (abs(y_test - y_pred) / y_test).mean() * 100
         r2 = r2_score(y_test, y_pred)
+        # y_pred = pipe.predict(X_train)
+        # mae = mean_absolute_error(y_train, y_pred)
+        # mape = (abs(y_train - y_pred) / y_train).mean() * 100
+        # r2 = r2_score(y_train, y_pred)
         path = os.path.join(MODEL_DIR, out_name)
 
         joblib.dump(pipe, path)
         # Save as ONNX model
         onnx_path = os.path.join(MODEL_DIR, out_name.replace(".joblib", ".onnx"))
-        from skl2onnx.common.data_types import StringTensorType
+
         initial_type = []
         for name in FEATURE_COLS:
             if name == "model":
@@ -118,11 +126,13 @@ def train_and_save(df):
             f.write(onnx_model.SerializeToString())
         results[target_col] = {"model_path": path, "mae": mae, "mape": mape, "r2": r2, "n_train": len(X_train)}
         print(f"trained {target_col}: saved -> {path}  MAE={mae:.4f}  MAPE={mape:.4f}  R2={r2:.4f}  train_rows={len(X_train)}")
+
         # Save ground truth, predicted values, and input features to CSV
         results_df = X_test.copy()
         results_df["ground_truth"] = y_test.values
         results_df["predicted"] = y_pred
         results_df["error"] = results_df["predicted"] - results_df["ground_truth"]
+        results_df = results_df.sort_values(by="error", key=abs, ascending=False).reset_index(drop=True)
         results_csv_path = os.path.join(MODEL_DIR, f"{target_col}_pred_vs_true.csv")
         results_df.to_csv(results_csv_path, index=False)
     return results
@@ -171,9 +181,9 @@ def predict_latencies(inputs, decode_model, prefill_model):
             input_feed[col] = val.astype(str)
         else:
             input_feed[col] = val.astype("float32")
-    out["decode_time"] = float(decode_model.run(None, input_feed)[0][0])
+    out["decode_time"] = float(decode_model.run(None, input_feed)[0][0].item())
 
-    out["prefill_time"] = float(prefill_model.run(None, input_feed)[0][0])
+    out["prefill_time"] = float(prefill_model.run(None, input_feed)[0][0].item())
     return out
 
 if __name__ == '__main__':
@@ -192,15 +202,29 @@ if __name__ == '__main__':
     df = pd.concat([df_tp2_P, df_tp2_D], ignore_index=True)
 
     df[["model", "batch_size", "input_len_sum", "input_len_mean", "input_len_std", "latency_prefill_s", "tp_degree", "freq_mhz"]].dropna().to_csv("prefill_cleaned.csv", index=False)
+    df[["model", "batch_size", "input_len_sum", "input_len_mean", "input_len_std", "latency_decode_s", "tp_degree", "freq_mhz"]].dropna().to_csv("decode_cleaned.csv", index=False)
 
     stats = train_and_save(df)
     dec_model, pre_model = load_models()
-    # example prediction
-    example = ["gemma-2-27b-it", 1, 100, 100, 0, 2, 1410]  # model,batch_size,total_tokens,tp_degree,freq_mhz
-    start = time.time()
 
-    pred = predict_latencies(example, decode_model=dec_model, prefill_model=pre_model)
-    elapsed = time.time() - start
-    print(f"Prediction took {elapsed:.6f} seconds")
-    print("example input:", example)
-    print("predicted latencies:", pred)
+    # Calculate statistics for batch1
+    batch1 = [512] * 3
+
+    def get_features(batch, model_name, batch_size, tp_degree, freq_mhz):
+        arr = np.array(batch)
+        return [
+            model_name,
+            batch_size,
+            arr.sum(),
+            arr.mean(),
+            arr.std(),
+            tp_degree,
+            freq_mhz,
+        ]
+
+    features1 = get_features(batch1, "gemma-2-27b-it", len(batch1), 2, 1410)
+
+    pred1 = predict_latencies(features1, decode_model=dec_model, prefill_model=pre_model)
+
+    print("Batch 1 features:", features1)
+    print("Batch 1 predicted latencies:", pred1)
