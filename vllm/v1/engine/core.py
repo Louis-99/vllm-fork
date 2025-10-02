@@ -293,17 +293,25 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        start_event.record()
+        self.step_start_events.put(start_event)
+
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
+
+        end_event.record()
+        self.step_end_events.put(end_event)
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
@@ -791,11 +799,11 @@ class EngineCoreProc(EngineCore):
             if start_event is not None and end_event is not None:
                 try:
                     step_timing_ms = start_event.elapsed_time(end_event)
-                except Exception as e:
-                    logger.warning("Failed to get step timing: %s", str(e))
-                    self.step_start_events.put(start_event)
-                    for _ in range(self.step_start_events.qsize()-1):
-                        self.step_start_events.put(self.step_start_events.get())
+                except RuntimeError as e:
+                    logger.warning("Failed to get step timing, putting end_event back")
+                    self.step_end_events.put(end_event)
+                    for _ in range(self.step_end_events.qsize()-1):
+                        self.step_end_events.put(self.step_end_events.get())
 
         # --- Attach timing info to outputs ---
         for output in (outputs.items() if outputs else ()):
@@ -805,8 +813,6 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
 
         self.post_step(model_executed)
-
-        
 
         return model_executed
 
