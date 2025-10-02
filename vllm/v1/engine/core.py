@@ -169,6 +169,11 @@ class EngineCore:
         self.step_start_events: queue[torch.cuda.Event] = queue.Queue(10)
         self.step_end_events: queue[torch.cuda.Event] = queue.Queue(10)
 
+        if self.step_fn == self.step:
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            self.step_start_events.put(start_event)
+
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
@@ -295,14 +300,14 @@ class EngineCore:
         """
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        start_event.record()
+        
         self.step_start_events.put(start_event)
-
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
@@ -793,7 +798,12 @@ class EngineCoreProc(EngineCore):
         
         # --- Compute elapsed time if enough events ---
         step_timing_ms = 0.0
-        if self.step_end_events.qsize() > 1:
+        if self.step_fn == self.step and self.step_end_events.qsize() > 1:
+            start_event = self.step_start_events.get(block=False)
+            end_event = self.step_end_events.get(block=False)
+            step_timing_ms = start_event.elapsed_time(end_event)
+
+        elif self.step_end_events.qsize() > 1:
             start_event = self.step_start_events.get(block=False)
             end_event = self.step_end_events.get(block=False)
             if start_event is not None and end_event is not None:
