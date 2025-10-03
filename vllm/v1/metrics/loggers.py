@@ -679,6 +679,7 @@ class CSVLogger(StatLoggerBase):
                     iteration_stats.inter_token_latencies_iter
                 ),
                 "step_with_batch_queue_time_ms_1_iters_delay": iteration_stats.step_with_batch_queue_time_ms,
+                "since_last_batch_ms_1_iters_delay": iteration_stats.since_last_batch_ms,
                 "engine_core_timestamp": iteration_stats.engine_core_timestamp,
             }
 

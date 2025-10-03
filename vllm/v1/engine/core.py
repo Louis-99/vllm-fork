@@ -166,13 +166,15 @@ class EngineCore:
                         self.step_with_batch_queue)
                         
         # Initialize CUDA timing events for step_with_batch_queue performance monitoring
-        self.step_start_events: queue[torch.cuda.Event] = queue.Queue(10)
-        self.step_end_events: queue[torch.cuda.Event] = queue.Queue(10)
+        self.step_start_events: deque[torch.cuda.Event] = deque(maxlen=10)
+        self.step_end_events: deque[torch.cuda.Event] = deque(maxlen=10)
+        self.last_step_end_events: deque[torch.cuda.Event] = deque(maxlen=10)
+        self.stream = torch.cuda.Stream()
 
-        if self.step_fn == self.step:
-            start_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-            self.step_start_events.put(start_event)
+        # if self.step_fn == self.step:
+        #     start_event = torch.cuda.Event(enable_timing=True)
+        #     start_event.record(stream=self.stream)
+        #     self.step_start_events.append(start_event)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -298,25 +300,17 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
         
-        self.step_start_events.put(start_event)
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
-
-        end_event.record()
-        self.step_end_events.put(end_event)
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
@@ -329,7 +323,7 @@ class EngineCore:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
     def step_with_batch_queue(
-            self) -> tuple[Optional[dict[int, EngineCoreOutputs]], bool]:
+            self) -> tuple[Optional[dict[int, EngineCoreOutputs]], bool, bool]:
         """Schedule and execute batches with the batch queue.
         Note that if nothing to output in this step, None is returned.
 
@@ -343,8 +337,6 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
-        
-
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -352,14 +344,10 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
-
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
         
         model_executed = False
+        actually_new_req = False
         if self.scheduler.has_requests():
-            start_event.record()
-            self.step_start_events.put(start_event)
             scheduler_output = self.scheduler.schedule()
             future = self.model_executor.execute_model(scheduler_output,
                                                        non_block=True)
@@ -367,17 +355,23 @@ class EngineCore:
                 (future, scheduler_output))  # type: ignore[arg-type]
 
             model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            if model_executed:
+                # either a new request, or a preempted request or num scheduled tokens > num cached reqs
+                actually_new_req = len(scheduler_output.scheduled_new_reqs) > 0 or \
+                                    any(scheduler_output.scheduled_cached_reqs.resumed_from_preemption) or \
+                                    scheduler_output.total_num_scheduled_tokens > len(scheduler_output.scheduled_cached_reqs.req_ids)
             if model_executed and len(batch_queue) < self.batch_queue_size \
                 and not batch_queue[-1][0].done():
                 # Don't block on next worker response unless the queue is full
                 # or there are no more requests to schedule.
-                return None, True
+                
+                return None, True, actually_new_req
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
-            return None, False
+            return None, False, actually_new_req
 
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
@@ -387,11 +381,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)
         
-        end_event.record()
-        if self.step_start_events.qsize() >= self.step_end_events.qsize()+1:
-            self.step_end_events.put(end_event)
-        
-        return engine_core_outputs, model_executed
+        return engine_core_outputs, model_executed, actually_new_req
 
     def shutdown(self):
         self.structured_output_manager.clear_backend()
@@ -793,33 +783,45 @@ class EngineCoreProc(EngineCore):
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
+        start_event1 = torch.cuda.Event(enable_timing=True)  
+        end_event1 = torch.cuda.Event(enable_timing=True)
+        start_event1.record()
+
         # Step the engine core.
-        outputs, model_executed = self.step_fn()
-        
+        outputs, model_executed, actually_new_req = self.step_fn()
+
+        end_event1.record()
+
+        if outputs and \
+         any(len(out.outputs) > 0 for out in outputs.values()) and \
+         any(any(core_output.events for core_output in out.outputs) for out in outputs.values()):
+            self.step_end_events.appendleft(end_event1)
+        if actually_new_req:
+            self.step_start_events.appendleft(start_event1)
+
         # --- Compute elapsed time if enough events ---
         step_timing_ms = 0.0
-        if self.step_fn == self.step and self.step_end_events.qsize() > 1:
-            start_event = self.step_start_events.get(block=False)
-            end_event = self.step_end_events.get(block=False)
-            step_timing_ms = start_event.elapsed_time(end_event)
-
-        elif self.step_end_events.qsize() > 1:
-            start_event = self.step_start_events.get(block=False)
-            end_event = self.step_end_events.get(block=False)
-            if start_event is not None and end_event is not None:
-                try:
-                    step_timing_ms = start_event.elapsed_time(end_event)
-                except RuntimeError as e:
-                    logger.warning("Failed to get step timing, putting end_event back")
-                    self.step_end_events.put(end_event)
-                    for _ in range(self.step_end_events.qsize()-1):
-                        self.step_end_events.put(self.step_end_events.get())
+        since_last_batch_ms = -1
+        if len(self.step_end_events) > 1:
+            start_event = self.step_start_events.pop()
+            end_event = self.step_end_events.pop()
+            try:
+                step_timing_ms = start_event.elapsed_time(end_event)
+            except Exception as e:
+                logger.warning("Failed to get step timing, %s", e)
+                # self.step_end_events.append(end_event)
+                
+            if len(self.last_step_end_events) > 0 and step_timing_ms > 0.0:
+                last_end_event = self.last_step_end_events.pop()
+                since_last_batch_ms = last_end_event.elapsed_time(
+                    start_event)    
+            self.last_step_end_events.append(end_event)
 
         # --- Attach timing info to outputs ---
         for output in (outputs.items() if outputs else ()):
             engine_index, engine_core_outputs = output
-            if step_timing_ms > 0.0:
-                engine_core_outputs.step_timing_ms = step_timing_ms
+            engine_core_outputs.step_timing_ms = step_timing_ms
+            engine_core_outputs.since_last_batch_ms = since_last_batch_ms
             self.output_queue.put_nowait(output)
 
         self.post_step(model_executed)

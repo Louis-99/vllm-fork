@@ -170,6 +170,7 @@ class EngineCoreOutputs(
     
     # Timing information for step_with_batch_queue function
     step_timing_ms: Optional[float] = None
+    since_last_batch_ms: Optional[float] = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:

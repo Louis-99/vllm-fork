@@ -466,6 +466,7 @@ class AsyncLLM(EngineClient):
                     # Extract step timing information if available
                     if iteration_stats is not None and outputs.step_timing_ms is not None:
                         iteration_stats.step_with_batch_queue_time_ms = outputs.step_timing_ms
+                        iteration_stats.since_last_batch_ms = outputs.since_last_batch_ms
 
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the

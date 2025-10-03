@@ -107,6 +107,7 @@ class IterationStats:
         self.running_lora_adapters: dict[str, int] = {}
         # CUDA timing for step_with_batch_queue function
         self.step_with_batch_queue_time_ms: Optional[float] = None
+        self.since_last_batch_ms: Optional[float] = None
         self.engine_core_timestamp: Optional[float] = None
 
     last_iter: float = 0.0
