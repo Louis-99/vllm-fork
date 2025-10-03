@@ -32,10 +32,12 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
     df_perf_metric_prefill_steady['request_ids_iter_ttft_evald'] = df_perf_metric_prefill_steady['request_ids_iter_ttft'].apply(eval)
     df_perf_metric_prefill_steady['time_to_first_tokens_iter_evald'] = df_perf_metric_prefill_steady['time_to_first_tokens_iter'].apply(eval)
     df_perf_metric_prefill_steady['num_prompt_tokens_reqs_evald'] = df_perf_metric_prefill_steady['num_prompt_tokens_reqs'].apply(eval)
-    df_perf_metric_prefill_steady['time_since_last_iter'] = df_perf_metric_prefill_steady['now'].diff().fillna(0)
 
-    if "step_with_batch_queue_time_ms" not in df_perf_metric_prefill_steady.columns:
-        df_perf_metric_prefill_steady["step_with_batch_queue_time_ms"] = df_perf_metric_prefill_steady["step_with_batch_queue_time_ms_1_iters_delay"].shift(-1)
+    # drop empty rows first
+    df_perf_metric_prefill_steady = df_perf_metric_prefill_steady[df_perf_metric_prefill_steady['request_ids_iter_ttft_evald'].apply(lambda x: len(x) > 0)].copy()
+    # then do shift of gpu times
+    df_perf_metric_prefill_steady.loc[:, "step_with_batch_queue_time_ms"] = df_perf_metric_prefill_steady["step_with_batch_queue_time_ms_1_iters_delay"].shift(-1)
+    df_perf_metric_prefill_steady.loc[:, "since_last_batch_ms_1_iters_delay"] = df_perf_metric_prefill_steady["since_last_batch_ms_1_iters_delay"].shift(-1)
 
     lat_and_shape_list = []
 
@@ -102,11 +104,12 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
         input_len_std = float(np.std(input_lens))
         latencies = [row.step_with_batch_queue_time_ms/ 1000.0]
         latency_prefill_s = np.median(latencies) if len(latencies) > 0 else np.nan
+        time_since_last_iter = row.since_last_batch_ms_1_iters_delay / 1000.0 if not pd.isna(row.since_last_batch_ms_1_iters_delay) else np.nan
 
-        if latency_prefill_s > row.time_since_last_iter:
-            continue
-        if latency_prefill_s <= 0.002:  # if less than 2ms
-            continue
+        # if any(row.time_to_first_tokens_iter_evald < latency_prefill_s):
+        #     continue
+        # if latency_prefill_s <= 0.002:  # if less than 2ms
+        #     continue
 
         lat_and_shape_list.append(LatencyAndShape(
             batch_size=batch_size,
@@ -117,6 +120,7 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
             latency_decode_s=np.nan,
             power_w=0,
             freq_mhz=1410,
+            since_last_batch_s=time_since_last_iter
         ))
 
     return lat_and_shape_list
@@ -219,7 +223,7 @@ if __name__ == '__main__':
     merged_stats_power = {}
     for stats in stats_list:
         freq = int(round(stats.freq_mhz / 10.0) * 10) if not np.isnan(stats.freq_mhz) else np.nan
-        key = (stats.batch_size, stats.input_len_sum, stats.input_len_mean, stats.input_len_std, freq)
+        key = (stats.batch_size, stats.input_len_sum, stats.input_len_mean, stats.input_len_std, freq, stats.since_last_batch_s)
         if not np.isnan(stats.latency_prefill_s):
             if key not in merged_stats_prefill:
                 merged_stats_prefill[key] = []
@@ -241,10 +245,11 @@ if __name__ == '__main__':
             'latency_decode_s': np.nan,
             'power_w': np.median(powers) if powers else np.nan,
             'freq_mhz': key[4],
+            'since_last_batch_s': key[5],
         })
     merged_stats_df = pd.DataFrame(merged_stats_rows, columns=[
         'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std',
-        'latency_prefill_s', 'latency_decode_s', 'power_w', 'freq_mhz'])
+        'latency_prefill_s', 'latency_decode_s', 'power_w', 'freq_mhz', 'since_last_batch_s'])
 
     print(f'len of unmerged stats: {len(stats_list)}, merged stats: {len(merged_stats_df)}')
 

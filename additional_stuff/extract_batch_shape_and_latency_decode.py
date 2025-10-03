@@ -22,6 +22,7 @@ class LatencyAndShape:
     latency_decode_s: float
     power_w: float
     freq_mhz: float
+    since_last_batch_s: float
 
 # get power for this window
 def compute_power_w(df_power_sub):
@@ -144,6 +145,7 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
             latency_decode_s=latency_decode_s,
             power_w=0,
             freq_mhz=1410,
+            since_last_batch_s=np.nan
         ))
 
     return lat_and_shape_list
