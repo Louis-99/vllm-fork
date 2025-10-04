@@ -7,15 +7,14 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
-import time
-import numpy as np
+import matplotlib.pyplot as plt
 
 import joblib
-import skl2onnx
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 import onnxruntime as ort
 from skl2onnx.common.data_types import StringTensorType
+from sklearn import tree
 
 def load_and_prepare(path, model, tp=None):
     df = pd.read_csv(path)
@@ -77,6 +76,23 @@ def train_and_save(df):
         results_df = results_df.sort_values(by="error", key=abs, ascending=False).reset_index(drop=True)
         results_csv_path = os.path.join(MODEL_DIR, f"{target_col}_pred_vs_true.csv")
         results_df.to_csv(results_csv_path, index=False)
+
+        
+
+        # Plot and save the first tree in the RandomForest
+        estimator = pipe.named_steps["est"].estimators_[0]
+        fig, ax = plt.subplots(figsize=(20, 10))
+        tree.plot_tree(
+            estimator,
+            feature_names=pipe.named_steps["pre"].get_feature_names_out(FEATURE_COLS),
+            filled=True,
+            rounded=True,
+            fontsize=8,
+            max_depth=3
+        )
+        plot_path = os.path.join(MODEL_DIR, f"{target_col}_tree_plot.png")
+        plt.savefig(plot_path, bbox_inches="tight")
+        plt.close(fig)
     return results
 
 def load_prefill_model():

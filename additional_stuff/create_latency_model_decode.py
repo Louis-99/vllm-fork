@@ -1,6 +1,8 @@
 import os
 import joblib
+from matplotlib import pyplot as plt
 import pandas as pd
+from sklearn import tree
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -35,7 +37,7 @@ def build_pipeline(target_col):
     pre = ColumnTransformer([
         ("ohe_model", OneHotEncoder(handle_unknown="ignore"), cat_cols)
     ], remainder=StandardScaler())
-    est = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+    est = RandomForestRegressor(n_estimators=5, random_state=42, n_jobs=-1)
     return Pipeline([("pre", pre), ("est", est)])
 
 def train_and_save(df):
@@ -77,6 +79,21 @@ def train_and_save(df):
         results_df = results_df.sort_values(by="error", key=abs, ascending=False).reset_index(drop=True)
         results_csv_path = os.path.join(MODEL_DIR, f"{target_col}_pred_vs_true.csv")
         results_df.to_csv(results_csv_path, index=False)
+
+        # Plot and save the first tree in the RandomForest
+        estimator = pipe.named_steps["est"].estimators_[0]
+        fig, ax = plt.subplots(figsize=(20, 10))
+        tree.plot_tree(
+            estimator,
+            feature_names=pipe.named_steps["pre"].get_feature_names_out(FEATURE_COLS),
+            filled=True,
+            rounded=True,
+            fontsize=8,
+            max_depth=3
+        )
+        plot_path = os.path.join(MODEL_DIR, f"{target_col}_tree_plot.png")
+        plt.savefig(plot_path, bbox_inches="tight")
+        plt.close(fig)
     return results
 
 def load_models():
@@ -129,24 +146,3 @@ if __name__ == '__main__':
 
     stats = train_and_save(df)
     dec_model = load_models()
-
-    batch1 = [512] * 3
-
-    def get_features(batch, model_name, batch_size, tp_degree, freq_mhz):
-        arr = np.array(batch)
-        return [
-            model_name,
-            batch_size,
-            arr.sum(),
-            arr.mean(),
-            arr.std(),
-            tp_degree,
-            freq_mhz,
-        ]
-
-    features1 = get_features(batch1, "gemma-2-27b-it", len(batch1), 2, 1410)
-
-    pred1 = predict_latencies(features1, decode_model=dec_model)
-
-    print("Batch 1 features:", features1)
-    print("Batch 1 predicted latencies:", pred1)
