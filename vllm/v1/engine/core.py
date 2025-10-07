@@ -303,7 +303,7 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
-            return {}, False
+            return {}, False, False
         
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
@@ -313,7 +313,7 @@ class EngineCore:
             scheduler_output, model_output)  # type: ignore
 
         return (engine_core_outputs,
-                scheduler_output.total_num_scheduled_tokens > 0)
+                scheduler_output.total_num_scheduled_tokens > 0, True)
 
     def post_step(self, model_executed: bool) -> None:
         if self.use_spec_decode and model_executed:
@@ -792,12 +792,17 @@ class EngineCoreProc(EngineCore):
 
         end_event1.record()
 
-        if outputs and \
-         any(len(out.outputs) > 0 for out in outputs.values()) and \
-         any(any(core_output.events for core_output in out.outputs) for out in outputs.values()):
-            self.step_end_events.appendleft(end_event1)
-        if actually_new_req:
-            self.step_start_events.appendleft(start_event1)
+        if self.step_fn == self.step_with_batch_queue:
+            if outputs and \
+            any(len(out.outputs) > 0 for out in outputs.values()) and \
+            any(any(core_output.events for core_output in out.outputs) for out in outputs.values()):
+                self.step_end_events.appendleft(end_event1)
+            if actually_new_req:
+                self.step_start_events.appendleft(start_event1)
+        else:
+            if model_executed:
+                self.step_end_events.appendleft(end_event1)
+                self.step_start_events.appendleft(start_event1)
 
         # --- Compute elapsed time if enough events ---
         step_timing_ms = 0.0
