@@ -54,7 +54,7 @@ def build_pipeline(role):
     if role == 'prefill':
         est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1)
     elif role == 'decode':
-        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1)
+        est = RandomForestRegressor(n_estimators=4, random_state=42, n_jobs=-1)
 
     return Pipeline([('pre', pre), ('est', est)])
 
@@ -246,7 +246,6 @@ def main():
         50,  # input_len_std
         2,  # tp_degree
         1830,  # freq_mhz
-        0,  # since_last_batch_s
     ]
 
     sample_decode = [
