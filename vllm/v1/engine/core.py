@@ -807,7 +807,7 @@ class EngineCoreProc(EngineCore):
         # --- Compute elapsed time if enough events ---
         step_timing_ms = 0.0
         since_last_batch_ms = -1
-        if len(self.step_end_events) > 1:
+        if len(self.step_end_events) > 1 and len(self.step_start_events) > 1:
             start_event = self.step_start_events.pop()
             end_event = self.step_end_events.pop()
             try:
