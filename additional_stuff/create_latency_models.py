@@ -54,7 +54,7 @@ def build_pipeline(role):
     if role == 'prefill':
         est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1)
     elif role == 'decode':
-        est = RandomForestRegressor(n_estimators=4, random_state=42, n_jobs=-1)
+        est = RandomForestRegressor(n_estimators=3, random_state=42, n_jobs=-1)
 
     return Pipeline([('pre', pre), ('est', est)])
 
@@ -171,7 +171,6 @@ def main():
     parser.add_argument('--no-prefill', action='store_true', help='Disable training prefill model')
     parser.add_argument('--no-decode', action='store_true', help='Disable training decode model')
     parser.add_argument('--model-dir', default=('/export2/obasit/ClusterLevelServing/vllm_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/models_tree'), help='Directory to store trained models')
-    parser.add_argument('--onnx', action='store_true', help='Attempt ONNX conversion for trained models')
     args = parser.parse_args()
 
     CSV_PATH_TP2_D = "/export2/obasit/ClusterLevelServing/vllm_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/default_log_path/decode_latencies.csv"
@@ -205,7 +204,7 @@ def main():
         print(f"prefill samples {len(df_p4.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_P}")
         df_prefill = pd.concat([df_p2, df_p4], ignore_index=True)
         df_prefill.to_csv(os.path.join(MODEL_DIR, 'prefill_cleaned.csv'), index=False)
-        stats_prefill = train_and_save(df_prefill, PREFILL_FEATURE_COLS, PREFILL_TARGET, PREFILL_OUT, MODEL_DIR, convert_onnx=args.onnx, role='prefill')
+        stats_prefill = train_and_save(df_prefill, PREFILL_FEATURE_COLS, PREFILL_TARGET, PREFILL_OUT, MODEL_DIR, convert_onnx=True, role='prefill')
     else:
         stats_prefill = None
 
@@ -218,7 +217,7 @@ def main():
         print(f"Decode samples {len(df_d4.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D}")
         df_decode = pd.concat([df_d2, df_d4], ignore_index=True)
         df_decode.to_csv(os.path.join(MODEL_DIR, 'decode_cleaned.csv'), index=False)
-        stats_decode = train_and_save(df_decode, DECODE_FEATURE_COLS, DECODE_TARGET, DECODE_OUT, MODEL_DIR, convert_onnx=args.onnx, role='decode')
+        stats_decode = train_and_save(df_decode, DECODE_FEATURE_COLS, DECODE_TARGET, DECODE_OUT, MODEL_DIR, convert_onnx=True, role='decode')
     else:
         stats_decode = None
 

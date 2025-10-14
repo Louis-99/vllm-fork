@@ -251,7 +251,6 @@ if __name__ == '__main__':
         merged_stats_df = pd.DataFrame(decode_stats_all, columns=[
             'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std',
             'latency_prefill_s', 'latency_decode_s', 'freq_mhz'])
-        merged_stats_df = merged_stats_df[merged_stats_df['input_len_sum'] < 8001]
 
         print(f'len of decode stats: {len(decode_stats_all)}')
 
