@@ -18,23 +18,33 @@ class LatencyAndShape:
     input_len_mean: float
     input_len_std: float
     power_w: float
+    energy: float
     freq_mhz: float
+    rate: float
 
 
-def compute_power_w(df_power_sub: pd.DataFrame):
+def compute_power_w(df_power_sub: pd.DataFrame, df_obs: pd.DataFrame) -> tuple[float, float]:
     energy_j = 0.0
     freqs = []
     gpu_power_cols = [col for col in df_power_sub.columns if col.startswith("GPU_") and col.endswith("_power_w")]
     gpu_freq_cols = [col for col in df_power_sub.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]
+
+    # zero out energy during idle times in df_obs, i.e. only keep compute times
+    idle_start_times = df_obs['start_time'] + df_obs['step_with_batch_queue_time_ms'] / 1000.0
+    idle_end_times = df_obs['start_time'].shift(-1).fillna(df_obs['now'].max())
+    for start, end in zip(idle_start_times, idle_end_times):
+        df_power_sub.loc[(df_power_sub['Timestamp'] >= start+0.1) & (df_power_sub['Timestamp'] <= end+0.1), gpu_power_cols] = 0.0
+
     for col in gpu_power_cols:
         energy_j += np.trapezoid(df_power_sub[col], df_power_sub['Timestamp'])
     for col in gpu_freq_cols:
         freqs.append(np.mean(df_power_sub[col]))
-    duration = df_power_sub['Timestamp'].max() - df_power_sub['Timestamp'].min()
-    if duration > 0.2:
-        return (energy_j / duration, np.mean(freqs))
+    total_duration = df_power_sub['Timestamp'].max() - df_power_sub['Timestamp'].min()
+    compute_duration = df_obs['step_with_batch_queue_time_ms'].sum() / 1000.0
+    if compute_duration > 0.2:
+        return (energy_j / compute_duration, energy_j, np.mean(freqs))
     else:
-        return np.nan, np.nan
+        return np.nan, np.nan, np.nan
 
 
 def calc_stats(expr_dir: Path, mode: str) -> List[LatencyAndShape]:
@@ -135,10 +145,45 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
     df = df_perf_metric_prefill_steady.copy()
     df['time_to_first_tokens_iter_evald'] = df['time_to_first_tokens_iter'].apply(eval)
     df['num_prompt_tokens_reqs_evald'] = df['num_prompt_tokens_reqs'].apply(eval)
+    
+    # drop empty rows first
+    df = df[df['num_prompt_tokens_reqs_evald'].apply(lambda x: len(x) > 0)].copy()
+    # then do shift of gpu times
+    df.loc[:, "step_with_batch_queue_time_ms"] = df["step_with_batch_queue_time_ms_1_iters_delay"].shift(-1)
+    #do explicit start and end time + idle of an iteration
+    df.loc[:, "start_time"] = df["now"] - df["step_with_batch_queue_time_ms"] / 1000.0
+    # df.loc[:, "end_time"] = df["start_time"].shift(-1).fillna(df["now"].max())
+    df.loc[:, "end_time"] = df["now"]
+
+    # filter the starting where rate is determined.
+    # characterized by high waiting queue. Skip first 5 seconds, then find the point where num_waiting_reqs goes to zero
+    # that is our starting point
+    start_time = df['start_time'].min() + 5.0
+    df = df[df['now'] >= start_time].copy()
+    zero_waiting_indices = df.index[df['num_waiting_reqs'] == 0].tolist()
+    if len(zero_waiting_indices) == 0:
+        print("No zero waiting reqs found, skipping this log")
+        return []
+    first_zero_waiting_index = zero_waiting_indices[0]
+    df = df[df.index >= first_zero_waiting_index].copy()
+
+    # filter out any where KV cache is above 90%
+    df = df[df['KV_usage_perc'] <= 0.9].copy()
+ 
+    # calculate RPS using EWMA (TODO: add RPS to logs directly)
+    df['rps'] = 0.0
+    df['diff_time'] = df["end_time"] - df["start_time"]
+    alpha = 0.8
+    for row in df.itertuples():
+        if row.num_prompt_tokens_reqs_evald:
+            rps = len(row.num_prompt_tokens_reqs_evald) / row.diff_time
+            prev_rps = df['rps'].shift().fillna(0.0).loc[row.Index]
+            df.loc[row.Index, 'rps'] = alpha * rps + (1 - alpha) * prev_rps
 
     lat_and_shape_list: List[LatencyAndShape] = []
 
     batch_size_input_len_sum_mean_std_under_obs = (0, 0, 0, 0)
+    iterations_in_window = 0
     obs_start_time = 0
     obs_end_time = 0
     for row in df.itertuples():
@@ -146,38 +191,53 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
                          np.sum(row.num_prompt_tokens_reqs_evald),
                          np.mean(row.num_prompt_tokens_reqs_evald),
                          np.std(row.num_prompt_tokens_reqs_evald))
+        
         if batch_size_input_len_sum_mean_std_under_obs != current_tuple:
             # save older data if we have enough samples
-            if obs_end_time - obs_start_time >= 0.25:
-                df_power_obs = df_power[(df_power['Timestamp'] >= obs_start_time) & (df_power['Timestamp'] <= obs_end_time)]
-                power_w, freq = compute_power_w(df_power_obs)
+            if obs_end_time - obs_start_time >= 0.25 and iterations_in_window > 2:
+                df_power_obs = df_power[(df_power['Timestamp'] >= obs_start_time+0.1) & (df_power['Timestamp'] <= obs_end_time+0.1)]
+                df_obs = df[(df['start_time'] >= obs_start_time) & (df['end_time'] <= obs_end_time)]
+                power, energy, freq = compute_power_w(df_power_obs, df_obs)
+                energy = energy / iterations_in_window
+                rate = df_obs['rps'].median()
 
                 lat_and_shape_list.append(LatencyAndShape(
                     batch_size=batch_size_input_len_sum_mean_std_under_obs[0],
                     input_len_sum=(batch_size_input_len_sum_mean_std_under_obs[1]),
                     input_len_mean=(batch_size_input_len_sum_mean_std_under_obs[2]),
                     input_len_std=(batch_size_input_len_sum_mean_std_under_obs[3]),
-                    power_w=power_w,
-                    freq_mhz=freq
+                    energy=energy,
+                    power_w=power,
+                    freq_mhz=freq,
+                    rate=rate
                 ))
 
             batch_size_input_len_sum_mean_std_under_obs = current_tuple
-            obs_start_time = row.now
-            obs_end_time = row.now
+            obs_start_time = row.start_time
+            obs_end_time = row.end_time
+            iterations_in_window = 1
         else:
-            obs_end_time = row.now
+            iterations_in_window += 1
+            obs_end_time = row.end_time
+
     # save the last one
+    obs_end_time = row.end_time
     if obs_end_time - obs_start_time >= 0.25:
-        df_power_obs = df_power[(df_power['Timestamp'] >= obs_start_time) & (df_power['Timestamp'] <= obs_end_time)]
-        power_w, freq = compute_power_w(df_power_obs)
+        df_power_obs = df_power[(df_power['Timestamp'] >= obs_start_time+0.1) & (df_power['Timestamp'] <= obs_end_time+0.1)]
+        df_obs = df[(df['start_time'] >= obs_start_time) & (df['end_time'] <= obs_end_time)]
+        power, energy, freq = compute_power_w(df_power_obs, df_obs)
+        energy = energy / iterations_in_window
+        rate = df_obs['rps'].median()
 
         lat_and_shape_list.append(LatencyAndShape(
             batch_size=batch_size_input_len_sum_mean_std_under_obs[0],
             input_len_sum=(batch_size_input_len_sum_mean_std_under_obs[1]),
             input_len_mean=(batch_size_input_len_sum_mean_std_under_obs[2]),
             input_len_std=(batch_size_input_len_sum_mean_std_under_obs[3]),
-            power_w=power_w,
-            freq_mhz=freq
+            energy=energy,
+            power_w=power,
+            freq_mhz=freq,
+            rate=rate
         ))
 
     return lat_and_shape_list
@@ -230,13 +290,18 @@ def main(argv):
         stats_list.append(calc_stats(expr_dir, mode))
     stats_list = list(itertools.chain.from_iterable(stats_list))
 
-    merged_stats_df = pd.DataFrame(stats_list, columns=[
-        'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std',
-        'power_w', 'freq_mhz'])
+    if mode == 'decode':
+        merged_stats_df = pd.DataFrame(stats_list, columns=[
+            'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std',
+            'power_w', 'freq_mhz'])
+    else:
+        merged_stats_df = pd.DataFrame(stats_list, columns=[
+            'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std',
+            'energy', 'power_w', 'freq_mhz', 'rate'])
 
-    print(f'len of unmerged stats: {len(stats_list)}, merged stats: {len(merged_stats_df)}')
+    print(f'len of stats: {len(stats_list)}')
 
-    df_stats = pd.DataFrame(merged_stats_df)
+    df_stats = pd.DataFrame(merged_stats_df).dropna()
     if mode == 'decode':
         df_stats = df_stats.sort_values(by=['batch_size', 'input_len_sum', 'input_len_mean']).reset_index(drop=True)
         out_name = 'decode_powers.csv'

@@ -24,6 +24,8 @@ from sklearn.metrics import mean_absolute_error
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType, StringTensorType
 import onnxruntime as ort
+from sklearn.neural_network import MLPRegressor
+from sklearn.model_selection import learning_curve
 
 def load_and_prepare(path, model_name, tp=None, numeric_cols=None):
     df = pd.read_csv(path)
@@ -52,7 +54,17 @@ def build_pipeline(role):
 
     # Choose defaults by role but allow overrides
     if role == 'prefill':
-        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1)
+        # est = RandomForestRegressor(n_estimators=8, random_state=42, n_jobs=-1)
+        est = MLPRegressor(
+            hidden_layer_sizes=(128, 64, 128),
+            activation='relu',
+            solver='adam',
+            alpha=1e-4,
+            learning_rate_init=1e-3,
+            max_iter=1000,
+            early_stopping=False,
+            random_state=42,
+        )
     elif role == 'decode':
         est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1)
 
@@ -69,6 +81,54 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
     X = df_t[feature_cols]
     y = df_t[target_col].astype(float)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # plot validation curve for estimator on the dataset X, y
+    import matplotlib.pyplot as plt
+
+    try:
+        estimator_for_curve = build_pipeline(role=role)
+        train_sizes = np.linspace(0.1, 1.0, 5)
+
+        # Use negative MAE as scoring (sklearn convention), then negate back
+        train_sizes_abs, train_scores, val_scores = learning_curve(
+            estimator_for_curve, X, y, cv=5, n_jobs=-1,
+            train_sizes=train_sizes, scoring='neg_mean_absolute_error', shuffle=True, random_state=42
+        )
+
+        # convert to positive MAE
+        train_scores_mean = -train_scores.mean(axis=1)
+        train_scores_std = train_scores.std(axis=1)
+        val_scores_mean = -val_scores.mean(axis=1)
+        val_scores_std = val_scores.std(axis=1)
+
+        plt.figure(figsize=(8, 6))
+        plt.plot(train_sizes_abs, train_scores_mean, 'o-', color='C0', label='Training MAE')
+        plt.fill_between(train_sizes_abs,
+                         train_scores_mean - train_scores_std,
+                         train_scores_mean + train_scores_std,
+                         alpha=0.2, color='C0')
+        plt.plot(train_sizes_abs, val_scores_mean, 'o-', color='C1', label='Validation MAE')
+        plt.fill_between(train_sizes_abs,
+                         val_scores_mean - val_scores_std,
+                         val_scores_mean + val_scores_std,
+                         alpha=0.2, color='C1')
+
+        plt.xlabel('Training examples')
+        plt.ylabel('Mean Absolute Error')
+        plt.title(f'Validation Curve ({target_col})')
+        plt.legend(loc='best')
+        plt.grid(True)
+
+        os.makedirs(model_dir, exist_ok=True)
+        vc_path = os.path.join(model_dir, f"{target_col}_validation_curve.png")
+        plt.savefig(vc_path, bbox_inches='tight', dpi=150)
+        plt.close()
+        print(f"validation curve saved to {vc_path}")
+    except Exception as e:
+        print(f"validation curve plotting failed: {e}")
+
+
+
     pipe = build_pipeline(role=role)
     pipe.fit(X_train, y_train)
     y_pred = pipe.predict(X_test)
@@ -177,15 +237,22 @@ def main():
     CSV_PATH_TP2_D = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_decode/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/decode_powers.csv"
     CSV_PATH_TP4_D = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_decode/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_powers.csv"
 
-    CSV_PATH_TP2_P = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/prefill_powers.csv"
-    CSV_PATH_TP4_P = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/prefill_powers.csv"
+    CSV_PATH_TP2_P = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill_back_to_back/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/prefill_powers_windowed.csv"
+    CSV_PATH_TP4_P = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill_back_to_back/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4_back_to_back/prefill_powers_windowed.csv"
+
+    CSV_PATH_TP2_P_1 = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill_real_arrival/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/prefill_powers_windowed.csv"
+    CSV_PATH_TP4_P_1 = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill_real_arrival/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/prefill_powers_windowed.csv"
+
 
     MODEL_DIR = os.path.join(args.model_dir)
 
     # Prefill configuration
     PREFILL_FEATURE_COLS = [
-        'model', 'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std', 'tp_degree', 'freq_mhz'
+        'model', 'total_batches', 'input_len_sum', 'input_len_mean', 'input_len_std', 'tp_degree', 'freq_mhz', 'rate',
+        'compute_ratio_for_window', 'max_batch_size', 'mean_batch_size', 'min_batch_size', 'std_batch_size',
+        'max_input_len', 'min_input_len',
     ]
+
     PREFILL_TARGET = 'power_w'
     PREFILL_OUT = 'prefill_model.joblib'
 
@@ -200,8 +267,12 @@ def main():
     if not args.no_prefill:
         print('\n=== Preprocessing prefill CSVs and training prefill model ===')
         df_p2 = load_and_prepare(CSV_PATH_TP2_P, 'Llama-3.3-70B-Instruct', tp=2, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        df_p2_1 = load_and_prepare(CSV_PATH_TP2_P_1, 'Llama-3.3-70B-Instruct', tp=2, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        df_p2 = pd.concat([df_p2, df_p2_1])
         print(f"prefill samples {len(df_p2.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_P}")
         df_p4 = load_and_prepare(CSV_PATH_TP4_P, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        df_p4_1 = load_and_prepare(CSV_PATH_TP4_P_1, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        df_p4 = pd.concat([df_p4, df_p4_1])
         print(f"prefill samples {len(df_p4.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_P}")
         df_prefill = pd.concat([df_p2, df_p4], ignore_index=True)
         df_prefill.to_csv(os.path.join(MODEL_DIR, 'prefill_cleaned.csv'), index=False)
@@ -237,15 +308,23 @@ def main():
         dec_joblib = os.path.join(MODEL_DIR, DECODE_OUT)
         dec_model = joblib.load(dec_joblib) if os.path.exists(dec_joblib) else None
 
-    # Example inputs
+    # sample_prefill must match PREFILL_FEATURE_COLS order and length
     sample_prefill = [
         'Llama-3.3-70B-Instruct',
-        4,  # batch_size
-        1200,  # input_len_sum
+        10,   # total_batches
+        1200, # input_len_sum
         300,  # input_len_mean
-        50,  # input_len_std
-        2,  # tp_degree
-        1830,  # freq_mhz
+        50,   # input_len_std
+        2,    # tp_degree
+        1830, # freq_mhz
+        4.0,  # rate
+        0.5,  # compute_ratio_for_window
+        8,    # max_batch_size
+        4.5,  # mean_batch_size
+        2,    # min_batch_size
+        1.2,  # std_batch_size
+        600,  # max_input_len
+        50,   # min_input_len
     ]
 
     sample_decode = [
