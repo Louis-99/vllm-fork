@@ -427,48 +427,51 @@ async def benchmark(
         timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
     )
 
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len, test_mm_content = (
-        input_requests[0].prompt,
-        input_requests[0].prompt_len,
-        input_requests[0].expected_output_len,
-        input_requests[0].multi_modal_data,
-    )
-
-    assert (
-        test_mm_content is None
-        or isinstance(test_mm_content, dict)
-        or (
-            isinstance(test_mm_content, list)
-            and all(isinstance(item, dict) for item in test_mm_content)
-        )
-    ), "multi_modal_data must be a dict or list[dict]"
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-        extra_headers=extra_headers,
-        extra_body=extra_body,
-    )
-
-    test_output = await wait_for_endpoint(
-        request_func,
-        test_input,
-        session,
-        timeout_seconds=ready_check_timeout_sec,
-    )
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
+    if int(os.getenv('SKIP_TEST_RUN', '0')):
+        print("Test run is skipped")
     else:
-        print("Initial test run completed. Starting main benchmark run...")
+        print("Starting initial single prompt test run...")
+        test_prompt, test_prompt_len, test_output_len, test_mm_content = (
+            input_requests[0].prompt,
+            input_requests[0].prompt_len,
+            input_requests[0].expected_output_len,
+            input_requests[0].multi_modal_data,
+        )
+
+        assert (
+            test_mm_content is None
+            or isinstance(test_mm_content, dict)
+            or (
+                isinstance(test_mm_content, list)
+                and all(isinstance(item, dict) for item in test_mm_content)
+            )
+        ), "multi_modal_data must be a dict or list[dict]"
+        test_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=api_url,
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            multi_modal_content=test_mm_content,
+            ignore_eos=ignore_eos,
+            extra_headers=extra_headers,
+            extra_body=extra_body,
+        )
+
+        test_output = await wait_for_endpoint(
+            request_func,
+            test_input,
+            session,
+            timeout_seconds=ready_check_timeout_sec,
+        )
+        if not test_output.success:
+            raise ValueError(
+                "Initial test run failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {test_output.error}")
+        else:
+            print("Initial test run completed. Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
