@@ -22,7 +22,7 @@ from vllm.utils import get_mp_context
 logger = init_logger(__name__)
 
 # Change this accordingly
-PATH_TO_MODELS = Path("/export2/obasit/ClusterLevelServing/DistServe/simdistserve/estimators/tree_models")
+PATH_TO_MODELS = Path(__file__).parent / 'tree_models'
 
 # power model prefill
 possible_freq = np.array([780, 1080, 1380, 1680, 1830])
