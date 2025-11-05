@@ -3201,6 +3201,9 @@ class VllmConfig:
     """The directory to store the logs."""
     log_power: bool = False
     """Whether to log power usage metrics."""
+    enable_nvml_freq_mod: bool = False
+    """Whether to enable DVFS"""
+
 
     def compute_hash(self) -> str:
         """

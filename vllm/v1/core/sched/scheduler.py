@@ -1178,9 +1178,14 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
+        waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
+        now = time.time()
+        waiting_reqs_num_time = [now - req.arrival_time for req in self.waiting]
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
+            waiting_reqs_num_tokens=waiting_reqs_num_tokens,
+            waiting_reqs_num_time=waiting_reqs_num_time,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,

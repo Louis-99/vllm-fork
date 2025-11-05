@@ -25,6 +25,9 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.platforms.nvml_power_monitor import start_nvml_power_monitor
+from vllm.platforms.nvml_freq_modulator.nvml_freq_modulator import (
+    NvmlFreqModulatorInterface,
+    nvml_freq_modulator)
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
@@ -168,6 +171,12 @@ class AsyncLLM(EngineClient):
                     },
                     daemon=True)
             self.power_monitor_process.start()
+        
+        # DVFS
+        self.freq_modulator: Optional[NvmlFreqModulatorInterface] = None
+        if vllm_config.enable_nvml_freq_mod:
+            self.freq_modulator = nvml_freq_modulator(
+                vllm_config, self)
 
         self.output_handler: Optional[asyncio.Task] = None
         try:
@@ -268,6 +277,9 @@ class AsyncLLM(EngineClient):
         if self.power_monitor_process:
             self.power_monitor_process.kill()
             self.power_monitor_process.join()
+
+        if self.freq_modulator:
+            self.freq_modulator.close()
 
         shutdown_prometheus()
 
@@ -452,6 +464,8 @@ class AsyncLLM(EngineClient):
         output_processor = self.output_processor
         log_stats = self.log_stats
         logger_manager = self.logger_manager
+        freq_modulator = self.freq_modulator
+            
 
         async def output_handler():
             try:
@@ -502,6 +516,12 @@ class AsyncLLM(EngineClient):
                             scheduler_stats=outputs.scheduler_stats,
                             iteration_stats=iteration_stats,
                         )
+                    
+                    if freq_modulator:
+                        freq_modulator.step(
+                            scheduler_stats=outputs.scheduler_stats,
+                            iteration_stats=iteration_stats)
+                        
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)

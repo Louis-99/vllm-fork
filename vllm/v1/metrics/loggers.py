@@ -668,7 +668,7 @@ class CSVLogger(StatLoggerBase):
                 "num_preempted_reqs": iteration_stats.num_preempted_reqs,
                 'finished_requests': len(iteration_stats.finished_requests),
                 "max_num_generation_tokens_iter": (
-                    iteration_stats.max_num_generation_tokens_iter
+                    iteration_stats.num_generation_tokens_iter
                 ),
                 "request_ids_iter_ttft": iteration_stats.req_ids_ttft,
                 "request_ids_iter_tbt": iteration_stats.req_ids_tbt,

@@ -32,6 +32,8 @@ class SchedulerStats:
 
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    waiting_reqs_num_tokens: list[int] = field(default_factory=list)
+    waiting_reqs_num_time: list[float] = field(default_factory=list)
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
@@ -97,6 +99,7 @@ class IterationStats:
         self.num_prompt_tokens_reqs: list[int] = []
         self.num_preempted_reqs = 0
         self.finished_requests: list[FinishedRequestStats] = []
+        self.num_generation_tokens_iter: list[int] = []
         self.max_num_generation_tokens_iter: list[int] = []
         self.n_params_iter: list[int] = []
         self.time_to_first_tokens_iter: list[float] = []
@@ -135,6 +138,7 @@ class IterationStats:
             req_stats.first_token_latency = first_token_latency
 
         req_stats.num_generation_tokens += num_new_generation_tokens
+        self.num_generation_tokens_iter.append(req_stats.num_generation_tokens)
 
         # Process request-level engine core events
         if output.events is not None:
