@@ -126,8 +126,8 @@ def nvml_freq_modulator(config: VllmConfig,
         log_dir=Path(config.log_dir),
         tbt_sla=0.1,
         ttft_sla=0.6,
-        optim_target='power',
-        mod_interval=1,
+        optim_target='energy',
+        mod_interval=2,
     )
 
 
@@ -275,8 +275,8 @@ class _MPNvmlFreqModulatorServer:
             mpc_start = time.perf_counter()
             msg: FreqModMsg = msgspec.msgpack.decode(msg_encoded,
                                                      type=FreqModMsg)
-            logger.info('freq_mod_msg: %s', msg)
-            # logger.debug('freq_mod_msg: %s', msg)
+            # logger.info('freq_mod_msg: %s', msg)
+            logger.debug('freq_mod_msg: %s', msg)
 
             future_states, prefill_cycles = self.get_future_states(
                 msg, self.future_windows)
@@ -328,15 +328,15 @@ class _MPNvmlFreqModulatorServer:
         lat_mat = np.array(lat_mat_list)
         power_mat = np.array(power_mat_list)
         energy_mat = lat_mat * power_mat
-        print("lat_mat:", lat_mat)
-        print("power_mat:", power_mat)
-        print("energy_mat:", energy_mat)
         assert lat_mat.shape == (max_future_vision, len(freq_choices_desc))
         assert power_mat.shape == (max_future_vision, len(freq_choices_desc))
 
         # check SLO satisfaction and adjust frequencies
         batch_lats_all = lat_mat[0]
-        oldest_waiting_time = max(freq_mod_msg.waiting_reqs_num_time)
+        if len(freq_mod_msg.waiting_reqs_num_time) > 0:
+            oldest_waiting_time = max(freq_mod_msg.waiting_reqs_num_time)
+        else:
+            oldest_waiting_time = 0.0
         if self.engine_role == 'prefill':
             sla_mask = (batch_lats_all + oldest_waiting_time) <= self.ttft_sla
         else:
