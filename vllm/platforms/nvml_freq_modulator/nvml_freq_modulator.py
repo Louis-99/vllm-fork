@@ -87,6 +87,7 @@ class FreqModMsg(msgspec.Struct):
     now: float
     num_prompt_tokens_reqs: list[int]   # for prefill, tokens in batch just executed
     num_generation_tokens_iter: list[int]  # for decode, tokens generated including the one right now
+    num_computed_tokens_list: list[int]  # tokens computed including the one right now
     kv_cache_usage: float               # fraction of GPU memory used by KV cache
     waiting_reqs_num_tokens: list[int]  # for prefill & decode, tokens in waiting queue
     waiting_reqs_num_time: list[float]  # for prefill, waiting time in waiting queue
@@ -191,6 +192,7 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
             iteration_stats.iteration_timestamp,
             iteration_stats.num_prompt_tokens_reqs,
             iteration_stats.num_generation_tokens_iter,
+            scheduler_stats.computed_tokens_list,
             scheduler_stats.kv_cache_usage,
             scheduler_stats.waiting_reqs_num_tokens,
             scheduler_stats.waiting_reqs_num_time,
@@ -226,7 +228,8 @@ class _MPNvmlFreqModulatorServer:
         self.engine_role = engine_role
 
         self.model = vllm_config.model_config.model
-        self.tp_degree = vllm_config.parallel_config.tensor_parallel_size
+        # self.tp_degree = vllm_config.parallel_config.tensor_parallel_size
+        self.tp_degree = 2
 
         model_name = vllm_config.model_config.model.split('/')[-1]
         combo_name = f'{get_gpu_name()}_{model_name}'
@@ -275,8 +278,8 @@ class _MPNvmlFreqModulatorServer:
             mpc_start = time.perf_counter()
             msg: FreqModMsg = msgspec.msgpack.decode(msg_encoded,
                                                      type=FreqModMsg)
-            # logger.info('freq_mod_msg: %s', msg)
-            logger.debug('freq_mod_msg: %s', msg)
+            logger.info('freq_mod_msg: %s', msg)
+            # logger.debug('freq_mod_msg: %s', msg)
 
             future_states, prefill_cycles = self.get_future_states(
                 msg, self.future_windows)
@@ -292,7 +295,7 @@ class _MPNvmlFreqModulatorServer:
                 selected_freq = max(self.freq_choices)
 
             freq_mod_start = time.perf_counter()
-            nvml_set_freq(selected_freq)
+            # nvml_set_freq(selected_freq)
             freq_mod_end = time.perf_counter()
             csv_writer.add_row([
                 msg.now,

@@ -34,6 +34,7 @@ class SchedulerStats:
     num_waiting_reqs: int = 0
     waiting_reqs_num_tokens: list[int] = field(default_factory=list)
     waiting_reqs_num_time: list[float] = field(default_factory=list)
+    computed_tokens_list: list[int] = field(default_factory=list)
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
