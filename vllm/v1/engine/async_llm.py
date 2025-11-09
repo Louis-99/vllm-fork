@@ -507,6 +507,11 @@ class AsyncLLM(EngineClient):
                         await engine_core.abort_requests_async(
                             processed_outputs.reqs_to_abort)
 
+                    if freq_modulator:
+                        freq_modulator.step(
+                            scheduler_stats=outputs.scheduler_stats,
+                            iteration_stats=iteration_stats)
+                        
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
@@ -517,10 +522,6 @@ class AsyncLLM(EngineClient):
                             iteration_stats=iteration_stats,
                         )
                     
-                    if freq_modulator:
-                        freq_modulator.step(
-                            scheduler_stats=outputs.scheduler_stats,
-                            iteration_stats=iteration_stats)
                         
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")

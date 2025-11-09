@@ -86,6 +86,9 @@ class FreqModMsg(msgspec.Struct):
     """
     now: float
     num_prompt_tokens_reqs: list[int]   # for prefill, tokens in batch just executed
+    running_reqs_num_tokens: list[int]  
+    running_reqs_num_tokens_reqs_id: list[str]
+    num_prompt_tokens_reqs_ids: list[str]
     num_generation_tokens_iter: list[int]  # for decode, tokens generated including the one right now
     num_computed_tokens_list: list[int]  # tokens computed including the one right now
     kv_cache_usage: float               # fraction of GPU memory used by KV cache
@@ -153,8 +156,11 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
         self.vllm_config = vllm_config
 
         self.engine_role = 'decode'
-        if vllm_config.kv_transfer_config.is_kv_producer:
+        self.token_budget = 100000 # big number for decode, we dont really care
+        if vllm_config.kv_transfer_config and vllm_config.kv_transfer_config.is_kv_producer:
             self.engine_role = 'prefill'
+            if vllm_config.scheduler_config.chunked_prefill_enabled:
+                self.token_budget = vllm_config.scheduler_config.max_num_batched_tokens
 
         self.model = vllm_config.model_config.model
 
@@ -167,7 +173,8 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
                                                  tbt_sla=tbt_sla,
                                                  ttft_sla=ttft_sla,
                                                  optim_target=optim_target,
-                                                 engine_role=self.engine_role)
+                                                 engine_role=self.engine_role,
+                                                 token_budget=self.token_budget,)
         self.server_process: Process = get_mp_context().Process(
             target=self.server.run)
         self.server_process.start()
@@ -189,13 +196,16 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
     @staticmethod
     def build_msg(scheduler_stats: SchedulerStats, iteration_stats: IterationStats) -> FreqModMsg:
         return FreqModMsg(
-            iteration_stats.iteration_timestamp,
-            iteration_stats.num_prompt_tokens_reqs,
-            iteration_stats.num_generation_tokens_iter,
-            scheduler_stats.computed_tokens_list,
-            scheduler_stats.kv_cache_usage,
-            scheduler_stats.waiting_reqs_num_tokens,
-            scheduler_stats.waiting_reqs_num_time,
+            now=iteration_stats.iteration_timestamp,
+            running_reqs_num_tokens=scheduler_stats.running_reqs_num_tokens,
+            running_reqs_num_tokens_reqs_id=scheduler_stats.running_reqs_num_tokens_reqs_ids,
+            num_prompt_tokens_reqs=iteration_stats.num_prompt_tokens_reqs,
+            num_prompt_tokens_reqs_ids=iteration_stats.req_ids_tbt + iteration_stats.req_ids_ttft,
+            num_generation_tokens_iter=iteration_stats.num_generation_tokens_iter,
+            num_computed_tokens_list=scheduler_stats.computed_tokens_list,
+            kv_cache_usage=scheduler_stats.kv_cache_usage,
+            waiting_reqs_num_tokens=scheduler_stats.waiting_reqs_num_tokens,
+            waiting_reqs_num_time=scheduler_stats.waiting_reqs_num_time,
         )
 
 class _MPNvmlFreqModulatorServer:
@@ -213,6 +223,7 @@ class _MPNvmlFreqModulatorServer:
         future_window: int = 4,
         mem_util_ceiling: float = 0.9,
         engine_role: str = 'prefill',
+        token_budget: int = 2048,
     ):
         self.vllm_config = vllm_config
         self.freq_choices = freq_choices
@@ -226,6 +237,7 @@ class _MPNvmlFreqModulatorServer:
         self.mem_util_ceiling = mem_util_ceiling
         self.optim_target = optim_target
         self.engine_role = engine_role
+        self.token_budget = token_budget
 
         self.model = vllm_config.model_config.model
         # self.tp_degree = vllm_config.parallel_config.tensor_parallel_size
@@ -375,7 +387,6 @@ class _MPNvmlFreqModulatorServer:
             - prefills are (poorly) chunked now
             - no decode requests reach EOS during future calculations
             - no new requests arrive
-            - no Chunking for now
         """
         # A list that tells you for each request in the wait queue
         # how many iterations it will take to get the first token

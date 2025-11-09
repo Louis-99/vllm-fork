@@ -1006,6 +1006,7 @@ class Scheduler(SchedulerInterface):
                 else:
                     engine_core_outputs[client_index] = EngineCoreOutputs(
                         finished_requests=finished_set)
+            assert finished_req_ids in self.running
             finished_req_ids.clear()
 
         if (stats := self.make_stats(spec_decoding_stats)) is not None:
@@ -1178,15 +1179,21 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
+        running_reqs_num_tokens = [req.num_tokens for req in self.running]
         waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
+        running_reqs_num_tokens_reqs_ids = [req.request_id for req in self.running]
+        waiting_reqs_num_tokens_reqs_ids = [req.request_id for req in self.waiting]
         now = time.time()
         waiting_reqs_num_time = [now - req.arrival_time for req in self.waiting]
         computed_tokens_list = [req.num_computed_tokens for req in self.running]
+
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             computed_tokens_list=computed_tokens_list,
+            running_reqs_num_tokens=running_reqs_num_tokens,
             waiting_reqs_num_tokens=waiting_reqs_num_tokens,
+            running_reqs_num_tokens_reqs_ids=running_reqs_num_tokens_reqs_ids,
             waiting_reqs_num_time=waiting_reqs_num_time,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
