@@ -662,7 +662,7 @@ class CSVLogger(StatLoggerBase):
                 'engine_index': engine_idx,
                 'num_running_reqs': scheduler_stats.num_running_reqs,
                 'num_waiting_reqs': scheduler_stats.num_waiting_reqs,
-                'computed_tokens_list': scheduler_stats.computed_tokens_list,
+                'running_computed_tokens_list': scheduler_stats.running_computed_tokens_list,
                 "KV_usage_perc": scheduler_stats.kv_cache_usage,
                 "num_generation_tokens": iteration_stats.num_generation_tokens,
                 "num_prompt_tokens_reqs": iteration_stats.num_prompt_tokens_reqs,

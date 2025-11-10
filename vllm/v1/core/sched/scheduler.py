@@ -17,6 +17,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
                                                           KVConnectorRole)
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.platforms.nvml_freq_modulator.nvml_freq_modulator import (
+    NvmlFreqModulatorInterface,
+    nvml_freq_modulator)
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -173,6 +176,12 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+        #DVFS
+        self.freq_modulator: Optional[NvmlFreqModulatorInterface] = None
+        if vllm_config.enable_nvml_freq_mod:
+            self.freq_modulator = nvml_freq_modulator(
+                vllm_config, self)
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -625,6 +634,7 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
+        logger.info("Scheduled: %d tokens", total_num_scheduled_tokens)
         return scheduler_output
 
     def _update_after_schedule(
@@ -640,6 +650,33 @@ class Scheduler(SchedulerInterface):
         #    scheduling step.
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
+
+        if self.freq_modulator and scheduler_output.total_num_scheduled_tokens > 0:
+            now = time.time()
+            running_reqs_num_tokens = [req.num_tokens for req in self.running]
+            running_computed_tokens_list = [req.num_computed_tokens for req in self.running]
+            running_reqs_num_time = [now - req.arrival_time for req in self.running]
+            waiting_computed_tokens_list = [req.num_computed_tokens for req in self.waiting]
+            waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
+            waiting_reqs_num_time = [now - req.arrival_time for req in self.waiting]
+
+            stats = SchedulerStats(
+                now=now,
+                num_running_reqs=len(self.running),
+                num_waiting_reqs=len(self.waiting),
+                running_computed_tokens_list=running_computed_tokens_list,
+                waiting_computed_tokens_list=waiting_computed_tokens_list,
+                running_reqs_num_tokens=running_reqs_num_tokens,
+                waiting_reqs_num_tokens=waiting_reqs_num_tokens,
+                running_reqs_num_time=running_reqs_num_time,
+                waiting_reqs_num_time=waiting_reqs_num_time,
+                kv_cache_usage=self.kv_cache_manager.usage,
+
+            )
+            self.freq_modulator.step(
+                scheduler_stats=stats)
+
+
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
@@ -1016,7 +1053,6 @@ class Scheduler(SchedulerInterface):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
-
         return engine_core_outputs
 
     def _update_request_with_output(
@@ -1179,22 +1215,11 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
-        running_reqs_num_tokens = [req.num_tokens for req in self.running]
-        waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
-        running_reqs_num_tokens_reqs_ids = [req.request_id for req in self.running]
-        waiting_reqs_num_tokens_reqs_ids = [req.request_id for req in self.waiting]
-        now = time.time()
-        waiting_reqs_num_time = [now - req.arrival_time for req in self.waiting]
-        computed_tokens_list = [req.num_computed_tokens for req in self.running]
+
 
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
-            computed_tokens_list=computed_tokens_list,
-            running_reqs_num_tokens=running_reqs_num_tokens,
-            waiting_reqs_num_tokens=waiting_reqs_num_tokens,
-            running_reqs_num_tokens_reqs_ids=running_reqs_num_tokens_reqs_ids,
-            waiting_reqs_num_time=waiting_reqs_num_time,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,
@@ -1222,6 +1247,8 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+        if self.freq_modulator:
+            self.freq_modulator.close()
 
     ########################################################################
     # KV Connector Related Methods
