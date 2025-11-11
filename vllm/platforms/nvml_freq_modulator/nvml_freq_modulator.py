@@ -355,6 +355,7 @@ class _MPNvmlFreqModulatorServer:
                     ),
                     axis=0,
                 )
+            waiting_time_per_req = waiting_time_per_req[:len(prefill_cycles), :]
             # Start with the highest freq for each window
             selected_freq_ids = [0 for _ in range(self.future_windows)]
             for freq_idx in range(1, len(freq_choices_desc)):
@@ -685,13 +686,13 @@ if __name__ == '__main__':
                                    )
     msg = [FreqModMsg(
             now=0.0,
-            running_queue_tokens=[1024, 512],
-            running_queue_pre_computed_tokens=[520, 0],
-            running_queue_wait_time=[0.01, 0.05],
+            running_queue_tokens=[1024, 512, 256],
+            running_queue_pre_computed_tokens=[520, 0, 0],
+            running_queue_wait_time=[0.01, 0.02, 0.02],
             kv_cache_usage=0.1,
-            waiting_queue_tokens=[1200],
-            waiting_queue_pre_computed_tokens=[0],
-            waiting_queue_wait_time=[0.15],
+            waiting_queue_tokens=[1200, 1200, 1200],
+            waiting_queue_pre_computed_tokens=[0, 0, 0],
+            waiting_queue_wait_time=[0.15, 0.15, 0.15],
         ),
         FreqModMsg(
             now=0.0,
