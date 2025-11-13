@@ -267,6 +267,7 @@ if __name__ == '__main__':
                 continue
             print('expr_dir (prefill):', expr_dir)
             prefill_stats_all.append(calc_stats_prefill(expr_dir))
+            print(f'Collected {len(prefill_stats_all[-1])} prefill stats from {expr_dir}')
         prefill_stats_all = list(itertools.chain.from_iterable(prefill_stats_all))
         
         merged_stats_df = pd.DataFrame(prefill_stats_all, columns=[

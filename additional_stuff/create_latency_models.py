@@ -18,7 +18,7 @@ import numpy as np
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 from skl2onnx import convert_sklearn
@@ -52,9 +52,9 @@ def build_pipeline(role):
 
     # Choose defaults by role but allow overrides
     if role == 'prefill':
-        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1)
+        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20)
     elif role == 'decode':
-        est = RandomForestRegressor(n_estimators=3, random_state=42, n_jobs=-1)
+        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20)
 
     return Pipeline([('pre', pre), ('est', est)])
 
@@ -170,14 +170,21 @@ def main():
     parser = argparse.ArgumentParser(description='Train prefill and decode latency models')
     parser.add_argument('--no-prefill', action='store_true', help='Disable training prefill model')
     parser.add_argument('--no-decode', action='store_true', help='Disable training decode model')
-    parser.add_argument('--model-dir', default=('/export2/obasit/ClusterLevelServing/vllm_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/models_tree'), help='Directory to store trained models')
+    parser.add_argument('--model-dir', default=('/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/models_tree/H100'), help='Directory to store trained models')
     args = parser.parse_args()
 
-    CSV_PATH_TP2_D = "/export2/obasit/ClusterLevelServing/vllm_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/default_log_path/decode_latencies.csv"
-    CSV_PATH_TP4_D = "/export2/obasit/ClusterLevelServing/vllm_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
+    CSV_PATH_TP2_D = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/default_log_path/decode_latencies.csv"
+    CSV_PATH_TP2_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov12_TP2_decode_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/decode_latencies.csv"
+    CSV_PATH_TP4_D = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
+    CSV_PATH_TP4_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov12_TP4_decode_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
 
-    CSV_PATH_TP2_P = "/export2/obasit/ClusterLevelServing/vllm_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/default_log_path/prefill_latencies.csv"
-    CSV_PATH_TP4_P = "/export2/obasit/ClusterLevelServing/vllm_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/prefill_latencies.csv"
+
+    CSV_PATH_TP2_P = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/default_log_path/prefill_latencies.csv"
+    CSV_PATH_TP2_P1 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov12_TP2_prefill_latency_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/prefill_latencies.csv"
+    CSV_PATH_TP2_P2 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov13_TP24_prefill_latency_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/prefill_latencies.csv"
+    CSV_PATH_TP4_P = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/prefill_latencies.csv"
+    CSV_PATH_TP4_P1 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov12_TP4_prefill_latency_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/prefill_latencies.csv"
+    CSV_PATH_TP4_P2 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov13_TP24_prefill_latency_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/prefill_latencies.csv"
 
     MODEL_DIR = os.path.join(args.model_dir)
 
@@ -199,10 +206,18 @@ def main():
     if not args.no_prefill:
         print('\n=== Preprocessing prefill CSVs and training prefill model ===')
         df_p2 = load_and_prepare(CSV_PATH_TP2_P, 'Llama-3.3-70B-Instruct', tp=2, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        df_p21 = load_and_prepare(CSV_PATH_TP2_P1, 'Llama-3.3-70B-Instruct', tp=2, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        df_p22 = load_and_prepare(CSV_PATH_TP2_P2, 'Llama-3.3-70B-Instruct', tp=2, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
         print(f"prefill samples {len(df_p2.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_P}")
+        print(f"prefill samples {len(df_p21.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_P1}")
+        print(f"prefill samples {len(df_p22.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_P2}")
         df_p4 = load_and_prepare(CSV_PATH_TP4_P, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        df_p41 = load_and_prepare(CSV_PATH_TP4_P1, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        df_p42 = load_and_prepare(CSV_PATH_TP4_P2, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
         print(f"prefill samples {len(df_p4.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_P}")
-        df_prefill = pd.concat([df_p2, df_p4], ignore_index=True)
+        print(f"prefill samples {len(df_p41.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_P1}")
+        print(f"prefill samples {len(df_p42.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_P2}")
+        df_prefill = pd.concat([df_p2, df_p21, df_p22, df_p4, df_p41, df_p42], ignore_index=True)
         df_prefill.to_csv(os.path.join(MODEL_DIR, 'prefill_cleaned.csv'), index=False)
         stats_prefill = train_and_save(df_prefill, PREFILL_FEATURE_COLS, PREFILL_TARGET, PREFILL_OUT, MODEL_DIR, convert_onnx=True, role='prefill')
     else:
@@ -212,10 +227,14 @@ def main():
     if not args.no_decode:
         print('\n=== Preprocessing decode CSVs and training decode model ===')
         df_d2 = load_and_prepare(CSV_PATH_TP2_D, 'Llama-3.3-70B-Instruct', tp=2, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
+        df_d21 = load_and_prepare(CSV_PATH_TP2_D1, 'Llama-3.3-70B-Instruct', tp=2, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
         print(f"Decode samples {len(df_d2.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_D}")
+        print(f"Decode samples {len(df_d21.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_D1}")
         df_d4 = load_and_prepare(CSV_PATH_TP4_D, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
+        df_d41 = load_and_prepare(CSV_PATH_TP4_D1, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
         print(f"Decode samples {len(df_d4.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D}")
-        df_decode = pd.concat([df_d2, df_d4], ignore_index=True)
+        print(f"Decode samples {len(df_d41.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D1}")
+        df_decode = pd.concat([df_d2, df_d21, df_d4, df_d41], ignore_index=True)
         df_decode.to_csv(os.path.join(MODEL_DIR, 'decode_cleaned.csv'), index=False)
         stats_decode = train_and_save(df_decode, DECODE_FEATURE_COLS, DECODE_TARGET, DECODE_OUT, MODEL_DIR, convert_onnx=True, role='decode')
     else:

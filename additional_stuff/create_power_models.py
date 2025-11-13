@@ -66,7 +66,7 @@ def build_pipeline(role):
             random_state=42,
         )
     elif role == 'decode':
-        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1)
+        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20)
 
     return Pipeline([('pre', pre), ('est', est)])
 
@@ -81,53 +81,6 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
     X = df_t[feature_cols]
     y = df_t[target_col].astype(float)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    # plot validation curve for estimator on the dataset X, y
-    import matplotlib.pyplot as plt
-
-    try:
-        estimator_for_curve = build_pipeline(role=role)
-        train_sizes = np.linspace(0.1, 1.0, 5)
-
-        # Use negative MAE as scoring (sklearn convention), then negate back
-        train_sizes_abs, train_scores, val_scores = learning_curve(
-            estimator_for_curve, X, y, cv=5, n_jobs=-1,
-            train_sizes=train_sizes, scoring='neg_mean_absolute_error', shuffle=True, random_state=42
-        )
-
-        # convert to positive MAE
-        train_scores_mean = -train_scores.mean(axis=1)
-        train_scores_std = train_scores.std(axis=1)
-        val_scores_mean = -val_scores.mean(axis=1)
-        val_scores_std = val_scores.std(axis=1)
-
-        plt.figure(figsize=(8, 6))
-        plt.plot(train_sizes_abs, train_scores_mean, 'o-', color='C0', label='Training MAE')
-        plt.fill_between(train_sizes_abs,
-                         train_scores_mean - train_scores_std,
-                         train_scores_mean + train_scores_std,
-                         alpha=0.2, color='C0')
-        plt.plot(train_sizes_abs, val_scores_mean, 'o-', color='C1', label='Validation MAE')
-        plt.fill_between(train_sizes_abs,
-                         val_scores_mean - val_scores_std,
-                         val_scores_mean + val_scores_std,
-                         alpha=0.2, color='C1')
-
-        plt.xlabel('Training examples')
-        plt.ylabel('Mean Absolute Error')
-        plt.title(f'Validation Curve ({target_col})')
-        plt.legend(loc='best')
-        plt.grid(True)
-
-        os.makedirs(model_dir, exist_ok=True)
-        vc_path = os.path.join(model_dir, f"{target_col}_validation_curve.png")
-        plt.savefig(vc_path, bbox_inches='tight', dpi=150)
-        plt.close()
-        print(f"validation curve saved to {vc_path}")
-    except Exception as e:
-        print(f"validation curve plotting failed: {e}")
-
-
 
     pipe = build_pipeline(role=role)
     pipe.fit(X_train, y_train)
@@ -235,7 +188,9 @@ def main():
     args = parser.parse_args()
 
     CSV_PATH_TP2_D = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_decode/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/decode_powers.csv"
+    CSV_PATH_TP2_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_Nov12_TP2_decode_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/decode_powers.csv"
     CSV_PATH_TP4_D = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_decode/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_powers.csv"
+    CSV_PATH_TP4_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_Nov12_TP4_decode_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_powers.csv"
 
     CSV_PATH_TP2_P = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill_back_to_back/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/prefill_powers_windowed.csv"
     CSV_PATH_TP4_P = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill_back_to_back/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4_back_to_back/prefill_powers_windowed.csv"
@@ -284,10 +239,14 @@ def main():
     if not args.no_decode:
         print('\n=== Preprocessing decode CSVs and training decode model ===')
         df_d2 = load_and_prepare(CSV_PATH_TP2_D, 'Llama-3.3-70B-Instruct', tp=2, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
+        df_d21 = load_and_prepare(CSV_PATH_TP2_D1, 'Llama-3.3-70B-Instruct', tp=2, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
         print(f"Decode samples {len(df_d2.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_D}")
+        print(f"Decode samples {len(df_d21.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_D1}")
         df_d4 = load_and_prepare(CSV_PATH_TP4_D, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
+        df_d41 = load_and_prepare(CSV_PATH_TP4_D1, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
         print(f"Decode samples {len(df_d4.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D}")
-        df_decode = pd.concat([df_d2, df_d4], ignore_index=True)
+        print(f"Decode samples {len(df_d41.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D1}")
+        df_decode = pd.concat([df_d2, df_d21, df_d4, df_d41], ignore_index=True)
         df_decode.to_csv(os.path.join(MODEL_DIR, 'decode_cleaned.csv'), index=False)
         stats_decode = train_and_save(df_decode, DECODE_FEATURE_COLS, DECODE_TARGET, DECODE_OUT, MODEL_DIR, convert_onnx=args.onnx, role='decode')
     else:

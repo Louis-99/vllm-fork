@@ -22,8 +22,23 @@ class LatencyAndShape:
     freq_mhz: float
     rate: float
 
+def compute_power_w(df_power_sub: pd.DataFrame) -> tuple[float, float]:
+    energy_j = 0.0
+    freqs = []
+    gpu_power_cols = [col for col in df_power_sub.columns if col.startswith("GPU_") and col.endswith("_power_w")]
+    gpu_freq_cols = [col for col in df_power_sub.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]
 
-def compute_power_w(df_power_sub: pd.DataFrame, df_obs: pd.DataFrame) -> tuple[float, float]:
+    for col in gpu_power_cols:
+        energy_j += np.trapezoid(df_power_sub[col], df_power_sub['Timestamp'])
+    for col in gpu_freq_cols:
+        freqs.append(np.mean(df_power_sub[col]))
+    duration = df_power_sub['Timestamp'].max() - df_power_sub['Timestamp'].min()
+    if duration > 0.2:
+        return (energy_j / duration, np.mean(freqs))
+    else:
+        return np.nan, np.nan
+
+def compute_power_w_no_idle(df_power_sub: pd.DataFrame, df_obs: pd.DataFrame) -> tuple[float, float]:
     energy_j = 0.0
     freqs = []
     gpu_power_cols = [col for col in df_power_sub.columns if col.startswith("GPU_") and col.endswith("_power_w")]
@@ -131,7 +146,9 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
             input_len_mean=input_len_mean,
             input_len_std=input_len_std,
             power_w=power_w,
-            freq_mhz=gpu_freq
+            freq_mhz=gpu_freq,
+            energy=np.nan,
+            rate=np.nan
         ))
 
         start_subsection = end_subsection
@@ -197,7 +214,7 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
             if obs_end_time - obs_start_time >= 0.25 and iterations_in_window > 2:
                 df_power_obs = df_power[(df_power['Timestamp'] >= obs_start_time+0.1) & (df_power['Timestamp'] <= obs_end_time+0.1)]
                 df_obs = df[(df['start_time'] >= obs_start_time) & (df['end_time'] <= obs_end_time)]
-                power, energy, freq = compute_power_w(df_power_obs, df_obs)
+                power, energy, freq = compute_power_w_no_idle(df_power_obs, df_obs)
                 energy = energy / iterations_in_window
                 rate = df_obs['rps'].median()
 
@@ -225,7 +242,7 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
     if obs_end_time - obs_start_time >= 0.25:
         df_power_obs = df_power[(df_power['Timestamp'] >= obs_start_time+0.1) & (df_power['Timestamp'] <= obs_end_time+0.1)]
         df_obs = df[(df['start_time'] >= obs_start_time) & (df['end_time'] <= obs_end_time)]
-        power, energy, freq = compute_power_w(df_power_obs, df_obs)
+        power, energy, freq = compute_power_w_no_idle(df_power_obs, df_obs)
         energy = energy / iterations_in_window
         rate = df_obs['rps'].median()
 
