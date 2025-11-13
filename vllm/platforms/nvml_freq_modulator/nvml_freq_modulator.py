@@ -595,36 +595,31 @@ class _MPNvmlFreqModulatorServer:
         #prefill
         if self.engine_role == 'prefill':
             # For each future-state input, interpolate power for every freq choice.
-            outputs = []
-            for inp in inputs:
-                # inp shape: (len(freq_choices), Ncols) where
-                # col0=freq, col1=num_prefills, col2=prefill_len_sum, ...
-                # Extract prefill_len_sum from the first row (same for all rows).
-                prefill_len_sum = float(inp[0, 2])
-                # Clamp to the known grid bounds to avoid excessive extrapolation.
-                input_len = float(np.clip(prefill_len_sum,
-                            possible_input_len.min(),
-                            possible_input_len.max()))
-                freqs = np.array(freq_choices, dtype=np.float32)
+            freqs = np.array(freq_choices, dtype=np.float32)
+            # Clamp and collect all input_len values
+            input_lens = np.array([
+                np.clip(float(inp[0, 2]), possible_input_len.min(), possible_input_len.max())
+                for inp in inputs
+            ], dtype=np.float32)
 
-                # xi should be shape (n_freqs, 2): [input_len, freq] pairs.
-                xi = np.column_stack((
-                    np.full(len(freqs), input_len, dtype=np.float32),
-                    freqs,
-                ))
+            # Shape will be (len(inputs), len(freqs), 2)
+            input_grid, freq_grid = np.meshgrid(input_lens, freqs, indexing='ij')
 
-                out = interpn(
-                    points=(possible_input_len, possible_freq),
-                    values=busy_power_values_dict[self.tp_degree],
-                    xi=xi,
-                    method='linear',
-                    bounds_error=False,
-                    fill_value=None,
-                )
-                outputs.append(np.asarray(out, dtype=np.float32).tolist())
+            # Flatten to (N_inputs * N_freqs, 2)
+            xi_all = np.stack([input_grid.ravel(), freq_grid.ravel()], axis=-1)
 
+            # Perform batched interpolation
+            values = busy_power_values_dict[self.tp_degree]
+            out_all = interpn(
+                points=(possible_input_len, possible_freq),
+                values=values,
+                xi=xi_all,
+                method='linear',
+                bounds_error=False,
+                fill_value=None,
+            )
             # output_arr shape: (n_future_states, n_freq_choices)
-            output_arr = np.array(outputs, dtype=np.float32)
+            output_arr = np.array(out_all.reshape(len(inputs), len(freqs)).astype(np.float32).tolist(), dtype=np.float32)
         else:
             # decode: batch-predict power for all future-state inputs at once
             power_model = self.power_model_decode
