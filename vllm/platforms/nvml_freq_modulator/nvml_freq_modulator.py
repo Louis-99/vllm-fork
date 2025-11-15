@@ -378,7 +378,7 @@ class _MPNvmlFreqModulatorServer:
                 time_till_finish_per_batch = np.cumsum(tbt_arr, axis=0)
                 time_till_finish_per_req = time_till_finish_per_batch[
                     np.array(prefill_cycles, dtype=int) - 1, :]
-                ttft_arr = time_till_finish_per_req + waiting_time_per_req
+                ttft_arr = time_till_finish_per_req + waiting_time_per_req[: time_till_finish_per_req.shape[0], :]
                 sla_ttft_mask = np.all(ttft_arr <= self.ttft_sla, axis=0)
                 # Combine masks to filter valid candidates
                 valid_mask = sla_ttft_mask
