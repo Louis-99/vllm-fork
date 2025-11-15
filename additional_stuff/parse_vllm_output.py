@@ -227,7 +227,7 @@ def load_logs_prefill_decode_power_logs(expr_dir: Path) -> Tuple[
 ]:
     decode_csv_paths = None
     # Read decode CSV if it exists
-    if "prefill" not in str(expr_dir):
+    if "prefill" not in str(expr_dir.name):
         decode_csv_paths = list(expr_dir.glob('engine_*.csv'))
     
     if decode_csv_paths is not None:
@@ -239,7 +239,7 @@ def load_logs_prefill_decode_power_logs(expr_dir: Path) -> Tuple[
 
     prefill_csv_paths = None
     # Read prefill CSV if it exists
-    if "decode" not in str(expr_dir) or "prefill_and_decode" in str(expr_dir):
+    if "decode" not in str(expr_dir.name) or "prefill_and_decode" in str(expr_dir.name):
         prefill_csv_paths = list(expr_dir.glob('engine_*.csv'))
     if prefill_csv_paths is not None:
         if len(prefill_csv_paths) > 1:
@@ -276,6 +276,7 @@ def extract_steady_region(
     for logs in raw_logs_dict.values():
         if isinstance(logs, tuple) and len(logs) == 3:
             decode_df, prefill_df, power_df = logs
+            print(f"Decode df shape: {decode_df.shape}, Prefill df shape: {prefill_df.shape}, Power df shape: {power_df.shape}")
             if not decode_df.empty:
                 decode_dfs.append(decode_df)
             if not prefill_df.empty:
