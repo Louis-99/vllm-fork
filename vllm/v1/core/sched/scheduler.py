@@ -634,7 +634,6 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
-        logger.info("Scheduled: %d tokens", total_num_scheduled_tokens)
         return scheduler_output
 
     def _update_after_schedule(

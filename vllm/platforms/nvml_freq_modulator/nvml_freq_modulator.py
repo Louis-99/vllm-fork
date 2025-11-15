@@ -128,11 +128,12 @@ def nvml_freq_modulator(config: VllmConfig,
         llm_engine,
         config,
         freq_choices=freq_choices,
+        mod_interval=1,
         log_dir=Path(config.log_dir),
         tbt_sla=0.1,
         ttft_sla=0.6,
-        optim_target='energy',
-        mod_interval=1,
+        optim_target='power',
+        future_window=6,
     )
 
 
@@ -290,8 +291,8 @@ class _MPNvmlFreqModulatorServer:
             mpc_start = time.perf_counter()
             msg: FreqModMsg = msgspec.msgpack.decode(msg_encoded,
                                                      type=FreqModMsg)
-            logger.info('freq_mod_msg: %s', msg)
-            # logger.debug('freq_mod_msg: %s', msg)
+            # logger.info('freq_mod_msg: %s', msg)
+            logger.debug('freq_mod_msg: %s', msg)
 
             future_states, prefill_cycles = self.get_future_states(
                 msg, self.future_windows)
@@ -345,9 +346,6 @@ class _MPNvmlFreqModulatorServer:
             selected_freq = freq_choices_desc[selected_freq_idx[0]]
             predicted_batch_lat = lat_mat[0][selected_freq_idx[0]]
         else:
-            # Precompute small helper arrays once (avoid repeated allocations)
-            idx_rows = np.arange(max_future_vision)[:, None]
-
             # Build waiting time vector once (use numpy, ensure float32)
             run_wait = np.asarray(freq_mod_msg.running_queue_wait_time, dtype=np.float32)
             wait_slice_len = len(prefill_cycles) - len(freq_mod_msg.running_queue_wait_time)
@@ -356,54 +354,59 @@ class _MPNvmlFreqModulatorServer:
             else:
                 wait_wait = np.empty((0,), dtype=np.float32)
             waiting_time_per_req = np.concatenate((run_wait, wait_wait), axis=0).reshape(-1, 1)
-
-            # Precompute prefill indices for indexing time-to-first-token rows
-            prefill_idx = (np.asarray(prefill_cycles, dtype=np.int32) - 1) if len(prefill_cycles) > 0 else np.array([], dtype=np.int32)
-
             # Start with the highest freq for each window
             selected_freq_ids = [0 for _ in range(self.future_windows)]
             for freq_idx in range(1, len(freq_choices_desc)):
-                # Collect the candidates from `selected_freqs`
+            # Collect the candidates from `selected_freqs`
                 candidates_: list[list[int]] = [[]]
                 for window_idx in range(max_future_vision):
                     if selected_freq_ids[window_idx] == freq_idx - 1:
                         freq_ids_this_window = [freq_idx - 1, freq_idx]
                     else:
                         freq_ids_this_window = [selected_freq_ids[window_idx]]
-                    candidates_ = [[*c, f] for c, f in product(candidates_, freq_ids_this_window)]
-                candidates = np.asarray(candidates_, dtype=np.int32)
+                    candidates_ = [[
+                        *c, f
+                    ] for c, f in product(candidates_, freq_ids_this_window)]
+                candidates = np.array(candidates_)
                 # [n_candidates, max_future_vision]
                 assert candidates.shape[1] == max_future_vision
 
-                # Keep only candidates
-                tbt_arr = lat_mat[idx_rows, candidates.T]
+                # Keep candidates that meet SLA
+                tbt_arr = lat_mat[np.arange(max_future_vision)[:, None],
+                                candidates.T]
                 # Compute TTFT for all candidates in parallel
                 time_till_finish_per_batch = np.cumsum(tbt_arr, axis=0)
-                time_till_finish_per_req = time_till_finish_per_batch[prefill_idx, :]
+                time_till_finish_per_req = time_till_finish_per_batch[
+                    np.array(prefill_cycles, dtype=int) - 1, :]
                 ttft_arr = time_till_finish_per_req + waiting_time_per_req
                 sla_ttft_mask = np.all(ttft_arr <= self.ttft_sla, axis=0)
-                candidates = candidates[sla_ttft_mask]
+                # Combine masks to filter valid candidates
+                valid_mask = sla_ttft_mask
+                candidates = candidates[valid_mask]
 
-                # Select the min-energy/power candidate as `selected_freq_ids`
-                if candidates.size > 0:
-                    # transpose once
-                    candidates_T = candidates.T
-                    energy_per_batch = energy_mat[idx_rows, candidates_T]
+                # Select the min-energy candidate as `selected_freq_ids`
+                if len(candidates) > 0:
+                    candidates = np.array(candidates)
+                    energy_per_batch = energy_mat[
+                        np.arange(max_future_vision)[:, None], candidates.T]
                     total_energy = np.sum(energy_per_batch, axis=0)
                     if self.optim_target == 'energy':
                         selected_freq_ids = candidates[np.argmin(total_energy)]
                     elif self.optim_target == 'power':
-                        lat_per_batch = lat_mat[idx_rows, candidates_T]
+                        lat_per_batch = lat_mat[np.arange(max_future_vision)[:,
+                                                                            None],
+                                                candidates.T]
                         total_lat = np.sum(lat_per_batch, axis=0)
                         total_power = total_energy / total_lat
                         selected_freq_ids = candidates[np.argmin(total_power)]
                 else:
                     break
-            selected_freq = max([freq_choices_desc[selected_freq_ids[i]] for i in range(self.mod_interval)])
+            selected_freq = max([
+                freq_choices_desc[selected_freq_ids[i]]
+                for i in range(self.mod_interval)
+            ])
 
             predicted_batch_lat = lat_mat[0][selected_freq_ids[0]]
-
-        return selected_freq, predicted_batch_lat
 
         return selected_freq, predicted_batch_lat
 
@@ -427,7 +430,7 @@ class _MPNvmlFreqModulatorServer:
         for i in range(len(msg.running_queue_tokens)):
             total_tokens = msg.running_queue_tokens[i]
             processed_tokens = msg.running_queue_pre_computed_tokens[i]
-            remaining_tokens = total_tokens - processed_tokens
+            remaining_tokens = (total_tokens+1) - processed_tokens
             if remaining_tokens > 0:
                 dummy_wait_queue.append(
                     (total_tokens+1, processed_tokens, remaining_tokens))
