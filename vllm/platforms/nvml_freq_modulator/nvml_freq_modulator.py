@@ -348,11 +348,7 @@ class _MPNvmlFreqModulatorServer:
         else:
             # Build waiting time vector once (use numpy, ensure float32)
             run_wait = np.asarray(freq_mod_msg.running_queue_wait_time, dtype=np.float32)
-            wait_slice_len = len(prefill_cycles) - len(freq_mod_msg.running_queue_wait_time)
-            if wait_slice_len > 0:
-                wait_wait = np.asarray(freq_mod_msg.waiting_queue_wait_time[:wait_slice_len], dtype=np.float32)
-            else:
-                wait_wait = np.empty((0,), dtype=np.float32)
+            wait_wait = np.asarray(freq_mod_msg.waiting_queue_wait_time, dtype=np.float32)
             waiting_time_per_req = np.concatenate((run_wait, wait_wait), axis=0).reshape(-1, 1)
             # Start with the highest freq for each window
             selected_freq_ids = [0 for _ in range(self.future_windows)]
@@ -361,7 +357,7 @@ class _MPNvmlFreqModulatorServer:
                 candidates_: list[list[int]] = [[]]
                 for window_idx in range(max_future_vision):
                     if selected_freq_ids[window_idx] == freq_idx - 1:
-                        freq_ids_this_window = [freq_idx - 1, freq_idx]
+                        freq_ids_this_window = [freq_idx - 1, freq_idx, freq_idx + 1] 
                     else:
                         freq_ids_this_window = [selected_freq_ids[window_idx]]
                     candidates_ = [[
@@ -383,7 +379,6 @@ class _MPNvmlFreqModulatorServer:
                 # Combine masks to filter valid candidates
                 valid_mask = sla_ttft_mask
                 candidates = candidates[valid_mask]
-
                 # Select the min-energy candidate as `selected_freq_ids`
                 if len(candidates) > 0:
                     candidates = np.array(candidates)
@@ -405,7 +400,6 @@ class _MPNvmlFreqModulatorServer:
                 freq_choices_desc[selected_freq_ids[i]]
                 for i in range(self.mod_interval)
             ])
-
             predicted_batch_lat = lat_mat[0][selected_freq_ids[0]]
 
         return selected_freq, predicted_batch_lat
@@ -572,6 +566,11 @@ class _MPNvmlFreqModulatorServer:
         }
 
         out = latency_model.run(None, input_feed)[0]
+
+        # Mark rows with batch_size == 0 so we can override model output after inference.
+        batch_size_col = batch_sizes.reshape(n_rows)
+        zero_mask = batch_size_col == 0
+        out[zero_mask] = 0.005
         
         out = np.asarray(out)
         latency_mat = out.reshape(n_states, n_freqs)
@@ -626,10 +625,9 @@ class _MPNvmlFreqModulatorServer:
 
             # Idle rows: directly lookup idle power table (map freq_choices -> nearest possible_freq)
             if np.any(idle_mask):
-                idle_table = idle_power_values_dict[self.tp_degree]
                 # For each freq choice, pick nearest index in possible_freq
                 freq_idx = np.argmin(np.abs(possible_freq.reshape(1, -1) - freqs.reshape(-1, 1)), axis=1)
-                idle_vals_for_freqs = idle_table[freq_idx]  # shape (n_freqs,)
+                idle_vals_for_freqs = idle_power_values_dict[self.tp_degree][freq_idx]
                 # Fill all idle future-state rows with the same idle vector
                 idle_rows = np.where(idle_mask)[0]
                 for r in idle_rows:
@@ -725,7 +723,8 @@ if __name__ == '__main__':
                                    ttft_sla=0.6,
                                    token_budget=1024,
                                    )
-    msg = [FreqModMsg(
+    msg = [
+        FreqModMsg(
             now=0.0,
             running_queue_tokens=[1024, 512, 256],
             running_queue_pre_computed_tokens=[520, 0, 0],
@@ -745,15 +744,15 @@ if __name__ == '__main__':
             waiting_queue_pre_computed_tokens=[0],
             waiting_queue_wait_time=[0.15],
         ),
-    FreqModMsg(
+        FreqModMsg(
             now=0.0,
-            running_queue_tokens=[200, 200, 200, 200],
-            running_queue_pre_computed_tokens=[0, 0, 0, 0],
-            running_queue_wait_time=[0.001, 0.002, 0.003, 0.004],
+            running_queue_tokens=[16],
+            running_queue_pre_computed_tokens=[0],
+            running_queue_wait_time=[0.001],
             kv_cache_usage=0.1,
-            waiting_queue_tokens=[1200],
-            waiting_queue_pre_computed_tokens=[0],
-            waiting_queue_wait_time=[0.15],
+            waiting_queue_tokens=[],
+            waiting_queue_pre_computed_tokens=[],
+            waiting_queue_wait_time=[],
         )]
     for i in range(3):
         q.put(msgspec.msgpack.encode(msg[i]))
