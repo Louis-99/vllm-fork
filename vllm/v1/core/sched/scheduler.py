@@ -1133,8 +1133,11 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 
-        # also send update to freq modulator on new request arrival
-        if self.freq_modulator:
+        # also send update to freq modulator on new request arrival (only for prefill) (only when there is already something in the running queue)
+        if self.freq_modulator and \
+                self.vllm_config.kv_transfer_config and \
+                self.vllm_config.kv_transfer_config.is_kv_producer and \
+                len(self.running) > 0:
             now = time.time()
             running_reqs_num_tokens = [req.num_tokens for req in self.running]
             running_computed_tokens_list = [req.num_computed_tokens for req in self.running]

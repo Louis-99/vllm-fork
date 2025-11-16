@@ -133,7 +133,7 @@ def nvml_freq_modulator(config: VllmConfig,
         tbt_sla=0.1,
         ttft_sla=0.6,
         optim_target='power',
-        future_window=6,
+        future_window=1,
     )
 
 
@@ -352,7 +352,7 @@ class _MPNvmlFreqModulatorServer:
             waiting_time_per_req = np.concatenate((run_wait, wait_wait), axis=0).reshape(-1, 1)
             # Start with the highest freq for each window
             selected_freq_ids = [0 for _ in range(self.future_windows)]
-            for freq_idx in range(1, len(freq_choices_desc)):
+            for freq_idx in range(1, len(freq_choices_desc) - 1):
             # Collect the candidates from `selected_freqs`
                 candidates_: list[list[int]] = [[]]
                 for window_idx in range(max_future_vision):
