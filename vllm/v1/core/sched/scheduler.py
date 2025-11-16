@@ -1133,6 +1133,32 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 
+        # also send update to freq modulator on new request arrival
+        if self.freq_modulator:
+            now = time.time()
+            running_reqs_num_tokens = [req.num_tokens for req in self.running]
+            running_computed_tokens_list = [req.num_computed_tokens for req in self.running]
+            running_reqs_num_time = [now - req.arrival_time for req in self.running]
+            waiting_computed_tokens_list = [req.num_computed_tokens for req in self.waiting]
+            waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
+            waiting_reqs_num_time = [now - req.arrival_time for req in self.waiting]
+
+            stats = SchedulerStats(
+                now=now,
+                num_running_reqs=len(self.running),
+                num_waiting_reqs=len(self.waiting),
+                running_computed_tokens_list=running_computed_tokens_list,
+                waiting_computed_tokens_list=waiting_computed_tokens_list,
+                running_reqs_num_tokens=running_reqs_num_tokens,
+                waiting_reqs_num_tokens=waiting_reqs_num_tokens,
+                running_reqs_num_time=running_reqs_num_time,
+                waiting_reqs_num_time=waiting_reqs_num_time,
+                kv_cache_usage=self.kv_cache_manager.usage,
+
+            )
+            self.freq_modulator.step(
+                scheduler_stats=stats)
+
     def finish_requests(
         self,
         request_ids: Union[str, Iterable[str]],
