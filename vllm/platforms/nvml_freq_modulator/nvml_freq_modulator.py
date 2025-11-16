@@ -278,7 +278,8 @@ class _MPNvmlFreqModulatorServer:
         # Column `now` used as key column to join with `perf_metrics.csv`
         csv_writer = CSVWriter(col_names=[
             'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
-            'target_freq', 'batch_lat', 
+            'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
+            'max_running_q_wait', 'max_waiting_q_wait',
         ],
         filename=self.log_dir / 'freq_mod_log.csv')
 
@@ -315,6 +316,12 @@ class _MPNvmlFreqModulatorServer:
                 freq_mod_end,
                 selected_freq,
                 pred_batch_lat,
+                len(msg.running_queue_wait_time),
+                len(msg.waiting_queue_wait_time),
+                max(msg.running_queue_wait_time) if len(
+                    msg.running_queue_wait_time) > 0 else 0.0,
+                max(msg.waiting_queue_wait_time) if len(
+                    msg.waiting_queue_wait_time) > 0 else 0.0,
             ])
 
         csv_writer.close()
