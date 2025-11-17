@@ -133,7 +133,6 @@ def nvml_freq_modulator(config: VllmConfig,
         tbt_sla=0.1,
         ttft_sla=0.6,
         optim_target='power',
-        future_window=1,
     )
 
 
@@ -150,7 +149,7 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
             freq_choices: list[int],
             log_dir: Path,
             mod_interval: int = 1,
-            future_window: int = 4,
+            future_window: int = 8,
             tbt_sla: float = 0.1,
             ttft_sla: float = 0.6,
             optim_target: str = 'power',  # 'energy' or 'power'factory
@@ -410,16 +409,6 @@ class _MPNvmlFreqModulatorServer:
                 for i in range(self.mod_interval)
             ])
             predicted_batch_lat = lat_mat[0][selected_freq_ids[0]]
-
-            print("prefill cycles:", prefill_cycles)
-            print('Selected freqs for future windows:', [
-                freq_choices_desc[selected_freq_ids[i]]
-                for i in range(len(selected_freq_ids))
-            ])
-            print('Predicted latencies for future windows:', [
-                lat_mat[i][selected_freq_ids[i]]
-                for i in range(len(selected_freq_ids))
-            ])
 
         return selected_freq, predicted_batch_lat
 
@@ -736,11 +725,11 @@ if __name__ == '__main__':
                                    log_dir=Path('./logs'),
                                    optim_target='power',
                                    mod_interval=1,
-                                   future_window=4,
+                                   future_window=8,
                                    engine_role='prefill',    
                                    tbt_sla=0.1,
                                    ttft_sla=0.6,
-                                   token_budget=1024,
+                                   token_budget=2048,
                                    )
     msg = [
         FreqModMsg(
@@ -772,8 +761,18 @@ if __name__ == '__main__':
             waiting_queue_tokens=[],
             waiting_queue_pre_computed_tokens=[],
             waiting_queue_wait_time=[],
-        )]
-    for i in range(3):
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[520, 0],
+            running_queue_wait_time=[0.01, 0.02],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[1200, 1200, 1200, 777, 666, 555, 888],
+            waiting_queue_pre_computed_tokens=[0, 0, 0, 0, 0, 0, 0],
+            waiting_queue_wait_time=[0.11, 0.12, 0.13, 0.13, 0.14, 0.157, 0.20],
+        ),]
+    for i in range(len(msg)):
         q.put(msgspec.msgpack.encode(msg[i]))
     s.run()
 
