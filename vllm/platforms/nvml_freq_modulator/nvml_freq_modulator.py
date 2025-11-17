@@ -306,7 +306,7 @@ class _MPNvmlFreqModulatorServer:
 
             freq_mod_start = time.perf_counter()
             if self.last_applied_freq != selected_freq:
-                nvml_set_freq(selected_freq)
+                # nvml_set_freq(selected_freq)
                 self.last_applied_freq = selected_freq
             freq_mod_end = time.perf_counter()
             csv_writer.add_row([
@@ -330,7 +330,9 @@ class _MPNvmlFreqModulatorServer:
                           future_states: list[FutureState], prefill_cycles):
         freq_choices_desc = sorted(copy.deepcopy(self.freq_choices),
                                    reverse=True)
-        max_future_vision = self.future_windows
+        
+        max_future_vision = self.future_windows if max(prefill_cycles) > self.future_windows else max(prefill_cycles)
+        future_states = future_states[:max_future_vision]
         # Pre-compute latency and power for each future window for each freq
         lat_mat = self.predict_latencies_future_states(future_states,
                                     freq_choices_desc)
@@ -408,6 +410,16 @@ class _MPNvmlFreqModulatorServer:
                 for i in range(self.mod_interval)
             ])
             predicted_batch_lat = lat_mat[0][selected_freq_ids[0]]
+
+            print("prefill cycles:", prefill_cycles)
+            print('Selected freqs for future windows:', [
+                freq_choices_desc[selected_freq_ids[i]]
+                for i in range(len(selected_freq_ids))
+            ])
+            print('Predicted latencies for future windows:', [
+                lat_mat[i][selected_freq_ids[i]]
+                for i in range(len(selected_freq_ids))
+            ])
 
         return selected_freq, predicted_batch_lat
 
