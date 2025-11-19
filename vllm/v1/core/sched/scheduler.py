@@ -182,6 +182,7 @@ class Scheduler(SchedulerInterface):
         if vllm_config.enable_nvml_freq_mod:
             self.freq_modulator = nvml_freq_modulator(
                 vllm_config, self)
+        self.last_add_req_stat = time.time()
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1133,12 +1134,13 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 
-        # also send update to freq modulator on new request arrival (only for prefill) (only when there is already something in the running queue)
+        now = time.time()
+        # also send update to freq modulator on new request arrival (only for prefill) (rate limit to once every 50ms)
         if self.freq_modulator and \
                 self.vllm_config.kv_transfer_config and \
                 self.vllm_config.kv_transfer_config.is_kv_producer and \
-                len(self.running) > 0:
-            now = time.time()
+                now - self.last_add_req_stat > 0.05:
+            self.last_add_req_stat = now
             running_reqs_num_tokens = [req.num_tokens for req in self.running]
             running_computed_tokens_list = [req.num_computed_tokens for req in self.running]
             running_reqs_num_time = [now - req.arrival_time for req in self.running]

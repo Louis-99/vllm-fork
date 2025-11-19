@@ -305,7 +305,7 @@ class _MPNvmlFreqModulatorServer:
 
             freq_mod_start = time.perf_counter()
             if self.last_applied_freq != selected_freq:
-                # nvml_set_freq(selected_freq)
+                nvml_set_freq(selected_freq)
                 self.last_applied_freq = selected_freq
             freq_mod_end = time.perf_counter()
             csv_writer.add_row([
