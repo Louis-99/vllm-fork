@@ -203,9 +203,9 @@ async def get_request(
         if delay_ts[request_index] > 0:
             current_ts = time.time()
             sleep_interval_s = start_ts + delay_ts[request_index] - current_ts
-            if sleep_interval_s > 0:
-                await asyncio.sleep(sleep_interval_s)
-        yield request, request_rates[request_index]
+            # if sleep_interval_s > 0:
+                # await asyncio.sleep(sleep_interval_s)
+        yield request, request_rates[request_index], delay_ts[request_index]
 
 
 def calculate_metrics_for_embeddings(
@@ -545,7 +545,7 @@ async def benchmark(
     data_time_list = []
     data_start_time = None
 
-    async for request, current_request_rate in get_request(
+    async for request, current_request_rate, accum_latency in get_request(
             input_requests, request_rate, burstiness, ramp_up_strategy,
             ramp_up_start_rps, ramp_up_end_rps):
         if ramp_up_strategy is not None:
@@ -573,7 +573,7 @@ async def benchmark(
         cur_time = time.perf_counter()
         if data_start_time is None:
             data_start_time = cur_time
-        data_time_list.append(cur_time - data_start_time)
+        data_time_list.append(accum_latency)
         input_len_list.append(prompt_len)
         output_len_list.append(output_len)
 
@@ -601,9 +601,9 @@ async def benchmark(
         pbar.close()
 
     df = pd.DataFrame({
-        'time': data_time_list,
-        'input_len': input_len_list,
-        'output_len': output_len_list,
+        'arrived_at': data_time_list,
+        'num_prefill_tokens': input_len_list,
+        'num_decode_tokens': output_len_list,
     })
 
     df.to_csv('trace.csv', index=False)
