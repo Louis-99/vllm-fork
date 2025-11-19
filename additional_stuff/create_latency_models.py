@@ -177,6 +177,7 @@ def main():
     CSV_PATH_TP2_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov12_TP2_decode_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/decode_latencies.csv"
     CSV_PATH_TP4_D = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
     CSV_PATH_TP4_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov12_TP4_decode_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
+    CSV_PATH_TP4_D2 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov19_TP4_decode_latency_largebatch/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
 
 
     CSV_PATH_TP2_P = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/default_log_path/prefill_latencies.csv"
@@ -232,9 +233,11 @@ def main():
         print(f"Decode samples {len(df_d21.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_D1}")
         df_d4 = load_and_prepare(CSV_PATH_TP4_D, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
         df_d41 = load_and_prepare(CSV_PATH_TP4_D1, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
+        df_d42 = load_and_prepare(CSV_PATH_TP4_D2, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
         print(f"Decode samples {len(df_d4.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D}")
         print(f"Decode samples {len(df_d41.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D1}")
-        df_decode = pd.concat([df_d2, df_d21, df_d4, df_d41], ignore_index=True)
+        print(f"Decode samples {len(df_d42.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D2}")
+        df_decode = pd.concat([df_d2, df_d21, df_d4, df_d41, df_d42], ignore_index=True)
         df_decode.to_csv(os.path.join(MODEL_DIR, 'decode_cleaned.csv'), index=False)
         stats_decode = train_and_save(df_decode, DECODE_FEATURE_COLS, DECODE_TARGET, DECODE_OUT, MODEL_DIR, convert_onnx=True, role='decode')
     else:
@@ -258,22 +261,22 @@ def main():
     # Example inputs
     sample_prefill = [
         'Llama-3.3-70B-Instruct',
-        4,  # batch_size
-        1200,  # input_len_sum
-        300,  # input_len_mean
-        50,  # input_len_std
-        2,  # tp_degree
-        1830,  # freq_mhz
+        6,  # batch_size
+        1472,  # input_len_sum
+        245.33,  # input_len_mean
+        247.41,  # input_len_std
+        4,  # tp_degree
+        360,  # freq_mhz
     ]
 
     sample_decode = [
         'Llama-3.3-70B-Instruct',
-        4,  # batch_size
-        1200,  # input_len_sum
-        300,  # input_len_mean
-        50,  # input_len_std
-        2,  # tp_degree
-        1830,  # freq_mhz
+        274,  # batch_size
+        93821,  # input_len_sum
+        171.2,  # input_len_mean
+        202.19,  # input_len_std
+        4,  # tp_degree
+        360,  # freq_mhz
     ]
 
     if pre_model is not None:

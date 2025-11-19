@@ -191,6 +191,7 @@ def main():
     CSV_PATH_TP2_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_Nov12_TP2_decode_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/decode_powers.csv"
     CSV_PATH_TP4_D = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_decode/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_powers.csv"
     CSV_PATH_TP4_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_Nov12_TP4_decode_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_powers.csv"
+    CSV_PATH_TP4_D2 = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_Nov19_TP4_decode_latency_largebatch/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_powers.csv"
 
     CSV_PATH_TP2_P = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill_back_to_back/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/prefill_powers_windowed.csv"
     CSV_PATH_TP4_P = "/export2/obasit/ClusterLevelServing/vllm_logs/energy_profiler_logs/profiler_logs_prefill_back_to_back/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4_back_to_back/prefill_powers_windowed.csv"
@@ -244,9 +245,11 @@ def main():
         print(f"Decode samples {len(df_d21.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP2_D1}")
         df_d4 = load_and_prepare(CSV_PATH_TP4_D, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
         df_d41 = load_and_prepare(CSV_PATH_TP4_D1, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
+        df_d42 = load_and_prepare(CSV_PATH_TP4_D2, 'Llama-3.3-70B-Instruct', tp=4, numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
         print(f"Decode samples {len(df_d4.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D}")
         print(f"Decode samples {len(df_d41.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D1}")
-        df_decode = pd.concat([df_d2, df_d21, df_d4, df_d41], ignore_index=True)
+        print(f"Decode samples {len(df_d42.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D2}")
+        df_decode = pd.concat([df_d2, df_d21, df_d4, df_d41, df_d42], ignore_index=True)
         df_decode.to_csv(os.path.join(MODEL_DIR, 'decode_cleaned.csv'), index=False)
         stats_decode = train_and_save(df_decode, DECODE_FEATURE_COLS, DECODE_TARGET, DECODE_OUT, MODEL_DIR, convert_onnx=args.onnx, role='decode')
     else:
