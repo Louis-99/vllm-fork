@@ -52,9 +52,11 @@ def build_pipeline(role):
 
     # Choose defaults by role but allow overrides
     if role == 'prefill':
-        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20)
+        # est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
+        est = HistGradientBoostingRegressor(max_iter=100, random_state=42, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
     elif role == 'decode':
-        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20)
+        # est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
+        est = HistGradientBoostingRegressor(max_iter=100, random_state=42, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
 
     return Pipeline([('pre', pre), ('est', est)])
 

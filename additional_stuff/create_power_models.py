@@ -18,7 +18,7 @@ import numpy as np
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 from skl2onnx import convert_sklearn
@@ -66,7 +66,7 @@ def build_pipeline(role):
             random_state=42,
         )
     elif role == 'decode':
-        est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20)
+        est = HistGradientBoostingRegressor(max_iter=100, random_state=42, monotonic_cst=[0, 0, 0, 0, 0, 0, 1])
 
     return Pipeline([('pre', pre), ('est', est)])
 
