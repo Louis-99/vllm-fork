@@ -1139,7 +1139,7 @@ class Scheduler(SchedulerInterface):
         if self.freq_modulator and \
                 self.vllm_config.kv_transfer_config and \
                 self.vllm_config.kv_transfer_config.is_kv_producer and \
-                now - self.last_add_req_stat > 0.05:
+                now - self.last_add_req_stat > 0.025:
             self.last_add_req_stat = now
             running_reqs_num_tokens = [req.num_tokens for req in self.running]
             running_computed_tokens_list = [req.num_computed_tokens for req in self.running]
