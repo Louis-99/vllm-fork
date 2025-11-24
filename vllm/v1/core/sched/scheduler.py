@@ -553,6 +553,9 @@ class Scheduler(SchedulerInterface):
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
+        logger.info(f"len skipped waiting requests: {len(skipped_waiting_requests)}"
+                    f"  KV usage: {self.kv_cache_manager.usage}")
+
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
@@ -1135,12 +1138,10 @@ class Scheduler(SchedulerInterface):
             request.record_event(EngineCoreEventType.QUEUED)
 
         now = time.time()
-        # also send update to freq modulator on new request arrival (only for prefill) (rate limit to once every 50ms)
+        # also send update to freq modulator on new request arrival (only for prefill)
         if self.freq_modulator and \
                 self.vllm_config.kv_transfer_config and \
-                self.vllm_config.kv_transfer_config.is_kv_producer and \
-                now - self.last_add_req_stat > 0.025:
-            self.last_add_req_stat = now
+                self.vllm_config.kv_transfer_config.is_kv_producer:
             running_reqs_num_tokens = [req.num_tokens for req in self.running]
             running_computed_tokens_list = [req.num_computed_tokens for req in self.running]
             running_reqs_num_time = [now - req.arrival_time for req in self.running]
