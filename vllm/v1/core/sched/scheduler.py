@@ -186,12 +186,13 @@ class Scheduler(SchedulerInterface):
         interval = 0.2  # seconds
         initial_timer = threading.Timer(interval, self.periodic_nvml_send_stats)
         initial_timer.daemon = True
-        initial_timer.start()
+        if vllm_config.kv_transfer_config.is_kv_producer:
+            initial_timer.start()
 
     def periodic_nvml_send_stats(self):
-        if self.freq_modulator:
+        if self.freq_modulator and len(self.running) > 0 and len(self.waiting) > 0:
             running_copy = self.running[:]
-            waiting_copy = self.waiting[:]
+            waiting_copy = [i for i in self.waiting]
             now = time.time()
             running_computed_tokens_list = [req.num_computed_tokens for req in running_copy]
             waiting_computed_tokens_list = [req.num_computed_tokens for req in waiting_copy]
