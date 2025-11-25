@@ -183,7 +183,7 @@ class Scheduler(SchedulerInterface):
         if vllm_config.enable_nvml_freq_mod:
             self.freq_modulator = nvml_freq_modulator(
                 vllm_config, self)
-        interval = 0.2  # seconds
+        interval = 0.1  # seconds
         initial_timer = threading.Timer(interval, self.periodic_nvml_send_stats)
         initial_timer.daemon = True
         if vllm_config.kv_transfer_config.is_kv_producer:
@@ -191,33 +191,28 @@ class Scheduler(SchedulerInterface):
 
     def periodic_nvml_send_stats(self):
         if self.freq_modulator and len(self.running) > 0 and len(self.waiting) > 0:
-            running_copy = self.running[:]
-            waiting_copy = [i for i in self.waiting]
+            running_top_copy = self.running[0]
+            running_len = len(self.running)
+            waiting_top_copy = self.waiting.peek_request()
+            waiting_len = len(self.waiting)
             now = time.time()
-            running_computed_tokens_list = [req.num_computed_tokens for req in running_copy]
-            waiting_computed_tokens_list = [req.num_computed_tokens for req in waiting_copy]
-            running_reqs_num_tokens = [req.num_tokens for req in running_copy]
-            waiting_reqs_num_tokens = [req.num_tokens for req in waiting_copy]
-            running_reqs_num_time = [now - req.arrival_time for req in running_copy]
-            waiting_reqs_num_time = [now - req.arrival_time for req in waiting_copy]
-
+            running_computed_tokens_list = [running_top_copy.num_computed_tokens] if running_top_copy else [0]
+            waiting_computed_tokens_list = [waiting_top_copy.num_computed_tokens] if waiting_top_copy else [0]
+            running_reqs_num_tokens = [running_top_copy.num_tokens] if running_top_copy else [0]
+            waiting_reqs_num_tokens = [waiting_top_copy.num_tokens] if waiting_top_copy else [0]
             stats = SchedulerStats(
                 now=now,
-                num_running_reqs=len(running_computed_tokens_list),
-                num_waiting_reqs=len(waiting_computed_tokens_list),
+                num_running_reqs=running_len,
+                num_waiting_reqs=waiting_len,
                 running_computed_tokens_list=running_computed_tokens_list,
                 waiting_computed_tokens_list=waiting_computed_tokens_list,
                 running_reqs_num_tokens=running_reqs_num_tokens,
                 waiting_reqs_num_tokens=waiting_reqs_num_tokens,
-                running_reqs_num_time=running_reqs_num_time,
-                waiting_reqs_num_time=waiting_reqs_num_time,
-                kv_cache_usage=self.kv_cache_manager.usage,
-
             )
-            self.freq_modulator.step(
+            self.freq_modulator.update_periodic_stats(
                 scheduler_stats=stats)
         # Reschedule the task for the next interval
-        timer = threading.Timer(0.2, self.periodic_nvml_send_stats)
+        timer = threading.Timer(0.1, self.periodic_nvml_send_stats)
         timer.daemon = True
         timer.start()
 
@@ -1170,6 +1165,35 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+
+        now = time.time()
+        # also send update to freq modulator on new request arrival (only for prefill)
+        if self.freq_modulator and \
+                self.vllm_config.kv_transfer_config and \
+                self.vllm_config.kv_transfer_config.is_kv_producer:
+            self.last_add_req_stat = now
+            running_reqs_num_tokens = [req.num_tokens for req in self.running]
+            running_computed_tokens_list = [req.num_computed_tokens for req in self.running]
+            running_reqs_num_time = [now - req.arrival_time for req in self.running]
+            waiting_computed_tokens_list = [req.num_computed_tokens for req in self.waiting]
+            waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
+            waiting_reqs_num_time = [now - req.arrival_time for req in self.waiting]
+
+            stats = SchedulerStats(
+                now=now,
+                num_running_reqs=len(self.running),
+                num_waiting_reqs=len(self.waiting),
+                running_computed_tokens_list=running_computed_tokens_list,
+                waiting_computed_tokens_list=waiting_computed_tokens_list,
+                running_reqs_num_tokens=running_reqs_num_tokens,
+                waiting_reqs_num_tokens=waiting_reqs_num_tokens,
+                running_reqs_num_time=running_reqs_num_time,
+                waiting_reqs_num_time=waiting_reqs_num_time,
+                kv_cache_usage=self.kv_cache_manager.usage,
+
+            )
+            self.freq_modulator.step(
+                scheduler_stats=stats)
 
     def finish_requests(
         self,
