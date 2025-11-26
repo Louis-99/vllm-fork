@@ -193,7 +193,7 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
         self.shared_state.waiting_len = 0
         self.shared_state.running_top_req_tokens = 0
         self.shared_state.waiting_top_req_tokens = 0
-        self.shared_state.running_top_computed_tokens
+        self.shared_state.running_top_computed_tokens = 0
         self._periodic_state_lock = get_mp_context().Lock()
 
         self.q: SimpleQueue = get_mp_context().SimpleQueue()
@@ -330,8 +330,7 @@ class _MPNvmlFreqModulatorServer:
             periodic_state.waiting_top_req_tokens == state.waiting_top_req_tokens and \
             periodic_state.running_top_computed_tokens == state.running_top_computed_tokens:
             nvml_set_freq(max(self.freq_choices))
-            pass
-              
+            logger.info(f'Underpredicted batch latency detected, comparing at time {state.timestamp}')              
 
     def run(self):
         # Load models here rather than in __init__() so that we don't pass the
@@ -373,17 +372,18 @@ class _MPNvmlFreqModulatorServer:
                 self.last_applied_freq = selected_freq
             freq_mod_end = time.perf_counter()
 
-            state = StateObservation(
-                timestamp=msg.now,
-                running_len=len(msg.running_queue_tokens),
-                waiting_len=len(msg.waiting_queue_tokens),
-                running_top_req_tokens=msg.running_queue_tokens[0] if len(msg.running_queue_tokens) > 0 else 0,
-                waiting_top_req_tokens=msg.waiting_queue_tokens[0] if len(msg.waiting_queue_tokens) > 0 else 0,
-                running_top_computed_tokens=msg.running_queue_pre_computed_tokens[0] if len(msg.running_queue_pre_computed_tokens) > 0 else 0,
-            )
-            lat_check_time = threading.Timer(float(pred_batch_lat+0.005), self.check_prediction, args=(state,))
-            lat_check_time.daemon = True
-            lat_check_time.start()
+            # if self.engine_role == 'prefill':
+            #     state = StateObservation(
+            #         timestamp=msg.now,
+            #         running_len=len(msg.running_queue_tokens),
+            #         waiting_len=len(msg.waiting_queue_tokens),
+            #         running_top_req_tokens=msg.running_queue_tokens[0] if len(msg.running_queue_tokens) > 0 else 0,
+            #         waiting_top_req_tokens=msg.waiting_queue_tokens[0] if len(msg.waiting_queue_tokens) > 0 else 0,
+            #         running_top_computed_tokens=msg.running_queue_pre_computed_tokens[0] if len(msg.running_queue_pre_computed_tokens) > 0 else 0,
+            #     )
+            #     lat_check_time = threading.Timer(float(pred_batch_lat+0.005), self.check_prediction, args=(state,))
+            #     lat_check_time.daemon = True
+            #     lat_check_time.start()
 
             csv_writer.add_row([
                 msg.now,
