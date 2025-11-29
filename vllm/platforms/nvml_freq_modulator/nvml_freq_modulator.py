@@ -485,7 +485,7 @@ class _MPNvmlFreqModulatorServer:
                     break
                 num_tokens = min(budget_left, dummy_wait_queue[0][2])
                 # add small overhead for chunking, dont count towards chunking budget
-                prefills.append(num_tokens + int(0.4*dummy_wait_queue[0][1]))
+                prefills.append(num_tokens + int(0.05*dummy_wait_queue[0][1]))
 
                 total_tokens, \
                 processed_tokens, \
