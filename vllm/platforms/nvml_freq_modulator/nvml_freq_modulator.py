@@ -185,23 +185,10 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
 
         self.model = vllm_config.model_config.model
 
-        # Create shared memory objects for cross-process communication
-        manager = get_mp_context().Manager()
-        self.shared_state = manager.Namespace()
-        self.shared_state.timestamp = 0.0
-        self.shared_state.running_len = 0
-        self.shared_state.waiting_len = 0
-        self.shared_state.running_top_req_tokens = 0
-        self.shared_state.waiting_top_req_tokens = 0
-        self.shared_state.running_top_computed_tokens = 0
-        self._periodic_state_lock = get_mp_context().Lock()
-
         self.q: SimpleQueue = get_mp_context().SimpleQueue()
         self.server = _MPNvmlFreqModulatorServer(vllm_config,
                                                  freq_choices,
                                                  self.q,
-                                                 shared_state=self.shared_state,
-                                                 shared_lock=self._periodic_state_lock,
                                                  log_dir=log_dir,
                                                  mod_interval=mod_interval,
                                                  future_window=future_window,
@@ -220,16 +207,6 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
         msg = self.build_msg(scheduler_stats)
         msg_encoded = msgspec.msgpack.encode(msg)
         self.q.put(msg_encoded)
-
-    def update_periodic_stats(self, scheduler_stats: SchedulerStats) -> None:
-        with self._periodic_state_lock:
-            self.shared_state.timestamp = scheduler_stats.now
-            self.shared_state.running_len = scheduler_stats.num_running_reqs
-            self.shared_state.waiting_len = scheduler_stats.num_waiting_reqs
-            self.shared_state.running_top_req_tokens = scheduler_stats.running_reqs_num_tokens[0]
-            self.shared_state.waiting_top_req_tokens = scheduler_stats.waiting_reqs_num_tokens[0]
-            self.shared_state.running_top_computed_tokens = scheduler_stats.running_computed_tokens_list[0]
-
 
     def close(self):
         self.q.put(None)
@@ -256,8 +233,6 @@ class _MPNvmlFreqModulatorServer:
         vllm_config: VllmConfig,
         freq_choices: list[int],
         q: SimpleQueue,
-        shared_state,
-        shared_lock,
         log_dir: Path,
         optim_target: str,
         mod_interval: int,
@@ -281,9 +256,6 @@ class _MPNvmlFreqModulatorServer:
         self.optim_target = optim_target
         self.engine_role = engine_role
         self.token_budget = token_budget
-
-        self.shared_state = shared_state
-        self.shared_lock = shared_lock
 
         self.model = vllm_config.model_config.model
         self.tp_degree = vllm_config.parallel_config.tensor_parallel_size
@@ -312,25 +284,7 @@ class _MPNvmlFreqModulatorServer:
         if pre_path.exists():
             self.latency_model_prefill = ort.InferenceSession(pre_path)
         if power_dec_path.exists():
-            self.power_model_decode = ort.InferenceSession(power_dec_path)
-        
-    def check_prediction(self, state: StateObservation):
-        with self.shared_lock:
-            periodic_state = StateObservation(
-                timestamp=self.shared_state.timestamp,
-                running_len=self.shared_state.running_len,
-                waiting_len=self.shared_state.waiting_len,
-                running_top_req_tokens=self.shared_state.running_top_req_tokens,
-                waiting_top_req_tokens=self.shared_state.waiting_top_req_tokens,
-                running_top_computed_tokens=self.shared_state.running_top_computed_tokens,
-            )
-        if periodic_state.running_len == state.running_len and \
-            periodic_state.waiting_len == state.waiting_len and \
-            periodic_state.running_top_req_tokens == state.running_top_req_tokens and \
-            periodic_state.waiting_top_req_tokens == state.waiting_top_req_tokens and \
-            periodic_state.running_top_computed_tokens == state.running_top_computed_tokens:
-            nvml_set_freq(max(self.freq_choices))
-            logger.info(f'Underpredicted batch latency detected, comparing at time {state.timestamp}')              
+            self.power_model_decode = ort.InferenceSession(power_dec_path)             
 
     def run(self):
         # Load models here rather than in __init__() so that we don't pass the
@@ -371,19 +325,6 @@ class _MPNvmlFreqModulatorServer:
                 nvml_set_freq(selected_freq)
                 self.last_applied_freq = selected_freq
             freq_mod_end = time.perf_counter()
-
-            # if self.engine_role == 'prefill':
-            #     state = StateObservation(
-            #         timestamp=msg.now,
-            #         running_len=len(msg.running_queue_tokens),
-            #         waiting_len=len(msg.waiting_queue_tokens),
-            #         running_top_req_tokens=msg.running_queue_tokens[0] if len(msg.running_queue_tokens) > 0 else 0,
-            #         waiting_top_req_tokens=msg.waiting_queue_tokens[0] if len(msg.waiting_queue_tokens) > 0 else 0,
-            #         running_top_computed_tokens=msg.running_queue_pre_computed_tokens[0] if len(msg.running_queue_pre_computed_tokens) > 0 else 0,
-            #     )
-            #     lat_check_time = threading.Timer(float(pred_batch_lat+0.005), self.check_prediction, args=(state,))
-            #     lat_check_time.daemon = True
-            #     lat_check_time.start()
 
             csv_writer.add_row([
                 msg.now,
@@ -543,7 +484,8 @@ class _MPNvmlFreqModulatorServer:
                 if i == 0 and extracted_reqs >= len(msg.running_queue_tokens):
                     break
                 num_tokens = min(budget_left, dummy_wait_queue[0][2])
-                prefills.append(num_tokens)
+                # add small overhead for chunking, dont count towards chunking budget
+                prefills.append(num_tokens + int(0.4*dummy_wait_queue[0][1]))
 
                 total_tokens, \
                 processed_tokens, \
@@ -795,21 +737,10 @@ if __name__ == '__main__':
         seed=0,
     )
     vllm_config.parallel_config.tensor_parallel_size = 4
-    manager = get_mp_context().Manager()
-    shared_state = manager.Namespace()
-    shared_state.timestamp = 0.0
-    shared_state.running_len = 3
-    shared_state.waiting_len = 3
-    shared_state.running_top_req_tokens = 1024
-    shared_state.waiting_top_req_tokens = 1200
-    shared_state.running_top_computed_tokens = 520
-    periodic_state_lock = get_mp_context().Lock()
     freq_choices = get_preselected_freq(get_gpu_name())
     s = _MPNvmlFreqModulatorServer(freq_choices=freq_choices,
                                    vllm_config=vllm_config,
                                    q=q,
-                                   shared_state=shared_state,
-                                   shared_lock=periodic_state_lock,
                                    log_dir=Path('./logs'),
                                    optim_target='power',
                                    mod_interval=1,
