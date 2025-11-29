@@ -100,6 +100,9 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
             num_computed_tokens_list[row.Index] = [num_computed_dict[ID] for ID in row.request_ids_iter_tbt_evald]
     df['num_computed_tokens_reqs_evald'] = num_computed_tokens_list
 
+    # drop rows with KV cache greater than 95%
+    df = df[df['KV_usage_perc'] < 0.95].copy()
+
     lat_and_shape_list: List[LatencyAndShape] = []
 
     if df.empty or df['now'].isnull().all():
@@ -184,8 +187,8 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
     first_zero_waiting_index = zero_waiting_indices[0]
     df = df[df.index >= first_zero_waiting_index].copy()
 
-    # filter out any where KV cache is above 90%
-    df = df[df['KV_usage_perc'] <= 0.9].copy()
+    # filter out any where KV cache is above 95%
+    df = df[df['KV_usage_perc'] <= 0.95].copy()
  
     # calculate RPS using EWMA (TODO: add RPS to logs directly)
     df['rps'] = 0.0

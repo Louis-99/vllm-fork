@@ -75,6 +75,9 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
             num_computed_tokens_list[row.Index] = [num_computed_dict[ID] for ID in row.request_ids_iter_tbt_evald]
     df_perf_metric_decode_steady['num_computed_tokens_reqs_evald'] = num_computed_tokens_list
 
+    # drop rows with KV cache greater than 95%
+    df_perf_metric_decode_steady = df_perf_metric_decode_steady[df_perf_metric_decode_steady['KV_usage_perc'] < 0.95].copy()
+
     lat_and_shape_list = []
     import concurrent.futures
 
@@ -112,7 +115,6 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
 
     return lat_and_shape_list
 
-
 def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFrame, df_power: pd.DataFrame) -> list[LatencyAndShape]:
     # get single freq_mhz for all gpus
     df_power['freq_mhz'] = df_power[[col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]].mean(axis=1)
@@ -125,6 +127,9 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
     df_perf_metric_prefill_steady = df_perf_metric_prefill_steady[df_perf_metric_prefill_steady['request_ids_iter_ttft_evald'].apply(lambda x: len(x) > 0)].copy()
     # then do shift of gpu times
     df_perf_metric_prefill_steady.loc[:, "step_with_batch_queue_time_ms"] = df_perf_metric_prefill_steady["step_with_batch_queue_time_ms_1_iters_delay"].shift(-1)
+
+    # drop rows with KV cache greater than 95%
+    df_perf_metric_prefill_steady = df_perf_metric_prefill_steady[df_perf_metric_prefill_steady['KV_usage_perc'] < 0.95].copy()    
 
     lat_and_shape_list = []
 
