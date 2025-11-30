@@ -79,7 +79,7 @@ class NvmlFreqModulatorInterface(ABC):
         ...
     
     @abstractmethod
-    def update_periodic_stats(self,
+    def step_update_wait_q(self,
                              scheduler_stats: Optional[SchedulerStats],) -> None:
         ...
 
@@ -202,8 +202,25 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
         self.server_process.start()
         logger.info('_MPNvmlFreqModulatorServer process started.')
 
+        self.stat_buffer = SchedulerStats()
+        self.stat_buffer_lock = threading.Lock()
+
     def step(self,
              scheduler_stats: SchedulerStats) -> None:
+        msg = self.build_msg(scheduler_stats)
+        msg_encoded = msgspec.msgpack.encode(msg)
+        self.q.put(msg_encoded)
+        with self.stat_buffer_lock:
+            self.stat_buffer = scheduler_stats
+
+    def step_update_wait_q(self,
+             scheduler_stats: SchedulerStats) -> None:
+        with self.stat_buffer_lock:
+            time_elapsed = scheduler_stats.now - self.stat_buffer.now
+            scheduler_stats.num_running_reqs = self.stat_buffer.num_running_reqs
+            scheduler_stats.running_computed_tokens_list = self.stat_buffer.running_computed_tokens_list
+            scheduler_stats.running_reqs_num_tokens = self.stat_buffer.running_reqs_num_tokens
+            scheduler_stats.running_reqs_num_time = [x + time_elapsed for x in self.stat_buffer.running_reqs_num_time]
         msg = self.build_msg(scheduler_stats)
         msg_encoded = msgspec.msgpack.encode(msg)
         self.q.put(msg_encoded)

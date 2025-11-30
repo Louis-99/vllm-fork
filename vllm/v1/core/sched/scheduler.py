@@ -183,42 +183,6 @@ class Scheduler(SchedulerInterface):
         if vllm_config.enable_nvml_freq_mod:
             self.freq_modulator = nvml_freq_modulator(
                 vllm_config, self)
-        interval = 0.1  # seconds
-        initial_timer = threading.Timer(interval, self.periodic_nvml_send_stats)
-        initial_timer.daemon = True
-        if vllm_config.kv_transfer_config.is_kv_producer:
-            initial_timer.start()
-
-    def periodic_nvml_send_stats(self):
-        if self.freq_modulator and (len(self.running) > 0 or len(self.waiting) > 0):
-            now = time.time()
-            self.last_add_req_stat = now
-            running_reqs_num_tokens = [req.num_tokens for req in self.running]
-            running_computed_tokens_list = [req.num_computed_tokens for req in self.running]
-            running_reqs_num_time = [now - req.arrival_time for req in self.running]
-            waiting_computed_tokens_list = [req.num_computed_tokens for req in self.waiting]
-            waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
-            waiting_reqs_num_time = [now - req.arrival_time for req in self.waiting]
-
-            stats = SchedulerStats(
-                now=now,
-                num_running_reqs=len(self.running),
-                num_waiting_reqs=len(self.waiting),
-                running_computed_tokens_list=running_computed_tokens_list,
-                waiting_computed_tokens_list=waiting_computed_tokens_list,
-                running_reqs_num_tokens=running_reqs_num_tokens,
-                waiting_reqs_num_tokens=waiting_reqs_num_tokens,
-                running_reqs_num_time=running_reqs_num_time,
-                waiting_reqs_num_time=waiting_reqs_num_time,
-                kv_cache_usage=self.kv_cache_manager.usage,
-
-            )
-            self.freq_modulator.step(
-                scheduler_stats=stats)
-        # Reschedule the task for the next interval
-        timer = threading.Timer(0.1, self.periodic_nvml_send_stats)
-        timer.daemon = True
-        timer.start()
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1177,27 +1141,24 @@ class Scheduler(SchedulerInterface):
                 self.vllm_config.kv_transfer_config.is_kv_producer and \
                 len(self.running) > 0:
             self.last_add_req_stat = now
-            running_reqs_num_tokens = [req.num_tokens for req in self.running]
-            running_computed_tokens_list = [req.num_computed_tokens for req in self.running]
-            running_reqs_num_time = [now - req.arrival_time for req in self.running]
             waiting_computed_tokens_list = [req.num_computed_tokens for req in self.waiting]
             waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
             waiting_reqs_num_time = [now - req.arrival_time for req in self.waiting]
 
             stats = SchedulerStats(
                 now=now,
-                num_running_reqs=len(self.running),
+                num_running_reqs=None,
                 num_waiting_reqs=len(self.waiting),
-                running_computed_tokens_list=running_computed_tokens_list,
+                running_computed_tokens_list=None,
                 waiting_computed_tokens_list=waiting_computed_tokens_list,
-                running_reqs_num_tokens=running_reqs_num_tokens,
+                running_reqs_num_tokens=None,
                 waiting_reqs_num_tokens=waiting_reqs_num_tokens,
-                running_reqs_num_time=running_reqs_num_time,
+                running_reqs_num_time=None,
                 waiting_reqs_num_time=waiting_reqs_num_time,
                 kv_cache_usage=self.kv_cache_manager.usage,
 
             )
-            self.freq_modulator.step(
+            self.freq_modulator.step_update_wait_q(
                 scheduler_stats=stats)
 
     def finish_requests(
