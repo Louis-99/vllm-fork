@@ -104,7 +104,8 @@ class FreqModMsg(msgspec.Struct):
     waiting_queue_tokens: list[int]  # tokens in wait queue, for batch just dispatched
     waiting_queue_pre_computed_tokens: list[int]  # tokens in wait queue, for batch just dispatched (should be 0s)
     waiting_queue_wait_time: list[float]  # waiting times in waiting queue
-    fromScheduler: bool = True  # True if from scheduler. False if from wait q update
+    fromWho: str  # can be from scheduler or request_update or request_end
+    batch_ID: int  # batch ID of the current batch
 
     def __post_init__(self):
         assert len(self.waiting_queue_tokens) == len(
@@ -235,11 +236,11 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
                                  batch_ID: int) -> None:
         msg = FreqModMsg(
             now = time.time(),
-            running_queue_tokens = 0,
+            running_queue_tokens = [],
             running_queue_pre_computed_tokens = [],
             running_queue_wait_time = [],
             kv_cache_usage = 0.0,
-            waiting_queue_tokens = 0,
+            waiting_queue_tokens = [],
             waiting_queue_pre_computed_tokens = [],
             waiting_queue_wait_time = [],
             fromWho="request_end",
@@ -315,7 +316,7 @@ class _MPNvmlFreqModulatorServer:
 
         self.last_applied_freq: int = 2000
 
-        self.underprediction_lock = threading.Lock()
+        self.underprediction_lock = None
         self.last_finished_ID: int = -1
 
     def _load_models(self):
@@ -332,6 +333,7 @@ class _MPNvmlFreqModulatorServer:
             self.power_model_decode = ort.InferenceSession(power_dec_path)             
 
     def run(self):
+        self.underprediction_lock = threading.Lock()
         # Load models here rather than in __init__() so that we don't pass the
         # loaded models across processes
         self._load_models()
@@ -376,8 +378,8 @@ class _MPNvmlFreqModulatorServer:
                 nvml_set_freq(selected_freq)
                 self.last_applied_freq = selected_freq
             freq_mod_end = time.perf_counter()
-            if msg.fromWho == "scheduler" and self.engine_role == 'prefill':
-                timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.01),
+            if self.engine_role == 'prefill':
+                timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
                                                            self.check_underprediction, 
                                                            args=(msg.batch_ID,))
                 timer_to_check_underpred.daemon = True
@@ -415,8 +417,9 @@ class _MPNvmlFreqModulatorServer:
                 # The running queue has changed since we set the timer.
                 # Skip this check.
                 return
-            logger.info('Underprediction detected, applied max freq')
-            nvml_set_freq(max(self.freq_choices))
+            if self.last_applied_freq is not max(self.freq_choices):
+                nvml_set_freq(max(self.freq_choices))
+                logger.info('Underprediction detected, applied max freq')
 
 
     def _get_next_freq(self, freq_mod_msg: FreqModMsg,
