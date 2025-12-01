@@ -1146,8 +1146,7 @@ class Scheduler(SchedulerInterface):
         # also send update to freq modulator on new request arrival (only for prefill)
         if self.freq_modulator and \
                 self.vllm_config.kv_transfer_config and \
-                self.vllm_config.kv_transfer_config.is_kv_producer and \
-                len(self.running) > 0:
+                self.vllm_config.kv_transfer_config.is_kv_producer:
             self.last_add_req_stat = now
             waiting_computed_tokens_list = [req.num_computed_tokens for req in self.waiting]
             waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
