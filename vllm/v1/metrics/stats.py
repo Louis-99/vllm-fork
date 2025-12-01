@@ -25,6 +25,21 @@ class PrefixCacheStats:
     # The number of hits in these requests.
     hits: int = 0
 
+@dataclass
+class NVMLFreqModulatorStats:
+    """Stats associated with the NVML Frequency Modulator."""
+    now: float = 0.0
+    num_running_reqs: int = 0
+    num_waiting_reqs: int = 0
+    running_computed_tokens_list: list[int] = field(default_factory=list)
+    waiting_computed_tokens_list: list[int] = field(default_factory=list)
+    running_reqs_num_tokens: list[int] = field(default_factory=list)
+    waiting_reqs_num_tokens: list[int] = field(default_factory=list)
+    running_reqs_num_time: list[float] = field(default_factory=list)
+    waiting_reqs_num_time: list[float] = field(default_factory=list)
+    kv_cache_usage: float = 0.0
+    batch_ID: int = 0
+    
 
 @dataclass
 class SchedulerStats:

@@ -15,7 +15,7 @@ import onnxruntime as ort
 from scipy.interpolate import interpn
 
 from vllm.config import ModelConfig, VllmConfig
-from vllm.v1.metrics.stats import IterationStats, SchedulerStats
+from vllm.v1.metrics.stats import IterationStats, NVMLFreqModulatorStats
 from vllm.logger import init_logger
 from vllm.platforms.nvml_utils import CSVWriter, get_gpu_name, get_preselected_freq, nvml_set_freq
 from vllm.utils import get_mp_context
@@ -75,12 +75,16 @@ class NvmlFreqModulatorInterface(ABC):
 
     @abstractmethod
     def step(self,
-             scheduler_stats: Optional[SchedulerStats],) -> None:
+             scheduler_stats: Optional[NVMLFreqModulatorStats],) -> None:
         ...
     
     @abstractmethod
     def step_update_wait_q(self,
-                             scheduler_stats: Optional[SchedulerStats],) -> None:
+                             scheduler_stats: Optional[NVMLFreqModulatorStats],) -> None:
+        ...
+
+    def step_update_batch_ID_end(self,
+                                 batch_ID: int) -> None:
         ...
 
     @abstractmethod
@@ -203,26 +207,44 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
         self.server_process.start()
         logger.info('_MPNvmlFreqModulatorServer process started.')
 
-        self.stat_buffer = SchedulerStats()
+        self.stat_buffer = NVMLFreqModulatorStats()
         self.stat_buffer_lock = threading.Lock()
 
     def step(self,
-             scheduler_stats: SchedulerStats) -> None:
-        msg = self.build_msg(scheduler_stats, fromScheduler=True)
-        msg_encoded = msgspec.msgpack.encode(msg)
-        self.q.put(msg_encoded)
+             scheduler_stats: NVMLFreqModulatorStats) -> None:
         with self.stat_buffer_lock:
             self.stat_buffer = scheduler_stats
+            msg = self.build_msg(scheduler_stats, fromWho="scheduler")
+            msg_encoded = msgspec.msgpack.encode(msg)
+            self.q.put(msg_encoded)
 
     def step_update_wait_q(self,
-             scheduler_stats: SchedulerStats) -> None:
+             scheduler_stats: NVMLFreqModulatorStats) -> None:
         with self.stat_buffer_lock:
             time_elapsed = scheduler_stats.now - self.stat_buffer.now
             scheduler_stats.num_running_reqs = self.stat_buffer.num_running_reqs
             scheduler_stats.running_computed_tokens_list = self.stat_buffer.running_computed_tokens_list
             scheduler_stats.running_reqs_num_tokens = self.stat_buffer.running_reqs_num_tokens
             scheduler_stats.running_reqs_num_time = [x + time_elapsed for x in self.stat_buffer.running_reqs_num_time]
-        msg = self.build_msg(scheduler_stats, fromScheduler=False)
+            scheduler_stats.batch_ID = self.stat_buffer.batch_ID
+        msg = self.build_msg(scheduler_stats, fromWho="request_update")
+        msg_encoded = msgspec.msgpack.encode(msg)
+        self.q.put(msg_encoded)
+
+    def step_update_batch_ID_end(self,
+                                 batch_ID: int) -> None:
+        msg = FreqModMsg(
+            now = time.time(),
+            running_queue_tokens = 0,
+            running_queue_pre_computed_tokens = [],
+            running_queue_wait_time = [],
+            kv_cache_usage = 0.0,
+            waiting_queue_tokens = 0,
+            waiting_queue_pre_computed_tokens = [],
+            waiting_queue_wait_time = [],
+            fromWho="request_end",
+            batch_ID=batch_ID,
+        )
         msg_encoded = msgspec.msgpack.encode(msg)
         self.q.put(msg_encoded)
 
@@ -232,7 +254,7 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
         logger.info('_MPNvmlFreqModulatorServer process terminated.')
 
     @staticmethod
-    def build_msg(scheduler_stats: SchedulerStats, fromScheduler: bool) -> FreqModMsg:
+    def build_msg(scheduler_stats: NVMLFreqModulatorStats, fromWho: str) -> FreqModMsg:
         return FreqModMsg(
             now = scheduler_stats.now,
             running_queue_tokens = scheduler_stats.running_reqs_num_tokens,
@@ -242,7 +264,8 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
             waiting_queue_tokens = scheduler_stats.waiting_reqs_num_tokens,
             waiting_queue_pre_computed_tokens = scheduler_stats.waiting_computed_tokens_list,
             waiting_queue_wait_time = scheduler_stats.waiting_reqs_num_time,
-            fromScheduler=fromScheduler
+            fromWho=fromWho,
+            batch_ID=scheduler_stats.batch_ID,
         )
 
 class _MPNvmlFreqModulatorServer:
@@ -293,9 +316,7 @@ class _MPNvmlFreqModulatorServer:
         self.last_applied_freq: int = 2000
 
         self.underprediction_lock = threading.Lock()
-        self.last_run_q_len: int = 0
-        self.last_run_q_mean_tokens: float = 0.0
-        self.last_run_q_std_tokens: float = 0.0
+        self.last_finished_ID: int = -1
 
     def _load_models(self):
         dec = None
@@ -329,11 +350,17 @@ class _MPNvmlFreqModulatorServer:
                 break
             if step_id % self.mod_interval > 0:
                 continue
+            
             mpc_start = time.perf_counter()
             msg: FreqModMsg = msgspec.msgpack.decode(msg_encoded,
                                                      type=FreqModMsg)
             # logger.info('freq_mod_msg: %s', msg)
             logger.debug('freq_mod_msg: %s', msg)
+            if msg.fromWho == "request_end":
+                with self.underprediction_lock:
+                    if msg.batch_ID > self.last_finished_ID:
+                        self.last_finished_ID = msg.batch_ID
+                continue
 
             future_states, prefill_cycles = self.get_future_states(
                 msg, self.future_windows)
@@ -349,12 +376,10 @@ class _MPNvmlFreqModulatorServer:
                 nvml_set_freq(selected_freq)
                 self.last_applied_freq = selected_freq
             freq_mod_end = time.perf_counter()
-            if msg.fromScheduler and self.engine_role == 'prefill':
+            if msg.fromWho == "scheduler" and self.engine_role == 'prefill':
                 timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.01),
                                                            self.check_underprediction, 
-                                                           args=(future_states[0].num_prefills,
-                                                                 future_states[0].prefill_len_mean, 
-                                                                 future_states[0].prefill_len_std,))
+                                                           args=(msg.batch_ID,))
                 timer_to_check_underpred.daemon = True
                 timer_to_check_underpred.start()
 
@@ -380,17 +405,13 @@ class _MPNvmlFreqModulatorServer:
 
         csv_writer.close()
 
-    def check_underprediction(self, running_q_len: int,
-                            running_q_mean_tokens: float,
-                            running_q_std_tokens: float):
+    def check_underprediction(self, ID: int,):
         """
         Check if the latency model underpredicted the actual latency.
         If yes, update the last known state for future corrections.
         """
         with self.underprediction_lock:
-            if (running_q_len != self.last_run_q_len or
-                running_q_mean_tokens != self.last_run_q_mean_tokens or
-                running_q_std_tokens != self.last_run_q_std_tokens):
+            if (self.last_finished_ID >= ID):
                 # The running queue has changed since we set the timer.
                 # Skip this check.
                 return
