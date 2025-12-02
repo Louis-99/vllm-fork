@@ -376,7 +376,8 @@ class _MPNvmlFreqModulatorServer:
             freq_mod_start = time.perf_counter()
             if self.last_applied_freq != selected_freq:
                 nvml_set_freq(selected_freq)
-                self.last_applied_freq = selected_freq
+                with self.underprediction_lock:
+                    self.last_applied_freq = selected_freq
             freq_mod_end = time.perf_counter()
             if self.engine_role == 'prefill':
                 timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
@@ -419,6 +420,7 @@ class _MPNvmlFreqModulatorServer:
                 return
             if self.last_applied_freq is not max(self.freq_choices):
                 nvml_set_freq(max(self.freq_choices))
+                self.last_applied_freq = max(self.freq_choices)
                 logger.info('Underprediction detected, applied max freq')
 
 
