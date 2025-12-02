@@ -305,6 +305,42 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False, False
         
+        # Apply staged failures
+        if getattr(self, "staged_executor_failed", None) and \
+                self.staged_executor_failed.is_set():
+            raise RuntimeError("Executor failed.")
+
+        # Drain staged utilities (process on core loop thread)
+        staged_utils = getattr(self, "staged_utilities", None)
+        if staged_utils is not None:
+            while not staged_utils.empty():
+                client_idx, method_name, (call_id, args) = staged_utils.get_nowait()
+                output = UtilityOutput(call_id)
+                try:
+                    method = getattr(self, method_name)
+                    result = method(*self._convert_msgspec_args(method, args))
+                    output.result = UtilityResult(result)
+                except BaseException as e:
+                    logger.exception("Invocation of %s method failed", method_name)
+                    output.failure_message = (f"Call to {method_name} method"
+                                            f" failed: {str(e)}")
+                self.output_queue.put_nowait(
+                    (client_idx, EngineCoreOutputs(utility_output=output)))
+
+        # Drain staged aborts
+        staged_aborts = getattr(self, "staged_aborts", None)
+        if staged_aborts is not None:
+            while not staged_aborts.empty():
+                abort_ids = staged_aborts.get_nowait()
+                self.abort_requests(abort_ids)
+
+        # Drain staged adds
+        staged_adds = getattr(self, "staged_adds", None)
+        if staged_adds is not None:
+            while not staged_adds.empty():
+                req, wave = staged_adds.get_nowait()
+                self.add_request(req, wave)
+        
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
@@ -498,8 +534,12 @@ class EngineCoreProc(EngineCore):
         engine_index: int = 0,
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
-        self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs],
-                                              bytes]]()
+        self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs], bytes]]()
+        self.staged_adds: queue.Queue[tuple[Request, int]] = queue.Queue()
+        self.staged_aborts: queue.Queue[list[str]] = queue.Queue()
+        self.staged_utilities: queue.Queue[tuple[int, str, tuple]] = queue.Queue()
+        self.staged_executor_failed: threading.Event = threading.Event()
+        
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b''))
 
@@ -559,10 +599,37 @@ class EngineCoreProc(EngineCore):
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
 
+        self.input_drainer_thread = threading.Thread(
+            target=self._drain_input_queue_loop,
+            daemon=True)
+        self.input_drainer_thread.start()
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         gc.collect()
         gc.freeze()
+
+    def _drain_input_queue_loop(self):
+        while True:
+            req_type, payload = self.input_queue.get()
+            if req_type == EngineCoreRequestType.ADD:
+                req, request_wave = payload
+                # Stage only; scheduler mutation happens in core loop
+                self.staged_adds.put_nowait((req, request_wave))
+            elif req_type == EngineCoreRequestType.ABORT:
+                # Stage aborts to apply in core loop
+                self.staged_aborts.put_nowait(payload)
+            elif req_type == EngineCoreRequestType.UTILITY:
+                client_idx, call_id, method_name, args = payload
+                # Stage utilities to process in core loop
+                self.staged_utilities.put_nowait((client_idx, method_name,
+                                                (call_id, args)))
+            elif req_type == EngineCoreRequestType.EXECUTOR_FAILED:
+                # Signal failure to core loop
+                self.staged_executor_failed.set()
+            else:
+                logger.error("Unrecognized input request type encountered: %s",
+                            req_type)
 
     @contextmanager
     def _perform_handshakes(
@@ -760,24 +827,22 @@ class EngineCoreProc(EngineCore):
             self._process_engine_step()
 
     def _process_input_queue(self):
-        """Exits when an engine step needs to be performed."""
-
-        waited = False
-        while not self.engines_running and not self.scheduler.has_requests() \
-                and not self.batch_queue:
-            if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
-                logger.debug("EngineCore waiting for work.")
-                waited = True
-            req = self.input_queue.get()
-            self._handle_client_request(*req)
-
-        if waited:
-            logger.debug("EngineCore loop active.")
-
-        # Handle any more client requests.
+        # Non-blocking: any remaining items get staged; core loop won’t block here.
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
-            self._handle_client_request(*req)
+            # Reuse drainer’s staging logic to avoid scheduler mutations here.
+            req_type, payload = req
+            if req_type == EngineCoreRequestType.ADD:
+                req_obj, request_wave = payload
+                self.staged_adds.put_nowait((req_obj, request_wave))
+            elif req_type == EngineCoreRequestType.ABORT:
+                self.staged_aborts.put_nowait(payload)
+            elif req_type == EngineCoreRequestType.UTILITY:
+                client_idx, call_id, method_name, args = payload
+                self.staged_utilities.put_nowait((client_idx, method_name,
+                                                (call_id, args)))
+            elif req_type == EngineCoreRequestType.EXECUTOR_FAILED:
+                self.staged_executor_failed.set()
 
 
     def _process_engine_step(self) -> bool:
@@ -840,7 +905,8 @@ class EngineCoreProc(EngineCore):
 
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
-            self.add_request(req, request_wave)
+            # self.add_request(req, request_wave)
+            self.staged_adds.put_nowait((req, request_wave))
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
