@@ -305,42 +305,6 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False, False
         
-        # Apply staged failures
-        if getattr(self, "staged_executor_failed", None) and \
-                self.staged_executor_failed.is_set():
-            raise RuntimeError("Executor failed.")
-
-        # Drain staged utilities (process on core loop thread)
-        staged_utils = getattr(self, "staged_utilities", None)
-        if staged_utils is not None:
-            while not staged_utils.empty():
-                client_idx, method_name, (call_id, args) = staged_utils.get_nowait()
-                output = UtilityOutput(call_id)
-                try:
-                    method = getattr(self, method_name)
-                    result = method(*self._convert_msgspec_args(method, args))
-                    output.result = UtilityResult(result)
-                except BaseException as e:
-                    logger.exception("Invocation of %s method failed", method_name)
-                    output.failure_message = (f"Call to {method_name} method"
-                                            f" failed: {str(e)}")
-                self.output_queue.put_nowait(
-                    (client_idx, EngineCoreOutputs(utility_output=output)))
-
-        # Drain staged aborts
-        staged_aborts = getattr(self, "staged_aborts", None)
-        if staged_aborts is not None:
-            while not staged_aborts.empty():
-                abort_ids = staged_aborts.get_nowait()
-                self.abort_requests(abort_ids)
-
-        # Drain staged adds
-        staged_adds = getattr(self, "staged_adds", None)
-        if staged_adds is not None:
-            while not staged_adds.empty():
-                req, wave = staged_adds.get_nowait()
-                self.add_request(req, wave)
-        
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
@@ -599,10 +563,10 @@ class EngineCoreProc(EngineCore):
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
 
-        self.input_drainer_thread = threading.Thread(
-            target=self._drain_input_queue_loop,
-            daemon=True)
-        self.input_drainer_thread.start()
+            self.input_drainer_thread = threading.Thread(
+                target=self._drain_input_queue_loop,
+                daemon=True)
+            self.input_drainer_thread.start()
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -843,6 +807,42 @@ class EngineCoreProc(EngineCore):
                                                 (call_id, args)))
             elif req_type == EngineCoreRequestType.EXECUTOR_FAILED:
                 self.staged_executor_failed.set()
+
+        # Apply staged failures
+        if getattr(self, "staged_executor_failed", None) and \
+                self.staged_executor_failed.is_set():
+            raise RuntimeError("Executor failed.")
+
+        # Drain staged utilities (process on core loop thread)
+        staged_utils = getattr(self, "staged_utilities", None)
+        if staged_utils is not None:
+            while not staged_utils.empty():
+                client_idx, method_name, (call_id, args) = staged_utils.get_nowait()
+                output = UtilityOutput(call_id)
+                try:
+                    method = getattr(self, method_name)
+                    result = method(*self._convert_msgspec_args(method, args))
+                    output.result = UtilityResult(result)
+                except BaseException as e:
+                    logger.exception("Invocation of %s method failed", method_name)
+                    output.failure_message = (f"Call to {method_name} method"
+                                            f" failed: {str(e)}")
+                self.output_queue.put_nowait(
+                    (client_idx, EngineCoreOutputs(utility_output=output)))
+
+        # Drain staged aborts
+        staged_aborts = getattr(self, "staged_aborts", None)
+        if staged_aborts is not None:
+            while not staged_aborts.empty():
+                abort_ids = staged_aborts.get_nowait()
+                self.abort_requests(abort_ids)
+
+        # Drain staged adds
+        staged_adds = getattr(self, "staged_adds", None)
+        if staged_adds is not None:
+            while not staged_adds.empty():
+                req, wave = staged_adds.get_nowait()
+                self.add_request(req, wave)
 
 
     def _process_engine_step(self) -> bool:
