@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import queue
 import threading
 import time
 from collections import defaultdict
@@ -1136,21 +1137,21 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
 
-    def add_request(self, request: Request) -> None:
-        self.waiting.add_request(request)
-        self.requests[request.request_id] = request
-        if self.log_stats:
-            request.record_event(EngineCoreEventType.QUEUED)
-
-        now = time.time()
-        # also send update to freq modulator on new request arrival (only for prefill)
+    def make_nvml_stats(self, wait_q: list[Request]) -> None:
         if self.freq_modulator and \
-                self.vllm_config.kv_transfer_config and \
-                self.vllm_config.kv_transfer_config.is_kv_producer:
-            self.last_add_req_stat = now
+            self.vllm_config.kv_transfer_config and \
+            self.vllm_config.kv_transfer_config.is_kv_producer:
+
+            now = time.time()
+            num_waiting_reqs = len(self.waiting)
             waiting_computed_tokens_list = [req.num_computed_tokens for req in self.waiting]
             waiting_reqs_num_tokens = [req.num_tokens for req in self.waiting]
             waiting_reqs_num_time = [now - req.arrival_time for req in self.waiting]
+
+            num_waiting_reqs += len(wait_q)
+            waiting_computed_tokens_list += [req.num_computed_tokens for req in wait_q]
+            waiting_reqs_num_tokens += [req.num_tokens for req in wait_q]
+            waiting_reqs_num_time += [now - req.arrival_time for req in wait_q]
 
             stats = NVMLFreqModulatorStats(
                 now=now,
@@ -1167,6 +1168,12 @@ class Scheduler(SchedulerInterface):
             )
             self.freq_modulator.step_update_wait_q(
                 scheduler_stats=stats)
+
+    def add_request(self, request: Request) -> None:
+        self.waiting.add_request(request)
+        self.requests[request.request_id] = request
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
         self,

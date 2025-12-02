@@ -148,6 +148,13 @@ class SchedulerInterface(ABC):
         The SchedulerStats object is created for every scheduling step.
         """
         raise NotImplementedError
+    
+    @abstractmethod
+    def make_nvml_stats(self, wait_q: list[Request]) -> None:
+        """Make a NVMLstats object for DVFS, 
+        and send wait Q update to DVFS process.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def shutdown(self) -> None:

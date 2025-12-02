@@ -47,7 +47,7 @@ from vllm.v1.engine.utils import (EngineHandshakeMetadata, EngineZmqAddresses,
                                   get_device_indices)
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.metrics.stats import NVMLFreqModulatorStats, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -594,6 +594,10 @@ class EngineCoreProc(EngineCore):
             else:
                 logger.error("Unrecognized input request type encountered: %s",
                             req_type)
+                
+            wait_q = list(self.staged_adds.queue)
+            wait_q = [req for req, _ in wait_q]
+            self.scheduler.make_nvml_stats(wait_q)
 
     @contextmanager
     def _perform_handshakes(
