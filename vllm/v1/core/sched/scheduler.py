@@ -912,7 +912,9 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
 
-        if self.freq_modulator:
+        if self.freq_modulator and \
+            self.vllm_config.kv_transfer_config and \
+            self.vllm_config.kv_transfer_config.is_kv_producer:
             self.freq_modulator.step_update_batch_ID_end(
                 batch_ID=scheduler_output.batch_ID,
             )

@@ -217,7 +217,6 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
             self.stat_buffer = scheduler_stats
             msg = self.build_msg(scheduler_stats, fromWho="scheduler")
             msg_encoded = msgspec.msgpack.encode(msg)
-            logger.info('FreqModulator step msg: %s', msg)
             self.q.put(msg_encoded)
 
     def step_update_wait_q(self,
@@ -233,7 +232,6 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
             scheduler_stats.batch_ID = self.stat_buffer.batch_ID
         msg = self.build_msg(scheduler_stats, fromWho="request_update")
         msg_encoded = msgspec.msgpack.encode(msg)
-        logger.info('FreqModulator step_update_wait_q msg: %s', msg)
         self.q.put(msg_encoded)
 
     def step_update_batch_ID_end(self,
