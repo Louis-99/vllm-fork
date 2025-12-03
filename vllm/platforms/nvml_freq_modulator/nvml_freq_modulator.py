@@ -217,10 +217,13 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
             self.stat_buffer = scheduler_stats
             msg = self.build_msg(scheduler_stats, fromWho="scheduler")
             msg_encoded = msgspec.msgpack.encode(msg)
+            logger.info('FreqModulator step msg: %s', msg)
             self.q.put(msg_encoded)
 
     def step_update_wait_q(self,
              scheduler_stats: NVMLFreqModulatorStats) -> None:
+        if self.stat_buffer is None:
+            return
         with self.stat_buffer_lock:
             time_elapsed = scheduler_stats.now - self.stat_buffer.now
             scheduler_stats.num_running_reqs = self.stat_buffer.num_running_reqs
@@ -230,6 +233,7 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
             scheduler_stats.batch_ID = self.stat_buffer.batch_ID
         msg = self.build_msg(scheduler_stats, fromWho="request_update")
         msg_encoded = msgspec.msgpack.encode(msg)
+        logger.info('FreqModulator step_update_wait_q msg: %s', msg)
         self.q.put(msg_encoded)
 
     def step_update_batch_ID_end(self,

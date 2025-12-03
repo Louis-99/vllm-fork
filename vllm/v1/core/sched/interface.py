@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from vllm.v1.request import Request, RequestStatus
 from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
@@ -10,7 +11,6 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.metrics.stats import SchedulerStats
     from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-    from vllm.v1.request import Request, RequestStatus
 
 
 class SchedulerInterface(ABC):

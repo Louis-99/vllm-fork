@@ -1153,6 +1153,9 @@ class Scheduler(SchedulerInterface):
             waiting_reqs_num_tokens += [req.num_tokens for req in wait_q]
             waiting_reqs_num_time += [now - req.arrival_time for req in wait_q]
 
+            if num_waiting_reqs == 0:
+                return
+
             stats = NVMLFreqModulatorStats(
                 now=now,
                 num_running_reqs=None,
