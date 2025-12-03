@@ -4,7 +4,7 @@ import csv
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -119,10 +119,10 @@ def nvml_set_freq(freq):
     def set_freq(handle):
         pynvml.nvmlDeviceSetGpuLockedClocks(handle, freq, freq)
 
-    with ThreadPoolExecutor(max_workers=len(handles)) as executor:
+    with ProcessPoolExecutor(max_workers=len(handles)) as executor:
         futures = [executor.submit(set_freq, handle) for handle in handles]
         for future in as_completed(futures):
-            future.result()  # Will raise if any thread fails
+            future.result()  # Will raise if any process fails
 
     logger.info('Set GPU freq to %d MHz for all devices.', freq)
 
