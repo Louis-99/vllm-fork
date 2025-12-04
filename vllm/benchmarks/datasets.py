@@ -60,6 +60,8 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
+import os
+
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
@@ -276,6 +278,15 @@ def is_valid_sequence(
     and `sample_sharegpt_requests` functions in benchmark_serving.py, as well as
     from `sample_requests` in benchmark_throughput.py.
     """
+
+    if int(os.getenv('MANUAL_INPUT_OUTPUT_LEN', 0)) > 0:
+        min_input_len = int(os.getenv('INPUT_LEN_MIN', 2))
+        max_input_len = int(os.getenv('INPUT_LEN_MAX', 1e8))
+        min_output_len = int(os.getenv('OUTPUT_LEN_MIN', 2))
+        max_output_len = int(os.getenv('OUTPUT_LEN_MAX', 1e8))
+        return min_input_len <= prompt_len <= max_input_len \
+            and min_output_len <= output_len <= max_output_len
+    
     # Check for invalid conditions
     prompt_too_short = prompt_len < min_len
     output_too_short = (not skip_min_output_len_check) and (output_len
