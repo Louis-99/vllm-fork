@@ -321,7 +321,6 @@ class _MPNvmlFreqModulatorServer:
         self.latency_model_decode: ort.InferenceSession
 
         self.last_applied_freq: int = 2000
-        self.last_applied_freq_time: float = 0.0
 
         self.underprediction_lock = None
         self.last_finished_ID: int = -1
@@ -387,10 +386,9 @@ class _MPNvmlFreqModulatorServer:
 
             freq_mod_start = time.perf_counter()
             with self.underprediction_lock:
-                if self.last_applied_freq != selected_freq and (time.perf_counter() - self.last_applied_freq_time > 0.05):
+                if self.last_applied_freq != selected_freq:
                     self.set_frequency_manager(selected_freq)
                     self.last_applied_freq = selected_freq
-                    self.last_applied_freq_time = time.perf_counter()
 
             freq_mod_end = time.perf_counter()
             if self.engine_role == 'prefill':
@@ -430,7 +428,6 @@ class _MPNvmlFreqModulatorServer:
             if self.last_applied_freq is not max(self.freq_choices):
                 self.set_frequency_manager(max(self.freq_choices))
                 self.last_applied_freq = max(self.freq_choices)
-                self.last_applied_freq_time = time.perf_counter()
                 logger.info('Underprediction detected, applied max freq')
 
     def _get_next_freq(self, freq_mod_msg: FreqModMsg,
@@ -825,15 +822,23 @@ class _MPNvmlFreqModulatorServer:
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_index)
             logger.info(f"Frequency daemon started for GPU index {physical_gpu_index}")
-
             while True:
                 # This blocks until a frequency is sent from the main process
                 freq = queue.get()
-
                 # Poison pill to stop the process
-                if freq is None:
+                if freq == -1:
                     break
 
+                if not queue.empty():
+                    qsize = queue.qsize()
+                    for _skipped in range(qsize):
+                        freq = queue.get()
+                        if freq == -1:
+                            break
+
+                if freq == -1:
+                    break
+                    
                 try:
                     # Apply the frequency
                     pynvml.nvmlDeviceSetGpuLockedClocks(handle, freq, freq)
@@ -899,7 +904,7 @@ class _MPNvmlFreqModulatorServer:
         logger.info("Stopping frequency daemons...")
         
         for q in self._freq_daemon_queues:
-            q.put(None)  # Poison pill
+            q.put(-1)  # Poison pill
 
         for p in self._freq_daemon_procs:
             p.join()
