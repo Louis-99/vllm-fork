@@ -321,6 +321,7 @@ class _MPNvmlFreqModulatorServer:
         self.latency_model_decode: ort.InferenceSession
 
         self.last_applied_freq: int = 2000
+        self.last_applied_freq_time: float = 0.0
 
         self.underprediction_lock = None
         self.last_finished_ID: int = -1
@@ -385,10 +386,12 @@ class _MPNvmlFreqModulatorServer:
                 selected_freq = max(self.freq_choices)
 
             freq_mod_start = time.perf_counter()
-            if self.last_applied_freq != selected_freq:
-                self.set_frequency_manager(selected_freq)
-                with self.underprediction_lock:
+            with self.underprediction_lock:
+                if self.last_applied_freq != selected_freq and (time.perf_counter() - self.last_applied_freq_time > 0.05):
+                    self.set_frequency_manager(selected_freq)
                     self.last_applied_freq = selected_freq
+                    self.last_applied_freq_time = time.perf_counter()
+
             freq_mod_end = time.perf_counter()
             if self.engine_role == 'prefill':
                 timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
@@ -397,18 +400,13 @@ class _MPNvmlFreqModulatorServer:
                 timer_to_check_underpred.daemon = True
                 timer_to_check_underpred.start()
 
-                with self.underprediction_lock:
-                    self.last_run_q_len = future_states[0].num_prefills
-                    self.last_run_q_mean_tokens = future_states[0].prefill_len_mean
-                    self.last_run_q_std_tokens = future_states[0].prefill_len_std
-
             csv_writer.add_row([
                 msg.now,
                 mpc_start,
                 freq_mod_start,
                 freq_mod_end,
-                selected_freq,
-                pred_batch_lat,
+                self.last_applied_freq,
+                pred_batch_lat if self.last_applied_freq == selected_freq else pred_batch_lat+10.0,
                 len(msg.running_queue_wait_time),
                 len(msg.waiting_queue_wait_time),
                 max(msg.running_queue_wait_time) if len(
@@ -432,6 +430,7 @@ class _MPNvmlFreqModulatorServer:
             if self.last_applied_freq is not max(self.freq_choices):
                 self.set_frequency_manager(max(self.freq_choices))
                 self.last_applied_freq = max(self.freq_choices)
+                self.last_applied_freq_time = time.perf_counter()
                 logger.info('Underprediction detected, applied max freq')
 
     def _get_next_freq(self, freq_mod_msg: FreqModMsg,
@@ -889,9 +888,6 @@ class _MPNvmlFreqModulatorServer:
             logger.warning("Frequency manager not started. Call start_frequency_manager() first.")
             return
 
-        # specific check: if freq is 0 or -1, we might want to reset, 
-        # but assuming input is a valid clock speed. 
-        # Passing the frequency to all workers.
         for q in self._freq_daemon_queues:
             q.put(freq)
 
