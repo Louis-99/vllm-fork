@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import copy
+import multiprocessing
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -13,11 +16,12 @@ import msgspec
 import numpy as np
 import onnxruntime as ort
 from scipy.interpolate import interpn
+import pynvml
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.v1.metrics.stats import IterationStats, NVMLFreqModulatorStats
 from vllm.logger import init_logger
-from vllm.platforms.nvml_utils import CSVWriter, get_gpu_name, get_preselected_freq, nvml_set_freq
+from vllm.platforms.nvml_utils import CSVWriter, get_gpu_name, get_preselected_freq
 from vllm.utils import get_mp_context
 
 logger = init_logger(__name__)
@@ -321,6 +325,9 @@ class _MPNvmlFreqModulatorServer:
         self.underprediction_lock = None
         self.last_finished_ID: int = -1
 
+        self._freq_daemon_queues = []
+        self._freq_daemon_procs = []
+
     def _load_models(self):
         dec = None
         pre = None
@@ -335,6 +342,7 @@ class _MPNvmlFreqModulatorServer:
             self.power_model_decode = ort.InferenceSession(power_dec_path)             
 
     def run(self):
+        self.start_frequency_manager()
         self.underprediction_lock = threading.Lock()
         # Load models here rather than in __init__() so that we don't pass the
         # loaded models across processes
@@ -351,6 +359,7 @@ class _MPNvmlFreqModulatorServer:
         for step_id in count():
             msg_encoded = self.q.get()
             if msg_encoded is None:
+                self.stop_frequency_manager()
                 break
             if step_id % self.mod_interval > 0:
                 continue
@@ -377,7 +386,7 @@ class _MPNvmlFreqModulatorServer:
 
             freq_mod_start = time.perf_counter()
             if self.last_applied_freq != selected_freq:
-                nvml_set_freq(selected_freq)
+                self.set_frequency_manager(selected_freq)
                 with self.underprediction_lock:
                     self.last_applied_freq = selected_freq
             freq_mod_end = time.perf_counter()
@@ -421,10 +430,9 @@ class _MPNvmlFreqModulatorServer:
                 # Skip this check.
                 return
             if self.last_applied_freq is not max(self.freq_choices):
-                nvml_set_freq(max(self.freq_choices))
+                self.set_frequency_manager(max(self.freq_choices))
                 self.last_applied_freq = max(self.freq_choices)
                 logger.info('Underprediction detected, applied max freq')
-
 
     def _get_next_freq(self, freq_mod_msg: FreqModMsg,
                           future_states: list[FutureState], prefill_cycles):
@@ -803,6 +811,106 @@ class _MPNvmlFreqModulatorServer:
             # reshape back to (n_future_states, n_freq_choices)
             output_arr = out.reshape(n_future, n_freqs)
         return output_arr
+
+    def _persistent_gpu_worker(physical_gpu_index: int, queue: multiprocessing.Queue):
+        """
+        Worker process that initializes NVML for a specific GPU and waits for
+        frequency commands.
+
+        Note: `self` is intentionally omitted so this function remains an
+        unbound function object in the class dictionary; when referenced via
+        `self.__class__._persistent_gpu_worker` it will be picklable by the
+        spawn/forkserver start methods.
+        """
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_index)
+            logger.info(f"Frequency daemon started for GPU index {physical_gpu_index}")
+
+            while True:
+                # This blocks until a frequency is sent from the main process
+                freq = queue.get()
+
+                # Poison pill to stop the process
+                if freq is None:
+                    break
+
+                try:
+                    # Apply the frequency
+                    pynvml.nvmlDeviceSetGpuLockedClocks(handle, freq, freq)
+                except pynvml.NVMLError as e:
+                    logger.error(f"Daemon GPU {physical_gpu_index} failed to set freq {freq}: {e}")
+
+        except Exception as e:
+            logger.error(f"Crash in frequency daemon for GPU {physical_gpu_index}: {e}")
+        finally:
+            try:
+                pynvml.nvmlDeviceResetGpuLockedClocks(handle)
+                pynvml.nvmlShutdown()
+            except:
+                pass
+
+
+    def start_frequency_manager(self):
+        """
+        Spawns a separate process for each visible GPU. Each process waits
+        indefinitely for frequency updates.
+        """
+        if self._freq_daemon_procs:
+            logger.warning("Frequency manager already running.")
+            return
+
+        # Determine which physical GPUs we are using based on env var
+        pynvml.nvmlInit()
+        cuda_visible_devices = os.getenv('CUDA_VISIBLE_DEVICES')
+        if cuda_visible_devices:
+            gpu_indices = [int(i) for i in cuda_visible_devices.split(',')]
+        else:
+            gpu_indices = list(range(pynvml.nvmlDeviceGetCount()))
+
+        ctx = get_mp_context()
+        for physical_idx in gpu_indices:
+            q = ctx.Queue()
+            # Use the unbound function object from the class dict to avoid pickling the instance.
+            p = ctx.Process(target=self.__class__._persistent_gpu_worker, args=(physical_idx, q))
+            p.start()
+            
+            self._freq_daemon_queues.append(q)
+            self._freq_daemon_procs.append(p)
+        logger.info(f"Started {len(self._freq_daemon_procs)} GPU frequency daemon processes.")
+
+
+    def set_frequency_manager(self, freq: int):
+        """
+        Sends the new frequency to all waiting GPU processes.
+        This function returns immediately after putting the freq in the queue.
+        """
+        if not self._freq_daemon_queues:
+            logger.warning("Frequency manager not started. Call start_frequency_manager() first.")
+            return
+
+        # specific check: if freq is 0 or -1, we might want to reset, 
+        # but assuming input is a valid clock speed. 
+        # Passing the frequency to all workers.
+        for q in self._freq_daemon_queues:
+            q.put(freq)
+
+
+    def stop_frequency_manager(self):
+        """
+        Sends a stop signal (None) to all workers and joins the processes.
+        """
+        logger.info("Stopping frequency daemons...")
+        
+        for q in self._freq_daemon_queues:
+            q.put(None)  # Poison pill
+
+        for p in self._freq_daemon_procs:
+            p.join()
+
+        self._freq_daemon_queues = []
+        self._freq_daemon_procs = []
+        logger.info("Frequency daemons stopped.")
 
 if __name__ == '__main__':
     q: SimpleQueue = SimpleQueue()

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
 import csv
+import multiprocessing
 import os
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pynvml
 import torch
 
 from vllm.logger import init_logger
+from vllm.utils import get_mp_context
 
 logger = init_logger(__name__)
 
@@ -119,7 +121,7 @@ def nvml_set_freq(freq):
     def set_freq(handle):
         pynvml.nvmlDeviceSetGpuLockedClocks(handle, freq, freq)
 
-    with ProcessPoolExecutor(max_workers=len(handles)) as executor:
+    with ThreadPoolExecutor(max_workers=len(handles)) as executor:
         futures = [executor.submit(set_freq, handle) for handle in handles]
         for future in as_completed(futures):
             future.result()  # Will raise if any process fails
