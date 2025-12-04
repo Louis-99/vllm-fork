@@ -260,7 +260,7 @@ class BenchmarkDataset(ABC):
 # Utility Functions and Global Caches
 # -----------------------------------------------------------------------------
 
-
+# TODO: (Yunzhao) change this
 def is_valid_sequence(
     prompt_len: int,
     output_len: int,
