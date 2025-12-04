@@ -279,7 +279,7 @@ def is_valid_sequence(
     from `sample_requests` in benchmark_throughput.py.
     """
 
-    if int(os.getenv('MANUAL_INPUT_OUTPUT_LEN', 0)) > 0:
+    if int(os.getenv('MANUAL_INPUT_OUTPUT_LEN_RANGE', 0)) > 0:
         min_input_len = int(os.getenv('INPUT_LEN_MIN', 2))
         max_input_len = int(os.getenv('INPUT_LEN_MAX', 1e8))
         min_output_len = int(os.getenv('OUTPUT_LEN_MIN', 2))
