@@ -288,7 +288,7 @@ class _MPNvmlFreqModulatorServer:
         tbt_sla: float,
         ttft_sla: float,
         future_window: int = 4,
-        mem_util_ceiling: float = 0.9,
+        mem_util_ceiling: float = 0.8,
         engine_role: str = 'prefill',
         token_budget: int = 2048,
     ):
