@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, Optional
+import pandas as pd
 
 import aiohttp
 import numpy as np
@@ -121,6 +122,7 @@ async def get_request(
     ramp_up_strategy: Optional[Literal["linear", "exponential"]] = None,
     ramp_up_start_rps: Optional[int] = None,
     ramp_up_end_rps: Optional[int] = None,
+    arrival_trace_file: Optional[str] = None,
 ) -> AsyncGenerator[tuple[SampleRequest, float], None]:
     """
     Asynchronously generates requests at a specified rate
@@ -160,6 +162,15 @@ async def get_request(
     # Precompute delays among requests to minimize request send laggings
     request_rates = []
     delay_ts = []
+
+    if arrival_trace_file is not None:
+        trace_df = pd.read_csv(arrival_trace_file, usecols=["arrived_at"])
+        trace_df["delay_s"] = trace_df["arrived_at"].sort_values().diff().fillna(0)
+        assert len(trace_df) >= total_requests, (
+            f"The number of requests in arrival trace file "
+            f"({len(trace_df)}) is less than the total_requests "
+            f"({total_requests}).")
+
     for request_index, request in enumerate(input_requests):
         current_request_rate = _get_current_request_rate(ramp_up_strategy,
                                                          ramp_up_start_rps,
@@ -170,6 +181,8 @@ async def get_request(
         request_rates.append(current_request_rate)
         if current_request_rate == float("inf"):
             delay_ts.append(0)
+        elif arrival_trace_file is not None:
+            delay_ts.append(trace_df["delay_s"].iloc[request_index])
         else:
             theta = 1.0 / (current_request_rate * burstiness)
 
@@ -180,7 +193,7 @@ async def get_request(
     # Calculate the cumulative delay time from the first sent out requests.
     for i in range(1, len(delay_ts)):
         delay_ts[i] += delay_ts[i - 1]
-    if ramp_up_strategy is None and delay_ts[-1] != 0:
+    if ramp_up_strategy is None and delay_ts[-1] != 0 and arrival_trace_file is None:
         # When ramp_up_strategy is not set, we assume the request rate is fixed
         # and all requests should be sent in target_total_delay_s, the following
         # logic would re-scale delay time to ensure the final delay_ts
@@ -395,6 +408,7 @@ async def benchmark(
     ramp_up_start_rps: Optional[int] = None,
     ramp_up_end_rps: Optional[int] = None,
     ready_check_timeout_sec: int = 600,
+    arrival_trace_file: Optional[str] = None,
 ):
     task_type = (
         TaskType.EMBEDDING
@@ -539,7 +553,7 @@ async def benchmark(
 
     async for request, current_request_rate in get_request(
             input_requests, request_rate, burstiness, ramp_up_strategy,
-            ramp_up_start_rps, ramp_up_end_rps):
+            ramp_up_start_rps, ramp_up_end_rps, arrival_trace_file):
         if ramp_up_strategy is not None:
             current_int_rps = int(current_request_rate)
             if current_int_rps > last_int_rps:
@@ -1088,6 +1102,13 @@ def add_cli_args(parser: argparse.ArgumentParser):
         type=int,
         default=0,
     )
+    parser.add_argument(
+        "--arrival-trace-file",
+        type=str,
+        default=None,
+        help="Path to a file containing arrival trace data." \
+        "If enabled, the request arrival times will follow the trace data." \
+    )
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
     return asyncio.run(main_async(args))
@@ -1221,6 +1242,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_start_rps=args.ramp_up_start_rps,
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
+        arrival_trace_file=args.arrival_trace_file,
     )
 
     # Save config and results to json
