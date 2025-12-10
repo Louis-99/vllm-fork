@@ -39,6 +39,13 @@ def load_and_prepare(path, model_name, tp=None, numeric_cols=None):
     df['model'] = model_name
     return df
 
+def filter_inputs(df):
+    # for rows with same batch size, input_len_sum, input_len_mean, input len std, tp_degree keep only median latency
+    print("before filtering:", df.shape)
+    group_cols = ['model', 'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std', 'tp_degree', 'freq_mhz']
+    df_filtered = df.groupby(group_cols).median().reset_index()
+    print("after filtering:", df_filtered.shape)
+    return df_filtered
 
 def build_pipeline(role):
     """Build a preprocessing + estimator pipeline.
@@ -120,6 +127,48 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
         'n_train': len(X_train),
     }
     print(f"trained {target_col}: saved -> {joblib_path}  MAE={mae:.4f}  MAPE={mape:.4f}  train_rows={len(X_train)}")
+    df_results = pd.DataFrame(columns=['freq', 'b_size_range', 'mae', 'mape', 'test_rows'])
+    for unique_freq in X_test['freq_mhz'].unique():
+        idxs = X_test['freq_mhz'] == unique_freq
+        freq_mae = mean_absolute_error(y_test[idxs], y_pred[idxs])
+        freq_mape = (abs(y_test[idxs] - y_pred[idxs]) / y_test[idxs]).mean() * 100
+        if idxs.sum() > 100:
+            for unique_batchs in [(1,5), (6,20), (21,50), (51,100), (101,200), (1,200), (201,400), (401,600), (601,800), (801,1000)]:
+                idxs = (X_test['batch_size'] >= unique_batchs[0]) & (X_test['batch_size'] <= unique_batchs[1])
+                if idxs.sum() < 10:
+                    continue
+                print(f"  freq {unique_freq} MHz, batch_size {unique_batchs[0]}-{unique_batchs[1]}: test_rows={idxs.sum()}")
+                freq_mae = mean_absolute_error(y_test[idxs], y_pred[idxs])
+                freq_mape = (abs(y_test[idxs] - y_pred[idxs]) / y_test[idxs]).mean() * 100
+                df_results = pd.concat([df_results, pd.DataFrame({
+                    'freq': [unique_freq],
+                    'b_size_range': [f"{unique_batchs[0]}-{unique_batchs[1]}"],
+                    'mae': [freq_mae],
+                    'mape': [freq_mape],
+                    'test_rows': [idxs.sum()],
+                })], ignore_index=True)
+    df_results_pivot = df_results.pivot_table(
+        index='b_size_range',
+        columns='freq',
+        values='mape',
+        aggfunc='mean'
+    )
+    print("\nMAPE by Batch Size Range and Frequency:")
+    print(df_results_pivot)
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(12, 6))
+    df_results_pivot.plot(kind='bar', ax=ax)
+    ax.set_xlabel('Batch Size Range')
+    ax.set_ylabel('MAPE (%)')
+    ax.set_title(f'MAPE by Batch Size Range and Frequency - {target_col}')
+    ax.legend(title='Frequency (MHz)')
+    plt.tight_layout()
+    chart_path = os.path.join(model_dir, f"{target_col}_mape_chart.png")
+    plt.savefig(chart_path, dpi=100)
+    plt.close()
+    print(f"Chart saved to {chart_path}")
+
+    
 
     # Save detailed predictions file
     results_df = X_test.copy()
@@ -253,6 +302,7 @@ def main():
         print(f"Decode samples {len(df_d42.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D2}")
         print(f"Decode samples {len(df_d43.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D3}")
         df_decode = pd.concat([df_d2, df_d21, df_d4, df_d41, df_d42, df_d43], ignore_index=True)
+        df_decode = filter_inputs(df_decode)
         df_decode.to_csv(os.path.join(MODEL_DIR, 'decode_cleaned.csv'), index=False)
         stats_decode = train_and_save(df_decode, DECODE_FEATURE_COLS, DECODE_TARGET, DECODE_OUT, MODEL_DIR, convert_onnx=args.onnx, role='decode')
     else:
@@ -260,37 +310,12 @@ def main():
 
     # Load models for a quick sample inference demonstration
     print('\n=== Quick sample inference (if ONNX created or joblib available) ===')
-    # Try ONNX first if requested, otherwise joblib
-    if stats_prefill and stats_prefill.get('onnx_path'):
-        pre_model = load_onnx(stats_prefill['onnx_path'])
-    else:
-        pre_joblib = os.path.join(MODEL_DIR, PREFILL_OUT)
-        pre_model = joblib.load(pre_joblib) if os.path.exists(pre_joblib) else None
 
     if stats_decode and stats_decode.get('onnx_path'):
         dec_model = load_onnx(stats_decode['onnx_path'])
     else:
         dec_joblib = os.path.join(MODEL_DIR, DECODE_OUT)
         dec_model = joblib.load(dec_joblib) if os.path.exists(dec_joblib) else None
-
-    # sample_prefill must match PREFILL_FEATURE_COLS order and length
-    sample_prefill = [
-        'Llama-3.3-70B-Instruct',
-        10,   # total_batches
-        1200, # input_len_sum
-        300,  # input_len_mean
-        50,   # input_len_std
-        2,    # tp_degree
-        1830, # freq_mhz
-        4.0,  # rate
-        0.5,  # compute_ratio_for_window
-        8,    # max_batch_size
-        4.5,  # mean_batch_size
-        2,    # min_batch_size
-        1.2,  # std_batch_size
-        600,  # max_input_len
-        50,   # min_input_len
-    ]
 
     sample_decode = [
         'Llama-3.3-70B-Instruct',
@@ -301,15 +326,6 @@ def main():
         2,  # tp_degree
         1830,  # freq_mhz
     ]
-
-    if pre_model is not None:
-        t0 = time.time()
-        try:
-            r = predict_with_model(sample_prefill, pre_model, PREFILL_FEATURE_COLS)
-            print('Sample prefill prediction:', r)
-        except Exception as e:
-            print('prefill sample predict failed:', e)
-        print(f'prefill inference time: {time.time()-t0:.6f}s')
 
     if dec_model is not None:
         t0 = time.time()
