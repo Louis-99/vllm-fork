@@ -182,10 +182,10 @@ async def get_request(
                                                          total_requests,
                                                          request_rate)
         request_rates.append(current_request_rate)
-        if current_request_rate == float("inf"):
-            delay_ts.append(0)
-        elif arrival_trace_file is not None:
+        if arrival_trace_file is not None:
             delay_ts.append(trace_df["delay_s"].iloc[request_index])
+        elif current_request_rate == float("inf"):
+            delay_ts.append(0)
         else:
             theta = 1.0 / (current_request_rate * burstiness)
 
