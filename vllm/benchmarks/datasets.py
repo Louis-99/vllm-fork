@@ -429,12 +429,23 @@ class RandomDataset(BenchmarkDataset):
         input_len: int = DEFAULT_INPUT_LEN,
         output_len: int = DEFAULT_OUTPUT_LEN,
         batchsize: int = 1,
+        trace_file: Optional[str] = None,
         **kwargs,
     ) -> list[SampleRequest]:
+        
+        if trace_file is not None:
+            assert trace_file.endswith('.csv'), "Only CSV trace files are supported."
+            df = pd.read_csv(trace_file)
+            num_requests = len(df)
 
         input_lens, output_lens, offsets = self.get_sampling_params(
             num_requests, range_ratio, input_len, output_len, tokenizer
         )
+
+        if trace_file is not None:
+            num_special_tokens = int(tokenizer.num_special_tokens_to_add())
+            input_lens = np.maximum(0, df['num_prefill_tokens'].to_numpy() - num_special_tokens)
+            output_lens = np.maximum(0, df['num_decode_tokens'].to_numpy() - num_special_tokens)
 
         # Generate prefix once
         prefix_token_ids = self.get_prefix(tokenizer, prefix_len)
@@ -1190,6 +1201,14 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
               "Only used for embeddings benchmark."),
     )
 
+    random_group.add_argument(
+        "--random-input-output-len-trace-file",
+        type=str,
+        default=None,
+        help=("Path to a CSV file containing input/output length of the trace. "
+              "If provided, overrides the random sampling of input/output."),
+    )
+
     # random multimodal dataset options
     random_mm_group = parser.add_argument_group(
         "random multimodal dataset options extended from random dataset")
@@ -1521,6 +1540,7 @@ def get_samples(args, tokenizer) -> list[SampleRequest]:
                 request_id_prefix=args.request_id_prefix,
                 batchsize=args.random_batch_size,
                 no_oversample=args.no_oversample,
+                trace_file=args.random_input_output_len_trace_file,
             ),
             "random-mm":
             lambda: RandomMultiModalDataset(
