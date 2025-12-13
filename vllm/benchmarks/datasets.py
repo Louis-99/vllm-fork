@@ -575,17 +575,26 @@ class RandomDataset(BenchmarkDataset):
         To avoid uncontrolled change of the prompt length,
         the encoded sequence is truncated before being decoded again.
         """
-        # Build the inner sequence by sampling sequentially from the vocab
-        inner_seq = ((offset + index + np.arange(input_len)) 
-                    % vocab_size).tolist()
-        token_sequence = prefix_token_ids + inner_seq
 
-        # Decode, then re-encode and truncate to preserve token count invariants
-        prompt = tokenizer.decode(token_sequence)
-        total_input_len = prefix_len + int(input_len)
+        # try up to 4 times to get the correct token length
+        scale_factor: int = 2
+        for _ in range(4):
+            # Build the inner sequence by sampling sequentially from the vocab
+            inner_seq = ((offset + index + np.arange(input_len * scale_factor)) 
+                        % vocab_size).tolist()
+            token_sequence = prefix_token_ids + inner_seq
 
-        re_encoded_sequence = tokenizer.encode(
-            prompt, add_special_tokens=False)[:total_input_len]
+            # Decode, then re-encode and truncate to preserve token count invariants
+            prompt = tokenizer.decode(token_sequence)
+            total_input_len = prefix_len + int(input_len)
+
+            re_encoded_sequence = tokenizer.encode(
+                prompt, add_special_tokens=False)[:total_input_len]
+            
+            if len(re_encoded_sequence) == total_input_len:
+                break
+            scale_factor += int(scale_factor * total_input_len / len(re_encoded_sequence))
+
         prompt = tokenizer.decode(re_encoded_sequence)
         total_input_len = len(re_encoded_sequence)
 
