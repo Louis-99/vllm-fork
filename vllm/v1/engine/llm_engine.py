@@ -278,6 +278,7 @@ class LLMEngine:
             self.stat_logger.record(scheduler_stats=outputs.scheduler_stats,
                                     iteration_stats=iteration_stats)
 
+
         return processed_outputs.request_outputs
 
     def get_vllm_config(self):

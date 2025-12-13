@@ -152,3 +152,6 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # A counter incremented every time a new batch is formed.
+    batch_ID: Optional[int] = 0

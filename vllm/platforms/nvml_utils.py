@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
 import csv
+import multiprocessing
 import os
 import threading
 import time
@@ -12,6 +13,7 @@ import pynvml
 import torch
 
 from vllm.logger import init_logger
+from vllm.utils import get_mp_context
 
 logger = init_logger(__name__)
 
@@ -122,7 +124,7 @@ def nvml_set_freq(freq):
     with ThreadPoolExecutor(max_workers=len(handles)) as executor:
         futures = [executor.submit(set_freq, handle) for handle in handles]
         for future in as_completed(futures):
-            future.result()  # Will raise if any thread fails
+            future.result()  # Will raise if any process fails
 
     logger.info('Set GPU freq to %d MHz for all devices.', freq)
 
@@ -181,8 +183,11 @@ def get_preselected_freq(gpu: str) -> list[int]:
         'A40': [210, 375, 555, 720, 885, 1065, 1230, 1395, 1575, 1740],
         'A100-SXM4-80GB':
         [210, 345, 480, 615, 750, 870, 1005, 1140, 1275, 1410],
+        'A100-SXM4-40GB':
+        [210, 345, 480, 615, 750, 870, 1005, 1140, 1275, 1410],
         'H100-80GB-HBM3':
-        [345, 525, 705, 885, 1065, 1260, 1440, 1620, 1800, 1980],
+        # [345, 525, 705, 885, 1065, 1260, 1440, 1620, 1800, 1980],
+        [360, 570, 780, 1080, 1380, 1680, 1830],
     }[gpu]
 
 

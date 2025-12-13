@@ -90,11 +90,13 @@ def calc_perf_stats_single_instance(root_name: str,
         df_perf_metric_decode_steady['request_ids_iter_tbt_evald'] = df_perf_metric_decode_steady['request_ids_iter_tbt'].apply(eval)
         df_perf_metric_decode_steady['time_to_first_tokens_iter_evald'] = df_perf_metric_decode_steady['time_to_first_tokens_iter'].apply(eval)
         df_perf_metric_decode_steady['inter_token_latencies_iter_evald'] = df_perf_metric_decode_steady['inter_token_latencies_iter'].apply(eval)
+        df_perf_metric_decode_steady['num_prompt_tokens_reqs_evald'] = df_perf_metric_decode_steady['num_prompt_tokens_reqs'].apply(eval)
     if not df_perf_metric_prefill_steady.empty:
         df_perf_metric_prefill_steady['request_ids_iter_ttft_evald'] = df_perf_metric_prefill_steady['request_ids_iter_ttft'].apply(eval)
         df_perf_metric_prefill_steady['request_ids_iter_tbt_evald'] = df_perf_metric_prefill_steady['request_ids_iter_tbt'].apply(eval)
         df_perf_metric_prefill_steady['time_to_first_tokens_iter_evald'] = df_perf_metric_prefill_steady['time_to_first_tokens_iter'].apply(eval)
         df_perf_metric_prefill_steady['inter_token_latencies_iter_evald'] = df_perf_metric_prefill_steady['inter_token_latencies_iter'].apply(eval)
+        df_perf_metric_prefill_steady['num_prompt_tokens_reqs_evald'] = df_perf_metric_prefill_steady['num_prompt_tokens_reqs'].apply(eval)
 
     # Calculate duration using min and max from both decode and prefill dfs
     decode_min = df_perf_metric_decode_steady['now'].min() if not df_perf_metric_decode_steady.empty else None
@@ -155,11 +157,11 @@ def calc_perf_stats_single_instance(root_name: str,
     tpot_list = [sum(tbts)/len(tbts) for tbts in tbts_dict.values() if len(tbts) > 0]
 
     if 'prefill' in root_name:
-        total_prefilled = sum(df_perf_metric_prefill_steady['num_prompt_tokens'].to_list())
-        total_decoded = sum(df_perf_metric_prefill_steady['num_generation_tokens'].to_list())
+        total_prefilled = sum(df_perf_metric_prefill_steady['num_prompt_tokens_reqs_evald'].sum())    # num prompt tokens
+        total_decoded = sum(df_perf_metric_prefill_steady['num_generation_tokens'].to_list())       # one token created in prefill
     else:
-        total_prefilled = sum(df_perf_metric_decode_steady['num_prompt_tokens'].to_list())
-        total_decoded = sum(df_perf_metric_decode_steady['num_generation_tokens'].to_list())
+        total_prefilled = 0
+        total_decoded = sum(df_perf_metric_decode_steady['num_generation_tokens'].to_list())        # number of tokens generated
 
     
     running_list = []
@@ -225,7 +227,7 @@ def load_logs_prefill_decode_power_logs(expr_dir: Path) -> Tuple[
 ]:
     decode_csv_paths = None
     # Read decode CSV if it exists
-    if "prefill" not in str(expr_dir):
+    if "prefill" not in str(expr_dir.name):
         decode_csv_paths = list(expr_dir.glob('engine_*.csv'))
     
     if decode_csv_paths is not None:
@@ -237,7 +239,7 @@ def load_logs_prefill_decode_power_logs(expr_dir: Path) -> Tuple[
 
     prefill_csv_paths = None
     # Read prefill CSV if it exists
-    if "decode" not in str(expr_dir) or "prefill_and_decode" in str(expr_dir):
+    if "decode" not in str(expr_dir.name) or "prefill_and_decode" in str(expr_dir.name):
         prefill_csv_paths = list(expr_dir.glob('engine_*.csv'))
     if prefill_csv_paths is not None:
         if len(prefill_csv_paths) > 1:
@@ -260,8 +262,8 @@ def load_logs_prefill_decode_power_logs(expr_dir: Path) -> Tuple[
 
 def extract_steady_region(
     raw_logs_dict: dict,
-    start_clip_minutes: float = 0.0,
-    end_clip_minutes: float = 0.0
+    start_clip_minutes: float = 1.0,
+    end_clip_minutes: float = 1.0
 ) -> dict:
     """
     Drop the first and last clip_minutes of data from df_perf_metric_*
@@ -274,6 +276,7 @@ def extract_steady_region(
     for logs in raw_logs_dict.values():
         if isinstance(logs, tuple) and len(logs) == 3:
             decode_df, prefill_df, power_df = logs
+            print(f"Decode df shape: {decode_df.shape}, Prefill df shape: {prefill_df.shape}, Power df shape: {power_df.shape}")
             if not decode_df.empty:
                 decode_dfs.append(decode_df)
             if not prefill_df.empty:

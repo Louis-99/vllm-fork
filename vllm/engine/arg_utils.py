@@ -474,6 +474,7 @@ class EngineArgs:
     # added args
     log_dir: str = "./logs"
     log_power: bool = False
+    enable_nvml_freq_mod: bool = False
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -934,6 +935,10 @@ class EngineArgs:
                             default=False,
                             action='store_true',
                             help="Log power consumption metrics on rank 0")
+        parser.add_argument("--enable-nvml-freq-mod",
+                            default=False,
+                            action='store_true',
+                            help="Enable DVFS")
 
         return parser
 
@@ -1447,6 +1452,7 @@ class EngineArgs:
             additional_config=self.additional_config,
             log_dir=self.log_dir,
             log_power=self.log_power,
+            enable_nvml_freq_mod=self.enable_nvml_freq_mod,
         )
 
         return config

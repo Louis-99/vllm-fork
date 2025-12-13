@@ -662,13 +662,14 @@ class CSVLogger(StatLoggerBase):
                 'engine_index': engine_idx,
                 'num_running_reqs': scheduler_stats.num_running_reqs,
                 'num_waiting_reqs': scheduler_stats.num_waiting_reqs,
+                'running_computed_tokens_list': scheduler_stats.running_computed_tokens_list,
                 "KV_usage_perc": scheduler_stats.kv_cache_usage,
                 "num_generation_tokens": iteration_stats.num_generation_tokens,
                 "num_prompt_tokens_reqs": iteration_stats.num_prompt_tokens_reqs,
                 "num_preempted_reqs": iteration_stats.num_preempted_reqs,
                 'finished_requests': len(iteration_stats.finished_requests),
                 "max_num_generation_tokens_iter": (
-                    iteration_stats.max_num_generation_tokens_iter
+                    iteration_stats.num_generation_tokens_iter
                 ),
                 "request_ids_iter_ttft": iteration_stats.req_ids_ttft,
                 "request_ids_iter_tbt": iteration_stats.req_ids_tbt,
@@ -678,7 +679,9 @@ class CSVLogger(StatLoggerBase):
                 "inter_token_latencies_iter": (
                     iteration_stats.inter_token_latencies_iter
                 ),
-                "step_with_batch_queue_time_ms": iteration_stats.step_with_batch_queue_time_ms
+                "step_with_batch_queue_time_ms_1_iters_delay": iteration_stats.step_with_batch_queue_time_ms,
+                "since_last_batch_ms_1_iters_delay": iteration_stats.since_last_batch_ms,
+                "engine_core_timestamp": iteration_stats.engine_core_timestamp,
             }
 
             with self.buf_lock:

@@ -25,13 +25,36 @@ class PrefixCacheStats:
     # The number of hits in these requests.
     hits: int = 0
 
+@dataclass
+class NVMLFreqModulatorStats:
+    """Stats associated with the NVML Frequency Modulator."""
+    now: float = 0.0
+    num_running_reqs: int = 0
+    num_waiting_reqs: int = 0
+    running_computed_tokens_list: list[int] = field(default_factory=list)
+    waiting_computed_tokens_list: list[int] = field(default_factory=list)
+    running_reqs_num_tokens: list[int] = field(default_factory=list)
+    waiting_reqs_num_tokens: list[int] = field(default_factory=list)
+    running_reqs_num_time: list[float] = field(default_factory=list)
+    waiting_reqs_num_time: list[float] = field(default_factory=list)
+    kv_cache_usage: float = 0.0
+    batch_ID: int = 0
+    
 
 @dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
-
+    now: float = 0.0
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    waiting_reqs_num_tokens: list[int] = field(default_factory=list)
+    running_reqs_num_tokens: list[int] = field(default_factory=list)
+    waiting_reqs_num_time: list[float] = field(default_factory=list)
+    running_reqs_num_time: list[float] = field(default_factory=list)
+    running_computed_tokens_list: list[int] = field(default_factory=list)
+    waiting_computed_tokens_list: list[int] = field(default_factory=list)
+    running_computed_req_list: list[str] = field(default_factory=list)
+    waiting_computed_req_list: list[str] = field(default_factory=list)
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
@@ -97,6 +120,7 @@ class IterationStats:
         self.num_prompt_tokens_reqs: list[int] = []
         self.num_preempted_reqs = 0
         self.finished_requests: list[FinishedRequestStats] = []
+        self.num_generation_tokens_iter: list[int] = []
         self.max_num_generation_tokens_iter: list[int] = []
         self.n_params_iter: list[int] = []
         self.time_to_first_tokens_iter: list[float] = []
@@ -107,6 +131,10 @@ class IterationStats:
         self.running_lora_adapters: dict[str, int] = {}
         # CUDA timing for step_with_batch_queue function
         self.step_with_batch_queue_time_ms: Optional[float] = None
+        self.since_last_batch_ms: Optional[float] = None
+        self.engine_core_timestamp: Optional[float] = None
+
+    last_iter: float = 0.0
 
     def _time_since(self, start: float) -> float:
         """Calculate an interval relative to this iteration's timestamp."""
@@ -131,6 +159,7 @@ class IterationStats:
             req_stats.first_token_latency = first_token_latency
 
         req_stats.num_generation_tokens += num_new_generation_tokens
+        self.num_generation_tokens_iter.append(req_stats.num_generation_tokens)
 
         # Process request-level engine core events
         if output.events is not None:
@@ -147,6 +176,8 @@ class IterationStats:
             self.inter_token_latencies_iter.append(itl)
 
         req_stats.last_token_ts = engine_core_timestamp
+        
+        self.engine_core_timestamp = engine_core_timestamp
 
     def update_from_events(self, req_id: str, events: list["EngineCoreEvent"],
                            is_prefilling: bool, req_stats: RequestStateStats,

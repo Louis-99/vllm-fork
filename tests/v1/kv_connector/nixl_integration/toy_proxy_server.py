@@ -12,6 +12,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -30,7 +32,7 @@ async def lifespan(app: FastAPI):
         prefiller_base_url = f'http://{host}:{port}/v1'
         app.state.prefill_clients.append({
             'client':
-            httpx.AsyncClient(timeout=None, base_url=prefiller_base_url),
+            httpx.AsyncClient(timeout=None, base_url=prefiller_base_url, limits=httpx.Limits(max_keepalive_connections=10000, max_connections=10000)),
             'host':
             host,
             'port':
@@ -38,13 +40,15 @@ async def lifespan(app: FastAPI):
             'id':
             i
         })
+
+
 
     # Create decode clients
     for i, (host, port) in enumerate(global_args.decoder_instances):
         decoder_base_url = f'http://{host}:{port}/v1'
         app.state.decode_clients.append({
             'client':
-            httpx.AsyncClient(timeout=None, base_url=decoder_base_url),
+            httpx.AsyncClient(timeout=None, base_url=decoder_base_url, limits=httpx.Limits(max_keepalive_connections=10000, max_connections=10000)),
             'host':
             host,
             'port':
@@ -53,11 +57,20 @@ async def lifespan(app: FastAPI):
             i
         })
 
-    # Initialize round-robin iterators
-    app.state.prefill_iterator = itertools.cycle(
-        range(len(app.state.prefill_clients)))
-    app.state.decode_iterator = itertools.cycle(
-        range(len(app.state.decode_clients)))
+    def get_next_idx_weighted(weights: list):
+        time_steps = 1 / np.array(weights)
+        time_steps /= time_steps.max()
+        virtual_times = np.zeros_like(time_steps)
+
+        while True:
+            idx = np.argmin(virtual_times)
+            virtual_times[idx] += time_steps[idx]
+            virtual_times -= virtual_times.min()
+            yield int(idx)
+
+    # Initialize (weighted) round-robin iterators
+    app.state.prefill_iterator = get_next_idx_weighted(global_args.prefiller_weights)
+    app.state.decode_iterator = get_next_idx_weighted(global_args.decoder_weights)
 
     print(f"Initialized {len(app.state.prefill_clients)} prefill clients "
           f"and {len(app.state.decode_clients)} decode clients.")
@@ -105,6 +118,16 @@ def parse_args():
                         type=int,
                         nargs="+",
                         default=[8200])
+    
+    # weights
+    parser.add_argument("--prefiller-weights",
+                        type=float,
+                        nargs="+",
+                        default=[1.0])
+    parser.add_argument("--decoder-weights",
+                        type=float,
+                        nargs="+",
+                        default=[1.0])
 
     args = parser.parse_args()
 
@@ -121,6 +144,16 @@ def parse_args():
     args.prefiller_instances = list(
         zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
+
+    if len(args.prefiller_weights) == 1:
+        args.prefiller_weights *= len(args.prefiller_instances)
+    elif len(args.prefiller_weights) != len(args.prefiller_instances):
+        raise ValueError("Number of prefiller weights must be 1 or match number of prefiller instances")
+    
+    if len(args.decoder_weights) == 1:
+        args.decoder_weights *= len(args.decoder_instances)
+    elif len(args.decoder_weights) != len(args.decoder_instances):
+        raise ValueError("Number of prefiller weights must be 1 or match number of prefiller instances")
 
     return args
 

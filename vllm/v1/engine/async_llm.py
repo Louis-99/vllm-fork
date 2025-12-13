@@ -269,6 +269,8 @@ class AsyncLLM(EngineClient):
             self.power_monitor_process.kill()
             self.power_monitor_process.join()
 
+        
+
         shutdown_prometheus()
 
         if engine_core := getattr(self, "engine_core", None):
@@ -451,7 +453,7 @@ class AsyncLLM(EngineClient):
         engine_core = self.engine_core
         output_processor = self.output_processor
         log_stats = self.log_stats
-        logger_manager = self.logger_manager
+        logger_manager = self.logger_manager            
 
         async def output_handler():
             try:
@@ -466,6 +468,7 @@ class AsyncLLM(EngineClient):
                     # Extract step timing information if available
                     if iteration_stats is not None and outputs.step_timing_ms is not None:
                         iteration_stats.step_with_batch_queue_time_ms = outputs.step_timing_ms
+                        iteration_stats.since_last_batch_ms = outputs.since_last_batch_ms
 
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
@@ -491,7 +494,7 @@ class AsyncLLM(EngineClient):
                         # 3) Abort any reqs that finished due to stop strings.
                         await engine_core.abort_requests_async(
                             processed_outputs.reqs_to_abort)
-
+                        
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
@@ -501,6 +504,8 @@ class AsyncLLM(EngineClient):
                             scheduler_stats=outputs.scheduler_stats,
                             iteration_stats=iteration_stats,
                         )
+                    
+                        
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)

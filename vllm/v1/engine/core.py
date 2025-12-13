@@ -13,6 +13,8 @@ from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
+import torch
+import torch.cuda.nvtx as nvtx
 
 import msgspec
 import torch
@@ -45,7 +47,7 @@ from vllm.v1.engine.utils import (EngineHandshakeMetadata, EngineZmqAddresses,
                                   get_device_indices)
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.metrics.stats import NVMLFreqModulatorStats, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -164,8 +166,15 @@ class EngineCore:
                         self.step_with_batch_queue)
                         
         # Initialize CUDA timing events for step_with_batch_queue performance monitoring
-        self.step_start_event: Optional[torch.cuda.Event] = None
-        self.step_end_event: Optional[torch.cuda.Event] = None
+        self.step_start_events: deque[torch.cuda.Event] = deque(maxlen=10)
+        self.step_end_events: deque[torch.cuda.Event] = deque(maxlen=10)
+        self.last_step_end_events: deque[torch.cuda.Event] = deque(maxlen=10)
+        self.stream = torch.cuda.Stream()
+
+        # if self.step_fn == self.step:
+        #     start_event = torch.cuda.Event(enable_timing=True)
+        #     start_event.record(stream=self.stream)
+        #     self.step_start_events.append(start_event)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -291,11 +300,11 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
-            return {}, False
+            return {}, False, False
+        
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
@@ -304,7 +313,7 @@ class EngineCore:
             scheduler_output, model_output)  # type: ignore
 
         return (engine_core_outputs,
-                scheduler_output.total_num_scheduled_tokens > 0)
+                scheduler_output.total_num_scheduled_tokens > 0, True)
 
     def post_step(self, model_executed: bool) -> None:
         if self.use_spec_decode and model_executed:
@@ -314,7 +323,7 @@ class EngineCore:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
     def step_with_batch_queue(
-            self) -> tuple[Optional[dict[int, EngineCoreOutputs]], bool]:
+            self) -> tuple[Optional[dict[int, EngineCoreOutputs]], bool, bool]:
         """Schedule and execute batches with the batch queue.
         Note that if nothing to output in this step, None is returned.
 
@@ -328,15 +337,6 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
-        # Start CUDA timing event for step_with_batch_queue
-        if torch.cuda.is_available():
-            self.step_start_event = torch.cuda.Event(enable_timing=True)
-            self.step_end_event = torch.cuda.Event(enable_timing=True)
-            self.step_start_event.record()
-        else:
-            self.step_start_event = None
-            self.step_end_event = None
-        
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -346,6 +346,7 @@ class EngineCore:
         assert len(batch_queue) < self.batch_queue_size
         
         model_executed = False
+        actually_new_req = False
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
             future = self.model_executor.execute_model(scheduler_output,
@@ -354,23 +355,23 @@ class EngineCore:
                 (future, scheduler_output))  # type: ignore[arg-type]
 
             model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            if model_executed:
+                # either a new request, or a preempted request or num scheduled tokens > num cached reqs
+                actually_new_req = len(scheduler_output.scheduled_new_reqs) > 0 or \
+                                    any(scheduler_output.scheduled_cached_reqs.resumed_from_preemption) or \
+                                    scheduler_output.total_num_scheduled_tokens > len(scheduler_output.scheduled_cached_reqs.req_ids)
             if model_executed and len(batch_queue) < self.batch_queue_size \
                 and not batch_queue[-1][0].done():
                 # Don't block on next worker response unless the queue is full
                 # or there are no more requests to schedule.
-                # Record end event before early return
-                if self.step_end_event is not None:
-                    self.step_end_event.record()
-                return None, True
+                
+                return None, True, actually_new_req
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
-            # Record end event before early return
-            if self.step_end_event is not None:
-                self.step_end_event.record()
-            return None, False
+            return None, False, actually_new_req
 
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
@@ -379,12 +380,8 @@ class EngineCore:
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)
-
-        # Record end event before return
-        if self.step_end_event is not None:
-            self.step_end_event.record()
         
-        return engine_core_outputs, model_executed
+        return engine_core_outputs, model_executed, actually_new_req
 
     def shutdown(self):
         self.structured_output_manager.clear_backend()
@@ -501,8 +498,12 @@ class EngineCoreProc(EngineCore):
         engine_index: int = 0,
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
-        self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs],
-                                              bytes]]()
+        self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs], bytes]]()
+        self.staged_adds: queue.Queue[tuple[Request, int]] = queue.Queue()
+        self.staged_aborts: queue.Queue[list[str]] = queue.Queue()
+        self.staged_utilities: queue.Queue[tuple[int, str, tuple]] = queue.Queue()
+        self.staged_executor_failed: threading.Event = threading.Event()
+        
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b''))
 
@@ -562,10 +563,44 @@ class EngineCoreProc(EngineCore):
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
 
+            self.input_drainer_thread = threading.Thread(
+                target=self._drain_input_queue_loop,
+                daemon=True)
+            self.input_drainer_thread.start()
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         gc.collect()
         gc.freeze()
+
+    def _drain_input_queue_loop(self):
+        nvml_sender_time = time.time()
+        while True:
+            req_type, payload = self.input_queue.get()
+            if req_type == EngineCoreRequestType.ADD:
+                req, request_wave = payload
+                # Stage only; scheduler mutation happens in core loop
+                self.staged_adds.put_nowait((req, request_wave))
+                if time.time() - nvml_sender_time >= 0.03 or self.input_queue.qsize() == 0:
+                    nvml_sender_time = time.time()
+                    # Update NVML stats for waiting requests
+                    wait_q = list(self.staged_adds.queue)
+                    wait_q = [req for req, _ in wait_q]
+                    self.scheduler.make_nvml_stats(wait_q)
+            elif req_type == EngineCoreRequestType.ABORT:
+                # Stage aborts to apply in core loop
+                self.staged_aborts.put_nowait(payload)
+            elif req_type == EngineCoreRequestType.UTILITY:
+                client_idx, call_id, method_name, args = payload
+                # Stage utilities to process in core loop
+                self.staged_utilities.put_nowait((client_idx, method_name,
+                                                (call_id, args)))
+            elif req_type == EngineCoreRequestType.EXECUTOR_FAILED:
+                # Signal failure to core loop
+                self.staged_executor_failed.set()
+            else:
+                logger.error("Unrecognized input request type encountered: %s",
+                            req_type)
 
     @contextmanager
     def _perform_handshakes(
@@ -763,54 +798,113 @@ class EngineCoreProc(EngineCore):
             self._process_engine_step()
 
     def _process_input_queue(self):
-        """Exits when an engine step needs to be performed."""
-
-        waited = False
-        while not self.engines_running and not self.scheduler.has_requests() \
-                and not self.batch_queue:
-            if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
-                logger.debug("EngineCore waiting for work.")
-                waited = True
-            req = self.input_queue.get()
-            self._handle_client_request(*req)
-
-        if waited:
-            logger.debug("EngineCore loop active.")
-
-        # Handle any more client requests.
+        # Non-blocking: any remaining items get staged; core loop won’t block here.
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
-            self._handle_client_request(*req)
+            # Reuse drainer’s staging logic to avoid scheduler mutations here.
+            req_type, payload = req
+            if req_type == EngineCoreRequestType.ADD:
+                req_obj, request_wave = payload
+                self.staged_adds.put_nowait((req_obj, request_wave))
+            elif req_type == EngineCoreRequestType.ABORT:
+                self.staged_aborts.put_nowait(payload)
+            elif req_type == EngineCoreRequestType.UTILITY:
+                client_idx, call_id, method_name, args = payload
+                self.staged_utilities.put_nowait((client_idx, method_name,
+                                                (call_id, args)))
+            elif req_type == EngineCoreRequestType.EXECUTOR_FAILED:
+                self.staged_executor_failed.set()
+
+        # Apply staged failures
+        if getattr(self, "staged_executor_failed", None) and \
+                self.staged_executor_failed.is_set():
+            raise RuntimeError("Executor failed.")
+
+        # Drain staged utilities (process on core loop thread)
+        staged_utils = getattr(self, "staged_utilities", None)
+        if staged_utils is not None:
+            while not staged_utils.empty():
+                client_idx, method_name, (call_id, args) = staged_utils.get_nowait()
+                output = UtilityOutput(call_id)
+                try:
+                    method = getattr(self, method_name)
+                    result = method(*self._convert_msgspec_args(method, args))
+                    output.result = UtilityResult(result)
+                except BaseException as e:
+                    logger.exception("Invocation of %s method failed", method_name)
+                    output.failure_message = (f"Call to {method_name} method"
+                                            f" failed: {str(e)}")
+                self.output_queue.put_nowait(
+                    (client_idx, EngineCoreOutputs(utility_output=output)))
+
+        # Drain staged aborts
+        staged_aborts = getattr(self, "staged_aborts", None)
+        if staged_aborts is not None:
+            while not staged_aborts.empty():
+                abort_ids = staged_aborts.get_nowait()
+                self.abort_requests(abort_ids)
+
+        # Drain staged adds
+        staged_adds = getattr(self, "staged_adds", None)
+        if staged_adds is not None:
+            while not staged_adds.empty():
+                req, wave = staged_adds.get_nowait()
+                self.add_request(req, wave)
+
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
+        start_event1 = torch.cuda.Event(enable_timing=True)  
+        end_event1 = torch.cuda.Event(enable_timing=True)
+        start_event1.record()
+
         # Step the engine core.
-        outputs, model_executed = self.step_fn()
-        
-        # Calculate step timing from CUDA events if available
-        step_timing_ms = None
-        if (hasattr(self, 'step_start_event') and hasattr(self, 'step_end_event') 
-            and self.step_start_event is not None and self.step_end_event is not None):
+        outputs, model_executed, actually_new_req = self.step_fn()
+
+        end_event1.record()
+
+        if self.step_fn == self.step_with_batch_queue:
+            if outputs and \
+            any(len(out.outputs) > 0 for out in outputs.values()) and \
+            any(any(core_output.events for core_output in out.outputs) for out in outputs.values()):
+                self.step_end_events.appendleft(end_event1)
+            if actually_new_req:
+                self.step_start_events.appendleft(start_event1)
+        else:
+            if model_executed:
+                self.step_end_events.appendleft(end_event1)
+                self.step_start_events.appendleft(start_event1)
+
+        # --- Compute elapsed time if enough events ---
+        step_timing_ms = 0.0
+        since_last_batch_ms = -1
+        if len(self.step_end_events) > 1 and len(self.step_start_events) > 1:
+            start_event = self.step_start_events.pop()
+            end_event = self.step_end_events.pop()
             try:
-                # Synchronize to ensure events are recorded
-                torch.cuda.synchronize()
-                step_timing_ms = self.step_start_event.elapsed_time(self.step_end_event)
-            except Exception:
-                # If timing fails for any reason, just continue without timing
-                step_timing_ms = None
-        
-        # Put EngineCoreOutputs into the output queue.
+                step_timing_ms = start_event.elapsed_time(end_event)
+            except Exception as e:
+                logger.warning("Failed to get step timing, %s", e)
+                # self.step_end_events.append(end_event)
+                
+            if len(self.last_step_end_events) > 0 and step_timing_ms > 0.0:
+                last_end_event = self.last_step_end_events.pop()
+                since_last_batch_ms = last_end_event.elapsed_time(
+                    start_event)    
+            self.last_step_end_events.append(end_event)
+
+        # --- Attach timing info to outputs ---
         for output in (outputs.items() if outputs else ()):
-            # Add timing information to the outputs
             engine_index, engine_core_outputs = output
-            if step_timing_ms is not None:
-                engine_core_outputs.step_timing_ms = step_timing_ms
+            engine_core_outputs.step_timing_ms = step_timing_ms
+            engine_core_outputs.since_last_batch_ms = since_last_batch_ms
             self.output_queue.put_nowait(output)
-        # Post-step hook.
+
         self.post_step(model_executed)
 
         return model_executed
+
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
@@ -818,7 +912,8 @@ class EngineCoreProc(EngineCore):
 
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
-            self.add_request(req, request_wave)
+            # self.add_request(req, request_wave)
+            self.staged_adds.put_nowait((req, request_wave))
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
