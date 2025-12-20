@@ -328,6 +328,9 @@ class _MPNvmlFreqModulatorServer:
         self._freq_daemon_queues = []
         self._freq_daemon_procs = []
 
+        self.init_done = False
+
+
     def _load_models(self):
         dec = None
         pre = None
@@ -342,19 +345,11 @@ class _MPNvmlFreqModulatorServer:
             self.power_model_decode = ort.InferenceSession(power_dec_path)             
 
     def run(self):
-        self.start_frequency_manager()
-        self.underprediction_lock = threading.Lock()
-        # Load models here rather than in __init__() so that we don't pass the
-        # loaded models across processes
-        self._load_models()
-
-        # Column `now` used as key column to join with `perf_metrics.csv`
-        csv_writer = CSVWriter(col_names=[
-            'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
-            'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
-            'max_running_q_wait', 'max_waiting_q_wait',
-        ],
-        filename=self.log_dir / 'freq_mod_log.csv')
+        if not self.init_done:
+            self.init_done = True
+            self.underprediction_lock = threading.Lock()
+            self._load_models()
+            self.start_frequency_manager()
 
         for step_id in count():
             msg_encoded = self.q.get()
@@ -387,7 +382,7 @@ class _MPNvmlFreqModulatorServer:
             freq_mod_start = time.perf_counter()
             with self.underprediction_lock:
                 if self.last_applied_freq != selected_freq:
-                    self.set_frequency_manager(selected_freq)
+                    self.set_frequency_manager(selected_freq, msg.now)
                     self.last_applied_freq = selected_freq
 
             freq_mod_end = time.perf_counter()
@@ -398,6 +393,12 @@ class _MPNvmlFreqModulatorServer:
                 timer_to_check_underpred.daemon = True
                 timer_to_check_underpred.start()
 
+            csv_writer = CSVWriter(col_names=[
+                'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
+                'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
+                'max_running_q_wait', 'max_waiting_q_wait',
+            ],
+            filename=self.log_dir / 'freq_mod_log.csv')
             csv_writer.add_row([
                 msg.now,
                 mpc_start,
@@ -412,8 +413,7 @@ class _MPNvmlFreqModulatorServer:
                 max(msg.waiting_queue_wait_time) if len(
                     msg.waiting_queue_wait_time) > 0 else 0.0,
             ])
-
-        csv_writer.close()
+            csv_writer.close()
 
     def check_underprediction(self, ID: int,):
         """
@@ -426,7 +426,7 @@ class _MPNvmlFreqModulatorServer:
                 # Skip this check.
                 return
             if self.last_applied_freq is not max(self.freq_choices):
-                self.set_frequency_manager(max(self.freq_choices))
+                self.set_frequency_manager(max(self.freq_choices), time.time())
                 self.last_applied_freq = max(self.freq_choices)
                 logger.info('Underprediction detected, applied max freq')
 
@@ -808,7 +808,7 @@ class _MPNvmlFreqModulatorServer:
             output_arr = out.reshape(n_future, n_freqs)
         return output_arr
 
-    def _persistent_gpu_worker(physical_gpu_index: int, queue: multiprocessing.Queue):
+    def _persistent_gpu_worker(physical_gpu_index: int, queue: multiprocessing.Queue, log_dir: str):
         """
         Worker process that initializes NVML for a specific GPU and waits for
         frequency commands.
@@ -824,24 +824,33 @@ class _MPNvmlFreqModulatorServer:
             logger.info(f"Frequency daemon started for GPU index {physical_gpu_index}")
             while True:
                 # This blocks until a frequency is sent from the main process
-                freq = queue.get()
+                freq, now = queue.get()
                 # Poison pill to stop the process
-                if freq == -1:
+                if freq == -1 and now == -1:
                     break
 
                 if not queue.empty():
                     qsize = queue.qsize()
                     for _skipped in range(qsize):
-                        freq = queue.get()
-                        if freq == -1:
+                        freq, now = queue.get()
+                        if freq == -1 and now == -1:
                             break
 
-                if freq == -1:
+                if freq == -1 and now == -1:
                     break
                     
                 try:
                     # Apply the frequency
                     pynvml.nvmlDeviceSetGpuLockedClocks(handle, freq, freq)
+                    csv_writer = CSVWriter(col_names=[
+                        'now',
+                        'target_freq'
+                    ],
+                    filename=log_dir / 'freq_apply_log.csv')
+                    csv_writer.add_row([
+                        now, freq,
+                    ])
+                    csv_writer.close()
                 except pynvml.NVMLError as e:
                     logger.error(f"Daemon GPU {physical_gpu_index} failed to set freq {freq}: {e}")
 
@@ -876,7 +885,7 @@ class _MPNvmlFreqModulatorServer:
         for physical_idx in gpu_indices:
             q = ctx.Queue()
             # Use the unbound function object from the class dict to avoid pickling the instance.
-            p = ctx.Process(target=self.__class__._persistent_gpu_worker, args=(physical_idx, q))
+            p = ctx.Process(target=self.__class__._persistent_gpu_worker, args=(physical_idx, q, self.log_dir))
             p.start()
             
             self._freq_daemon_queues.append(q)
@@ -884,7 +893,7 @@ class _MPNvmlFreqModulatorServer:
         logger.info(f"Started {len(self._freq_daemon_procs)} GPU frequency daemon processes.")
 
 
-    def set_frequency_manager(self, freq: int):
+    def set_frequency_manager(self, freq: int, now: float):
         """
         Sends the new frequency to all waiting GPU processes.
         This function returns immediately after putting the freq in the queue.
@@ -894,7 +903,7 @@ class _MPNvmlFreqModulatorServer:
             return
 
         for q in self._freq_daemon_queues:
-            q.put(freq)
+            q.put((freq, now))
 
 
     def stop_frequency_manager(self):
@@ -904,7 +913,7 @@ class _MPNvmlFreqModulatorServer:
         logger.info("Stopping frequency daemons...")
         
         for q in self._freq_daemon_queues:
-            q.put(-1)  # Poison pill
+            q.put((-1, -1))  # Poison pill
 
         for p in self._freq_daemon_procs:
             p.join()
