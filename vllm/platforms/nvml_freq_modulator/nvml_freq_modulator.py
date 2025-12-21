@@ -329,6 +329,7 @@ class _MPNvmlFreqModulatorServer:
         self._freq_daemon_procs = []
 
         self.init_done = False
+        self.csv_writer = None
 
 
     def _load_models(self):
@@ -350,6 +351,12 @@ class _MPNvmlFreqModulatorServer:
             self.underprediction_lock = threading.Lock()
             self._load_models()
             self.start_frequency_manager()
+            self.csv_writer = CSVWriter(col_names=[
+                'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
+                'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
+                'max_running_q_wait', 'max_waiting_q_wait',
+            ],
+            filename=self.log_dir / 'freq_mod_log.csv')
 
         for step_id in count():
             msg_encoded = self.q.get()
@@ -393,13 +400,8 @@ class _MPNvmlFreqModulatorServer:
                 timer_to_check_underpred.daemon = True
                 timer_to_check_underpred.start()
 
-            csv_writer = CSVWriter(col_names=[
-                'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
-                'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
-                'max_running_q_wait', 'max_waiting_q_wait',
-            ],
-            filename=self.log_dir / 'freq_mod_log.csv')
-            csv_writer.add_row([
+            
+            self.csv_writer.add_row([
                 msg.now,
                 mpc_start,
                 freq_mod_start,
@@ -413,7 +415,7 @@ class _MPNvmlFreqModulatorServer:
                 max(msg.waiting_queue_wait_time) if len(
                     msg.waiting_queue_wait_time) > 0 else 0.0,
             ])
-            csv_writer.close()
+            self.csv_writer.close()
 
     def check_underprediction(self, ID: int,):
         """
@@ -822,6 +824,12 @@ class _MPNvmlFreqModulatorServer:
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_index)
             logger.info(f"Frequency daemon started for GPU index {physical_gpu_index}")
+            csv_writer = CSVWriter(col_names=[
+                'now',
+                'freq_app_time',
+                'target_freq'
+            ],
+            filename=log_dir / f'freq_apply_log_{physical_gpu_index}.csv')
             while True:
                 # This blocks until a frequency is sent from the main process
                 freq, now = queue.get()
@@ -842,13 +850,10 @@ class _MPNvmlFreqModulatorServer:
                 try:
                     # Apply the frequency
                     pynvml.nvmlDeviceSetGpuLockedClocks(handle, freq, freq)
-                    csv_writer = CSVWriter(col_names=[
-                        'now',
-                        'target_freq'
-                    ],
-                    filename=log_dir / 'freq_apply_log.csv')
                     csv_writer.add_row([
-                        now, freq,
+                        now, 
+                        time.time(),
+                        freq,
                     ])
                     csv_writer.close()
                 except pynvml.NVMLError as e:
