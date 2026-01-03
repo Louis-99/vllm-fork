@@ -415,7 +415,7 @@ class _MPNvmlFreqModulatorServer:
                 max(msg.waiting_queue_wait_time) if len(
                     msg.waiting_queue_wait_time) > 0 else 0.0,
             ])
-            self.csv_writer.close()
+        self.csv_writer.close()
 
     def check_underprediction(self, ID: int,):
         """
@@ -855,7 +855,6 @@ class _MPNvmlFreqModulatorServer:
                         time.time(),
                         freq,
                     ])
-                    csv_writer.close()
                 except pynvml.NVMLError as e:
                     logger.error(f"Daemon GPU {physical_gpu_index} failed to set freq {freq}: {e}")
 
@@ -867,6 +866,7 @@ class _MPNvmlFreqModulatorServer:
                 pynvml.nvmlShutdown()
             except:
                 pass
+            csv_writer.close()
 
 
     def start_frequency_manager(self):
