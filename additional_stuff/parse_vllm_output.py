@@ -23,6 +23,10 @@ class PerfStats:
     power_w: float
     energy_j: float
     energy_per_token: float
+    energy_prefill: float
+    prefill_energy_per_token: float
+    energy_decode: float
+    decode_energy_per_token: float
     avg_running_q: float
     avg_waiting_q: float
     kv_usage_mean: float
@@ -35,35 +39,50 @@ class PerfStats:
     num_requests: int
     num_tokens_decoded: int
     num_tokens_prefilled: int
+    avg_req_len: float
+    p99_req_len: float
 
 def calc_perf_stats(expr_dir: Path) -> PerfStats:
     raw_logs_dict = load_logs(expr_dir)
     raw_logs_dict_steady = extract_steady_region(raw_logs_dict)
 
     perfstats_list = []
+    ttft_list = []
+    tpot_list = []
     for k, v in raw_logs_dict_steady.items():
         decode, prefill, power = v
-        perfstats = calc_perf_stats_single_instance(k, decode, prefill, power)
+        perfstats, ttft, tpot = calc_perf_stats_single_instance(k, decode, prefill, power)
         perfstats_list.append((k, perfstats))
-
+        ttft_list = ttft + ttft_list
+        tpot_list = tpot + tpot_list
+        
+    total_xput = sum(p.throughput_rps for k, p in perfstats_list if "prefill" in k)
     total_requests = sum(p.num_requests for k, p in perfstats_list if "prefill" in k)
-    total_duration_prefill = max(p.expr_duration_s for k, p in perfstats_list if "prefill" in k)
-    total_duration = max(p.expr_duration_s for _, p in perfstats_list)
+    total_duration = np.median([p.expr_duration_s for _, p in perfstats_list])
     total_energy = sum(p.energy_j for _, p in perfstats_list)
-    total_decode = sum(p.num_tokens_decoded for k, p in perfstats_list if "decode" in k)
-    total_prefill = sum(p.num_tokens_prefilled for k, p in perfstats_list if "decode" in k)
+    total_decode = sum(p.num_tokens_decoded for _, p in perfstats_list)
+    total_prefill = sum(p.num_tokens_prefilled for _, p in perfstats_list)
+
+    prefill_decodes = sum(p.num_tokens_decoded for k, p in perfstats_list if "prefill" in k)
+    prefill_energy = sum(p.energy_j for k, p in perfstats_list if "prefill" in k)
+    decode_decodes = sum(p.num_tokens_decoded for k, p in perfstats_list if "decode" in k)
+    decode_energy = sum(p.energy_j for k, p in perfstats_list if "decode" in k)
 
     total_perfstats = PerfStats(
-        throughput_rps=total_requests / total_duration_prefill,
-        ttft_mean=0,
-        ttft_p90=0,
-        ttft_p99=0,
-        tpot_mean=0,
-        tpot_p90=0,
-        tpot_p99=0,
+        throughput_rps=total_xput,
+        ttft_mean=np.mean(ttft_list),
+        ttft_p90=np.percentile(ttft_list, 90),
+        ttft_p99=np.percentile(ttft_list, 99),
+        tpot_mean=np.mean(tpot_list),
+        tpot_p90=np.percentile(tpot_list, 90),
+        tpot_p99=np.percentile(tpot_list, 99),
         power_w=total_energy / total_duration,
         energy_j=total_energy,
-        energy_per_token=total_energy / (total_decode + total_prefill),
+        energy_prefill=prefill_energy,
+        energy_decode=decode_energy,
+        energy_per_token=total_energy / (total_decode),
+        prefill_energy_per_token=prefill_energy / prefill_decodes,
+        decode_energy_per_token=decode_energy / decode_decodes,
         avg_running_q=0,
         avg_waiting_q=0,
         kv_usage_mean=0,
@@ -75,9 +94,16 @@ def calc_perf_stats(expr_dir: Path) -> PerfStats:
         expr_duration_s=total_duration,
         num_requests=total_requests,
         num_tokens_decoded=total_decode,
-        num_tokens_prefilled=total_prefill
+        num_tokens_prefilled=total_prefill,
+        avg_req_len=0,
+        p99_req_len=0,
     )
     perfstats_list.append(('total', total_perfstats))
+
+    # save tpot_list and ttft_list to csv
+    pd.DataFrame({'ttft_s': ttft_list}).to_csv(expr_dir / f'ttft.csv', index=False)
+    pd.DataFrame({'tpot_s': tpot_list}).to_csv(expr_dir / f'tpot.csv', index=False)
+
     return perfstats_list
 
 
@@ -150,6 +176,7 @@ def calc_perf_stats_single_instance(root_name: str,
     elif "decode" in root_name:
         for req_id_tbt_row, tbts_row, req_id_ttft_row, ttft_row in df_perf_metric_decode_steady[['request_ids_iter_tbt_evald', 'inter_token_latencies_iter_evald', 'request_ids_iter_ttft_evald', 'time_to_first_tokens_iter_evald']].itertuples(index=False, name=None):
             for id_tbt, tbts in zip(req_id_tbt_row, tbts_row):
+                # if tbts < 0.3:
                 tbts_dict[id_tbt].append(tbts)
             # add ttft as well if you want to include queueing time in tpot
             # for id_ttft, ttft in zip(req_id_ttft_row, ttft_row):
@@ -159,9 +186,15 @@ def calc_perf_stats_single_instance(root_name: str,
     if 'prefill' in root_name:
         total_prefilled = sum(df_perf_metric_prefill_steady['num_prompt_tokens_reqs_evald'].sum())    # num prompt tokens
         total_decoded = sum(df_perf_metric_prefill_steady['num_generation_tokens'].to_list())       # one token created in prefill
+        req_lens = list(itertools.chain.from_iterable(df_perf_metric_prefill_steady['num_prompt_tokens_reqs_evald']))
+        avg_req_len = np.mean(req_lens)
+        p99_req_len = np.percentile(req_lens, 99)
     else:
         total_prefilled = 0
         total_decoded = sum(df_perf_metric_decode_steady['num_generation_tokens'].to_list())        # number of tokens generated
+        req_lens = list(itertools.chain.from_iterable(df_perf_metric_decode_steady['num_prompt_tokens_reqs_evald']))
+        avg_req_len = np.mean(req_lens)
+        p99_req_len = np.percentile(req_lens, 99)
 
     
     running_list = []
@@ -191,6 +224,8 @@ def calc_perf_stats_single_instance(root_name: str,
         kv_usage_p99=float(percentile_or_nan(kv_usage_list, q=99)),
         power_w=power_w,
         energy_j=energy_j_steady,
+        energy_prefill=0,
+        energy_decode=0,
         freq_mhz_mean=float(np.mean(freq_arr_list)),
         freq_mhz_p10=float(percentile_or_nan(
             freq_arr_list, q=10)),
@@ -201,8 +236,12 @@ def calc_perf_stats_single_instance(root_name: str,
         expr_duration_s=duration,
         num_tokens_decoded= total_decoded,
         num_tokens_prefilled=total_prefilled,
-        energy_per_token=energy_j_steady / (total_decoded + total_prefilled),
-    )
+        energy_per_token=energy_j_steady / (total_decoded),
+        prefill_energy_per_token=0,
+        decode_energy_per_token=0,
+        avg_req_len=avg_req_len,
+        p99_req_len=p99_req_len,
+    ), ttft_list, tpot_list
 
 def percentile_or_nan(a, q):
     if len(a) > 0:
@@ -262,8 +301,8 @@ def load_logs_prefill_decode_power_logs(expr_dir: Path) -> Tuple[
 
 def extract_steady_region(
     raw_logs_dict: dict,
-    start_clip_minutes: float = 1.0,
-    end_clip_minutes: float = 1.0
+    start_clip_minutes: float = 0.5,
+    end_clip_minutes: float = 0.25,
 ) -> dict:
     """
     Drop the first and last clip_minutes of data from df_perf_metric_*
@@ -300,7 +339,9 @@ def extract_steady_region(
 
     # Clip minutes from start/end
     steady_start = global_min + (start_clip_minutes * 60)
-    steady_end = global_max - (end_clip_minutes * 60)
+    steady_end = global_min + 5 * 60
+    assert steady_end > steady_start, "Steady end time must be greater than steady start time"
+    assert steady_end < global_max, "Steady end time must be less than global max time"
 
     # Filter steady region
     raw_logs_dict_steady = {}
