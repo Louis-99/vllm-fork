@@ -339,7 +339,7 @@ def extract_steady_region(
 
     # Clip minutes from start/end
     steady_start = global_min + (start_clip_minutes * 60)
-    steady_end = global_min + 5 * 60
+    steady_end = global_min + (4.5 * 60)
     assert steady_end > steady_start, "Steady end time must be greater than steady start time"
     assert steady_end < global_max, "Steady end time must be less than global max time"
 
