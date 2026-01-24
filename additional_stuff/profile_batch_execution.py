@@ -814,8 +814,8 @@ def main():
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.6,
-        help="Fraction of GPU memory to use for KV cache (default: 0.6)",
+        default=0.8,
+        help="Fraction of GPU memory to use for KV cache (default: 0.8)",
     )
     parser.add_argument(
         "--max-num-seqs",
@@ -944,10 +944,33 @@ def main():
     from vllm.v1.core.kv_cache_utils import get_kv_cache_config, unify_kv_cache_configs
     
     # Calculate available memory based on gpu_memory_utilization
-    # Get actual GPU memory and apply utilization factor
+    # Get actual GPU memory and subtract model memory for each GPU (TP > 1 support)
     import torch
-    total_gpu_memory = torch.cuda.get_device_properties(0).total_memory
-    available_memory = [int(total_gpu_memory * args.gpu_memory_utilization)] * len(kv_cache_specs)
+    torch.cuda.synchronize()
+    
+    # Get memory info for each GPU in the tensor parallel group
+    num_gpus = args.tensor_parallel_size
+    available_memory = []
+    
+    for gpu_id in range(num_gpus):
+        model_memory = torch.cuda.memory_allocated(gpu_id)
+        total_gpu_memory = torch.cuda.get_device_properties(gpu_id).total_memory
+        remaining_memory = total_gpu_memory - model_memory
+        available_mem = int(remaining_memory * args.gpu_memory_utilization)
+        available_memory.append(available_mem)
+        
+        logger.info(f"GPU {gpu_id} Memory - Total: {total_gpu_memory / 1e9:.2f} GB, "
+                    f"Model: {model_memory / 1e9:.2f} GB, "
+                    f"Remaining: {remaining_memory / 1e9:.2f} GB, "
+                    f"Available for KV cache: {available_mem / 1e9:.2f} GB")
+    
+    # Ensure available_memory list matches kv_cache_specs length
+    if len(available_memory) < len(kv_cache_specs):
+        # Extend with last value if needed (shouldn't normally happen)
+        available_memory.extend([available_memory[-1]] * (len(kv_cache_specs) - len(available_memory)))
+    elif len(available_memory) > len(kv_cache_specs):
+        # Trim if needed
+        available_memory = available_memory[:len(kv_cache_specs)]
     
     kv_cache_configs = [
         get_kv_cache_config(vllm_config, spec, mem)
