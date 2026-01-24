@@ -28,6 +28,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
@@ -42,6 +43,57 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.executor.abstract import Executor
 
 logger = init_logger(__name__)
+
+
+def calculate_warmup_iterations(
+    prefill_ctx_lens: list[int],
+    decode_gen_lens: list[int],
+    max_num_batched_tokens: int,
+) -> int:
+    """
+    Calculate number of warmup iterations needed to initialize decode requests
+    without violating max_num_batched_tokens limit.
+    
+    Args:
+        prefill_ctx_lens: Context lengths for prefill requests
+        decode_gen_lens: Context lengths for decode initialization
+        max_num_batched_tokens: Maximum tokens per batch
+    
+    Returns:
+        Number of warmup iterations needed (minimum 2)
+    """
+    if not decode_gen_lens:
+        # No decode requests, use default warmup
+        return 2
+    
+    # Calculate tokens needed for prefill requests
+    prefill_tokens = sum(prefill_ctx_lens)
+    
+    # Calculate total tokens needed for decode initialization (all as prefill)
+    decode_init_tokens = sum(decode_gen_lens)
+    
+    # If both prefill and decode init fit in one batch, use default warmup
+    if prefill_tokens + decode_init_tokens <= max_num_batched_tokens:
+        return 2
+    
+    # Need to spread decode initialization across multiple iterations
+    # Each warmup iteration can initialize decode requests up to the limit
+    available_tokens_per_iter = max_num_batched_tokens - prefill_tokens
+    
+    if available_tokens_per_iter <= 0:
+        # Prefill alone exceeds limit - still need at least 2 warmup iterations
+        # Decode will be initialized in subsequent iterations without prefill
+        available_tokens_per_iter = max_num_batched_tokens
+        
+        # Calculate iterations needed for decode init (after first iteration with prefill)
+        warmup_for_decode = (decode_init_tokens + available_tokens_per_iter - 1) // available_tokens_per_iter
+        return 1 + warmup_for_decode  # 1 for prefill + N for decode init
+    
+    # Calculate how many warmup iterations needed to initialize all decode requests
+    warmup_for_decode = (decode_init_tokens + available_tokens_per_iter - 1) // available_tokens_per_iter
+    
+    # Return at least 2, but more if needed for decode initialization
+    return max(2, warmup_for_decode)
 
 
 def create_fake_block_ids(
@@ -85,7 +137,7 @@ def create_fake_new_request(
     from vllm.sampling_params import SamplingParams
     sampling_params = SamplingParams(
         temperature=0.0,
-        max_tokens=1,
+        max_tokens=1000,  # Set very high to avoid stopping during profiling
         ignore_eos=True,
     )
     
@@ -252,19 +304,16 @@ def profile_batch_execution(
     decode_gen_lens: list[int],
     block_size: int,
     num_kv_groups: int,
-    repeat: int = 1,
-    warmup: int = 1,
+    repeat: int = None,
+    runtime: float = None,
     prefill_precomputed_tokens: list[int] = None,
     test_id: str = "default",
     enable_power_logging: bool = False,
     power_log_file: Optional[Path] = None,
+    max_num_batched_tokens: int = 4096,
 ) -> dict:
     """
     Profile execution time of a single batch configuration.
-    
-    Creates a fresh executor for each profiling run to ensure clean state.
-    Only profiles prefill (new requests) to avoid complexity of maintaining
-    request state across iterations.
     
     Args:
         executor: vLLM executor instance
@@ -272,21 +321,33 @@ def profile_batch_execution(
         decode_gen_lens: List of generated token counts for decode requests  
         block_size: KV cache block size
         num_kv_groups: Number of KV cache groups
-        repeat: Number of times to repeat for averaging
-        warmup: Number of warmup iterations
+        repeat: Number of times to repeat for averaging (mutually exclusive with runtime)
+        runtime: Runtime in seconds for profiling (mutually exclusive with repeat)
         prefill_precomputed_tokens: List of pre-computed tokens per prefill request
+        max_num_batched_tokens: Maximum tokens per batch (for warmup calculation)
     
     Returns:
         Dictionary with timing statistics
     """
-    # For profiling mixed prefill/decode batches:
-    # - Iteration 0 (warmup): Initialize ALL requests as prefill to populate model runner state
-    # - Iteration 1+: Use actual batch composition (prefill + decode)
+    # Validate that exactly one of repeat or runtime is provided
+    if repeat is None and runtime is None:
+        raise ValueError("Either 'repeat' or 'runtime' must be specified")
+    if repeat is not None and runtime is not None:
+        raise ValueError("Cannot specify both 'repeat' and 'runtime'")
+    
+    use_runtime_mode = runtime is not None
+    # Calculate warmup iterations based on decode initialization needs
+    warmup = calculate_warmup_iterations(
+        prefill_ctx_lens, decode_gen_lens, max_num_batched_tokens
+    )
     
     logger.info(
         f"Profiling batch: {len(prefill_ctx_lens)} prefill reqs, "
         f"{len(decode_gen_lens)} decode reqs, "
-        f"ctx_lens: {prefill_ctx_lens}, decode_lens: {decode_gen_lens}"
+        f"ctx_lens: {prefill_ctx_lens}, decode_lens: {decode_gen_lens}, "
+        f"prefill_precomputed_tokens: {prefill_precomputed_tokens}, "
+        f"warmup iterations: {warmup}, "
+        f"mode: {'runtime=' + str(runtime) + 's' if use_runtime_mode else 'repeat=' + str(repeat)}"
     )
     
     # Generate persistent decode request IDs (unique per test)
@@ -295,10 +356,14 @@ def profile_batch_execution(
     # Track token counts for decode requests (starts at initial context length from dummy prefill)
     decode_token_counts = decode_gen_lens.copy() if decode_gen_lens else []
     
+    # Generate persistent prefill request IDs for precomputation
+    prefill_req_ids = [f"prefill_req_{test_id}_{i}" for i in range(len(prefill_ctx_lens))]
+    prefill_precomputed_initialized = False  # Track if prefill precomputation is done
+    
     # Warmup + timed iterations
     all_latencies = []
     previous_prefill_req_ids = set()  # Track prefill request IDs to clean up
-    decode_initialized = False  # Track if decode requests have been initialized
+    decode_initialized_count = 0  # Track how many decode requests initialized
     
     # Start power monitoring if enabled
     power_monitor_process = None
@@ -314,18 +379,52 @@ def profile_batch_execution(
             },
             daemon=True
         )
-        power_monitor_process.start()
-        time.sleep(0.5)  # Give power monitor time to initialize
     
-    for iteration in range(warmup + repeat):
-        # First iteration: Initialize decode requests as dummy prefill
-        # This populates the model runner's state so they can be used as cached requests later
-        if iteration == 0 and decode_gen_lens:
-            # Create dummy prefill for decode requests to initialize them
-            # Use decode_gen_lens as the context lengths for dummy prefill
-            dummy_prefill_lens = decode_gen_lens.copy()
+    iteration = 0
+    profiling_start_time = None
+    
+    while True:
+        # Check termination condition
+        if iteration >= warmup:
+            # We're in profiling phase
+            if use_runtime_mode:
+                if profiling_start_time is None:
+                    profiling_start_time = time.perf_counter()
+                elapsed = time.perf_counter() - profiling_start_time
+                if elapsed >= runtime:
+                    break
+            else:
+                # repeat mode
+                if len(all_latencies) >= repeat:
+                    break
+        
+        # During warmup: Initialize prefill precomputation and decode requests
+        # Prefill precomputation: Initialize prefill requests with precomputed tokens
+        if iteration < warmup and prefill_precomputed_tokens and not prefill_precomputed_initialized:
+            # Create prefill requests with only the precomputed portion to initialize KV cache
+            # We only need to compute up to the precomputed tokens during initialization
+            scheduler_output = create_fake_scheduler_output(
+                prefill_ctx_lens=prefill_precomputed_tokens,  # Only process precomputed portion
+                decode_gen_lens=[],  # No decode during prefill precomputation
+                block_size=block_size,
+                num_kv_groups=num_kv_groups,
+                iteration=iteration,
+                prefill_precomputed_tokens=[0] * len(prefill_precomputed_tokens),  # Process all tokens in precomputed portion
+                decode_req_ids=[],
+            )
             
-            # Create new requests for actual prefill
+            # Override request IDs to use persistent IDs
+            for i, req in enumerate(scheduler_output.scheduled_new_reqs):
+                old_req_id = req.req_id
+                req.req_id = prefill_req_ids[i]
+                scheduler_output.num_scheduled_tokens[prefill_req_ids[i]] = scheduler_output.num_scheduled_tokens.pop(old_req_id)
+            
+            prefill_precomputed_initialized = True
+            logger.info(f"Warmup {iteration+1}/{warmup}: Initialized prefill precomputation for {len(prefill_ctx_lens)} requests")
+        # During warmup: Initialize decode requests as dummy prefill
+        # Spread initialization across iterations to respect max_num_batched_tokens
+        elif iteration < warmup and decode_gen_lens and decode_initialized_count < len(decode_gen_lens):
+            # Create base scheduler output with prefill requests
             scheduler_output = create_fake_scheduler_output(
                 prefill_ctx_lens=prefill_ctx_lens,
                 decode_gen_lens=[],  # No decode yet
@@ -336,33 +435,105 @@ def profile_batch_execution(
                 decode_req_ids=[],
             )
             
-            # Add dummy prefill requests for decode initialization using persistent IDs
-            for i, (req_id, ctx_len) in enumerate(zip(decode_req_ids, dummy_prefill_lens)):
+            # Calculate how many tokens we can use for decode initialization
+            prefill_tokens = sum(prefill_ctx_lens) if prefill_ctx_lens else 0
+            available_tokens = max_num_batched_tokens - prefill_tokens
+            
+            # If prefill alone exceeds limit, skip prefill in decode init iterations
+            if available_tokens <= 0:
+                # Clear prefill from this iteration
+                scheduler_output.scheduled_new_reqs = []
+                scheduler_output.num_scheduled_tokens = {}
+                scheduler_output.total_num_scheduled_tokens = 0
+                available_tokens = max_num_batched_tokens
+            
+            # Add as many decode requests as fit within the token limit
+            tokens_used = 0
+            while decode_initialized_count < len(decode_gen_lens):
+                ctx_len = decode_gen_lens[decode_initialized_count]
+                if tokens_used + ctx_len > available_tokens:
+                    break
+                
+                req_id = decode_req_ids[decode_initialized_count]
                 new_req = create_fake_new_request(
                     req_id, ctx_len, block_size, num_kv_groups, num_computed_tokens=0
                 )
                 scheduler_output.scheduled_new_reqs.append(new_req)
-                # Update token counts
                 scheduler_output.num_scheduled_tokens[req_id] = ctx_len
                 scheduler_output.total_num_scheduled_tokens += ctx_len
+                
+                tokens_used += ctx_len
+                decode_initialized_count += 1
             
-            decode_initialized = True
-        else:
-            # Normal profiling with actual batch composition
+            logger.info(f"Warmup {iteration+1}/{warmup}: Initialized {decode_initialized_count}/{len(decode_gen_lens)} decode requests")
+        elif iteration < warmup:
+            # Remaining warmup iterations without special initialization
+            # Just create empty scheduler output to advance warmup
             scheduler_output = create_fake_scheduler_output(
-                prefill_ctx_lens=prefill_ctx_lens,
-                decode_gen_lens=decode_gen_lens if decode_initialized else [],
+                prefill_ctx_lens=[],
+                decode_gen_lens=[],
                 block_size=block_size,
                 num_kv_groups=num_kv_groups,
                 iteration=iteration,
-                prefill_precomputed_tokens=prefill_precomputed_tokens,
-                decode_req_ids=decode_req_ids if decode_initialized else [],
-                decode_token_counts=decode_token_counts if decode_initialized else [],
             )
+            logger.info(f"Warmup {iteration+1}/{warmup}: No action")
+        else:
+            if iteration == warmup and power_monitor_process is not None:
+                power_monitor_process.start()
+            # Normal profiling with actual batch composition
+            decode_fully_initialized = (decode_initialized_count == len(decode_gen_lens))
             
-            # Don't update decode token counts - keep them constant for profiling
-            # This ensures we're profiling the same batch configuration repeatedly
-            # rather than simulating decode progression
+            # For prefill requests: use persistent IDs and precomputed tokens if initialized
+            if prefill_precomputed_initialized:
+                # Create scheduler output with decode requests
+                scheduler_output = create_fake_scheduler_output(
+                    prefill_ctx_lens=[],
+                    decode_gen_lens=decode_gen_lens if decode_fully_initialized else [],
+                    block_size=block_size,
+                    num_kv_groups=num_kv_groups,
+                    iteration=iteration,
+                    prefill_precomputed_tokens=None,
+                    decode_req_ids=decode_req_ids if decode_fully_initialized else [],
+                    decode_token_counts=decode_token_counts if decode_fully_initialized else [],
+                )
+                
+                # Add prefill requests as NEW requests with full context and num_computed_tokens set
+                # This allows the model runner to use cached KV from warmup while processing remaining tokens
+                if prefill_ctx_lens:
+                    for i, (ctx_len, num_precomputed) in enumerate(zip(prefill_ctx_lens, prefill_precomputed_tokens)):
+                        req_id = prefill_req_ids[i]
+                        
+                        # Create as NewRequestData with full context but indicate precomputed tokens
+                        new_req = create_fake_new_request(
+                            req_id=req_id,
+                            context_length=ctx_len,
+                            block_size=block_size,
+                            num_kv_groups=num_kv_groups,
+                            num_computed_tokens=num_precomputed,
+                        )
+                        
+                        scheduler_output.scheduled_new_reqs.append(new_req)
+                        scheduler_output.num_scheduled_tokens[req_id] = ctx_len - num_precomputed
+                        scheduler_output.total_num_scheduled_tokens += ctx_len - num_precomputed
+            else:
+                # No precomputation: create normal prefill requests
+                scheduler_output = create_fake_scheduler_output(
+                    prefill_ctx_lens=prefill_ctx_lens,
+                    decode_gen_lens=decode_gen_lens if decode_fully_initialized else [],
+                    block_size=block_size,
+                    num_kv_groups=num_kv_groups,
+                    iteration=iteration,
+                    prefill_precomputed_tokens=prefill_precomputed_tokens,
+                    decode_req_ids=decode_req_ids if decode_fully_initialized else [],
+                    decode_token_counts=decode_token_counts if decode_fully_initialized else [],
+                )
+            
+            # Update decode token counts to match model runner's internal state
+            # The model runner tracks output tokens internally, so num_computed_tokens
+            # must increment each iteration to stay in sync
+            if decode_fully_initialized:
+                for i in range(len(decode_token_counts)):
+                    decode_token_counts[i] += 1
         
         # Mark previous iteration's PREFILL requests as finished (decode requests persist)
         scheduler_output.finished_req_ids = previous_prefill_req_ids
@@ -370,16 +541,19 @@ def profile_batch_execution(
         # Track current prefill request IDs for next iteration cleanup
         current_prefill_req_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
         # Don't include decode request IDs - they stay alive across iterations
-        if iteration == 0 and decode_gen_lens:
-            # Remove decode request IDs from the set to finish
-            current_prefill_req_ids -= set(decode_req_ids)
+        if iteration < warmup and decode_gen_lens:
+            # Remove decode request IDs from the set to finish (they persist)
+            current_prefill_req_ids -= set(decode_req_ids[:decode_initialized_count])
+        # Don't finish prefill requests with precomputation - they persist
+        if prefill_precomputed_initialized and iteration < warmup:
+            current_prefill_req_ids -= set(prefill_req_ids)
         previous_prefill_req_ids = current_prefill_req_ids
         
         torch.cuda.synchronize()
         start_time = time.perf_counter()
         
-        # print(scheduler_output)
         ret = executor.execute_model(scheduler_output, non_block=False)
+        # print(scheduler_output)
         # print(ret)
         # print("\n\n")
         
@@ -392,8 +566,15 @@ def profile_batch_execution(
             logger.info(f"Warmup iteration {iteration+1}/{warmup}: {latency_ms:.2f}ms")
         else:
             all_latencies.append(latency_ms)
-            if (len(all_latencies)) % max(1, repeat // 10) == 0:
-                logger.info(f"Timed iteration {len(all_latencies)}/{repeat}: {latency_ms:.2f}ms")
+            if use_runtime_mode:
+                elapsed = time.perf_counter() - profiling_start_time
+                if len(all_latencies) % max(1, 10) == 0 or elapsed >= runtime:
+                    logger.info(f"Profiling iteration {len(all_latencies)}: {latency_ms:.2f}ms (elapsed: {elapsed:.1f}s/{runtime}s)")
+            else:
+                if (len(all_latencies)) % max(1, repeat // 10) == 0:
+                    logger.info(f"Timed iteration {len(all_latencies)}/{repeat}: {latency_ms:.2f}ms")
+        
+        iteration += 1
     
     # Stop power monitoring
     if power_monitor_process is not None:
@@ -412,9 +593,25 @@ def profile_batch_execution(
         "p95_ms": np.percentile(all_latencies, 95),
         "p99_ms": np.percentile(all_latencies, 99),
         "num_prefill_reqs": len(prefill_ctx_lens),
+        "mean_ctx_len": np.mean(prefill_ctx_lens) if prefill_ctx_lens else 0,
+        "std_ctx_len": np.std(prefill_ctx_lens) if prefill_ctx_lens else 0,
         "num_decode_reqs": len(decode_gen_lens),
-        "total_tokens": sum(prefill_ctx_lens) + len(decode_gen_lens),  # prefill tokens + 1 token per decode
+        "mean_decode_len": np.mean(decode_gen_lens) + (iteration/2) if decode_gen_lens else 0,
+        "std_decode_len": np.std(decode_gen_lens) if decode_gen_lens else 0,
         "prefill_precomputed_tokens": prefill_precomputed_tokens,
+        "mean_ctx_len_w_precomputed": (
+            np.mean([cl + pt for cl, pt in zip(prefill_ctx_lens, prefill_precomputed_tokens)])
+            if prefill_precomputed_tokens else np.mean(prefill_ctx_lens) if prefill_ctx_lens else 0
+        ),
+        "std_ctx_len_w_precomputed": (
+            np.std([cl + pt for cl, pt in zip(prefill_ctx_lens, prefill_precomputed_tokens)])
+            if prefill_precomputed_tokens else np.std(prefill_ctx_lens) if prefill_ctx_lens else 0
+        ),
+        "num_iterations": len(all_latencies),
+        "total_profiling_time_s": sum(all_latencies) / 1000,
+        "mode": "runtime" if use_runtime_mode else "repeat",
+        "target_runtime_s": runtime if use_runtime_mode else None,
+        "target_repeat": repeat if not use_runtime_mode else None,
     }
 
 
@@ -424,6 +621,9 @@ def run_single_test(
     block_size: int,
     num_kv_groups: int,
     model_name: str,
+    max_num_batched_tokens: int,
+    repeat: int = None,
+    runtime: float = None,
     cleanup_previous_test: bool = False,
     save_dir: Optional[Path] = None,
     enable_power_logging: bool = False,
@@ -433,8 +633,6 @@ def run_single_test(
     prefill_ctx_lens = test_config.get("prefill_ctx_lens", [])
     prefill_precomputed_tokens = test_config.get("prefill_precomputed_tokens", None)
     decode_gen_lens = test_config.get("decode_gen_lens", [])
-    repeat = test_config.get("repeat", 10)
-    warmup = test_config.get("warmup", 2)
     
     logger.info(f"\n{'='*80}")
     logger.info(f"Running test: {test_name}")
@@ -492,11 +690,12 @@ def run_single_test(
         block_size=block_size,
         num_kv_groups=num_kv_groups,
         repeat=repeat,
-        warmup=warmup,
+        runtime=runtime,
         prefill_precomputed_tokens=prefill_precomputed_tokens,
         test_id=test_name,
         enable_power_logging=enable_power_logging,
         power_log_file=power_log_file,
+        max_num_batched_tokens=max_num_batched_tokens,
     )
     
     # Add test metadata to results
@@ -603,26 +802,26 @@ def main():
     parser.add_argument(
         "--repeat",
         type=int,
-        default=10,
-        help="Number of times to repeat each batch for averaging",
+        default=None,
+        help="Number of times to repeat each batch for averaging (mutually exclusive with --runtime)",
     )
     parser.add_argument(
-        "--warmup",
-        type=int,
-        default=2,
-        help="Number of warmup iterations before measurement",
+        "--runtime",
+        type=float,
+        default=None,
+        help="Runtime in seconds for profiling each test (mutually exclusive with --repeat)",
     )
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.8,
-        help="Fraction of GPU memory to use for KV cache (default: 0.8)",
+        default=0.6,
+        help="Fraction of GPU memory to use for KV cache (default: 0.6)",
     )
     parser.add_argument(
         "--max-num-seqs",
         type=int,
-        default=2048,
-        help="Maximum number of sequences that can be processed (default: 2048)",
+        default=1024,
+        help="Maximum number of sequences that can be processed (default: 1024)",
     )
     parser.add_argument(
         "--max-num-batched-tokens",
@@ -640,6 +839,8 @@ def main():
     
     # Load config file if provided
     save_dir = None
+    repeat = args.repeat  # Default from command line
+    runtime = args.runtime
     if args.config_file:
         config_path = Path(args.config_file)
         if not config_path.exists():
@@ -651,6 +852,21 @@ def main():
         test_configs = config.get("tests", [])
         if not test_configs:
             parser.error("Config file must contain 'tests' array")
+        
+        # Get repeat or runtime from config, fall back to command line arg
+        config_repeat = config.get("repeat", None)
+        config_runtime = config.get("runtime", None)
+        
+        # Validate config has exactly one
+        if config_repeat is None and config_runtime is None:
+            # Use command line values (already validated)
+            pass
+        elif config_repeat is not None and config_runtime is not None:
+            parser.error("Config file cannot specify both 'repeat' and 'runtime'")
+        else:
+            # Config overrides command line
+            repeat = config_repeat if config_repeat is not None else None
+            runtime = config_runtime if config_runtime is not None else None
         
         # Get save directory from config
         save_dir_str = config.get("save_dir", None)
@@ -673,9 +889,14 @@ def main():
             "prefill_ctx_lens": args.prefill_ctx_lens,
             "prefill_precomputed_tokens": args.prefill_precomputed_tokens,
             "decode_gen_lens": args.decode_gen_lens,
-            "repeat": args.repeat,
-            "warmup": args.warmup,
         }]
+        # repeat and runtime already set from args
+    
+    # Validate that exactly one of repeat or runtime is provided
+    if repeat is None and runtime is None:
+        parser.error("Either --repeat or --runtime must be specified (via command line or config file)")
+    if repeat is not None and runtime is not None:
+        parser.error("Cannot specify both --repeat and --runtime")
     
     # Validate test configurations
     for test_idx, test_config in enumerate(test_configs):
@@ -742,13 +963,16 @@ def main():
     logger.info(f"Starting profiling with {len(test_configs)} test(s)...")
     all_results = []
     
-    for test_idx, test_config in enumerate(test_configs):
+    for test_idx, test_config in enumerate(tqdm(test_configs, desc="Tests", unit="test")):
         result = run_single_test(
             executor=executor,
             test_config=test_config,
             block_size=args.block_size,
             num_kv_groups=num_kv_groups,
             model_name=args.model,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            repeat=repeat,
+            runtime=runtime,
             cleanup_previous_test=(test_idx > 0),  # Clean up before 2nd+ tests
             save_dir=save_dir,
             enable_power_logging=args.enable_power_logging,
