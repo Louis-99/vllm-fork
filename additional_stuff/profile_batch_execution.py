@@ -374,7 +374,7 @@ def profile_batch_execution(
             kwargs={
                 'interval': 0.01,  # 10ms sampling interval
                 'csv_filename': str(power_log_file),
-                'log_interval': 1.0,  # Write to CSV every 1 second
+                'log_interval': 0.3,  # Write to CSV every 0.3 seconds
                 'power_queue': None,
             },
             daemon=True
@@ -814,8 +814,8 @@ def main():
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.8,
-        help="Fraction of GPU memory to use for KV cache (default: 0.8)",
+        default=0.5,
+        help="Fraction of GPU memory to use for KV cache (default: 0.5)",
     )
     parser.add_argument(
         "--max-num-seqs",
@@ -1001,6 +1001,12 @@ def main():
             enable_power_logging=args.enable_power_logging,
         )
         all_results.append(result)
+
+    # Shutdown executor across all ranks
+    logger.info("Shutting down executor...")
+    executor.shutdown()
+
+    
     
     # Print summary
     # print("\n" + "="*80)
