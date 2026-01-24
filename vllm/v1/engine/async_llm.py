@@ -88,6 +88,11 @@ class AsyncLLM(EngineClient):
         Returns:
             None
         """
+
+        import gc
+        logger.info('Disable GC in AsyncLLM')
+        gc.disable()
+        
         if not envs.VLLM_USE_V1:
             raise ValueError(
                 "Using V1 AsyncLLMEngine, but envs.VLLM_USE_V1=False. "

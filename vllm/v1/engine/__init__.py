@@ -174,7 +174,8 @@ class EngineCoreOutputs(
 
     def __post_init__(self):
         if self.timestamp == 0.0:
-            self.timestamp = time.monotonic()
+            # self.timestamp = time.monotonic()
+            self.timestamp = time.time()
 
 
 class EngineCoreRequestType(enum.Enum):

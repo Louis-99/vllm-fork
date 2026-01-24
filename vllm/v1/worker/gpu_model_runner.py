@@ -158,7 +158,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-    ):
+    ):  
+        import gc
+        logger.info('Disable GC in GPUModelRunner')
+        gc.disable()
+        
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
