@@ -46,54 +46,44 @@ logger = init_logger(__name__)
 
 
 def calculate_warmup_iterations(
-    prefill_ctx_lens: list[int],
+    prefill_precomputed_tokens: list[int],
     decode_gen_lens: list[int],
     max_num_batched_tokens: int,
-) -> int:
+) -> tuple[int, int, int]:
     """
-    Calculate number of warmup iterations needed to initialize decode requests
-    without violating max_num_batched_tokens limit.
+    Calculate number of warmup iterations needed for each phase.
+    
+    Warmup is split into separate phases to avoid bin-packing complexity:
+    - Phase 1: Prefill precomputation (if prefill_precomputed_tokens provided)
+    - Phase 2: Decode initialization (decode requests initialized as prefill)
+    - Phase 3: 1 extra iteration for any spillover from both phases
     
     Args:
-        prefill_ctx_lens: Context lengths for prefill requests
+        prefill_precomputed_tokens: List of pre-computed tokens per prefill request (or None)
         decode_gen_lens: Context lengths for decode initialization
         max_num_batched_tokens: Maximum tokens per batch
     
     Returns:
-        Number of warmup iterations needed (minimum 2)
+        Tuple of (prefill_precompute_iters, decode_init_iters, extra_iter)
     """
-    if not decode_gen_lens:
-        # No decode requests, use default warmup
-        return 2
+    # Phase 1: Calculate iterations for prefill precomputation
+    prefill_precompute_iters = 0
+    if prefill_precomputed_tokens:
+        total_precompute_tokens = sum(prefill_precomputed_tokens)
+        if total_precompute_tokens > 0:
+            prefill_precompute_iters = (total_precompute_tokens + max_num_batched_tokens - 1) // max_num_batched_tokens
     
-    # Calculate tokens needed for prefill requests
-    prefill_tokens = sum(prefill_ctx_lens)
+    # Phase 2: Calculate iterations for decode initialization
+    decode_init_iters = 0
+    if decode_gen_lens:
+        total_decode_init_tokens = sum(decode_gen_lens)
+        if total_decode_init_tokens > 0:
+            decode_init_iters = (total_decode_init_tokens + max_num_batched_tokens - 1) // max_num_batched_tokens
     
-    # Calculate total tokens needed for decode initialization (all as prefill)
-    decode_init_tokens = sum(decode_gen_lens)
+    # Phase 3: 1 extra warmup iteration (for GPU warmup and any edge cases)
+    extra_iter = 1
     
-    # If both prefill and decode init fit in one batch, use default warmup
-    if prefill_tokens + decode_init_tokens <= max_num_batched_tokens:
-        return 2
-    
-    # Need to spread decode initialization across multiple iterations
-    # Each warmup iteration can initialize decode requests up to the limit
-    available_tokens_per_iter = max_num_batched_tokens - prefill_tokens
-    
-    if available_tokens_per_iter <= 0:
-        # Prefill alone exceeds limit - still need at least 2 warmup iterations
-        # Decode will be initialized in subsequent iterations without prefill
-        available_tokens_per_iter = max_num_batched_tokens
-        
-        # Calculate iterations needed for decode init (after first iteration with prefill)
-        warmup_for_decode = (decode_init_tokens + available_tokens_per_iter - 1) // available_tokens_per_iter
-        return 1 + warmup_for_decode  # 1 for prefill + N for decode init
-    
-    # Calculate how many warmup iterations needed to initialize all decode requests
-    warmup_for_decode = (decode_init_tokens + available_tokens_per_iter - 1) // available_tokens_per_iter
-    
-    # Return at least 2, but more if needed for decode initialization
-    return max(2, warmup_for_decode)
+    return prefill_precompute_iters, decode_init_iters, extra_iter
 
 
 def create_fake_block_ids(
@@ -271,8 +261,9 @@ def create_fake_scheduler_output(
     total_num_scheduled_tokens = 0
     
     for req in scheduled_new_reqs:
-        # For prefill, schedule all prompt tokens
-        num_tokens = len(req.prompt_token_ids)
+        # For prefill, schedule (prompt_tokens - num_computed_tokens)
+        # num_computed_tokens are already in KV cache (precomputed)
+        num_tokens = len(req.prompt_token_ids) - req.num_computed_tokens
         num_scheduled_tokens[req.req_id] = num_tokens
         total_num_scheduled_tokens += num_tokens
     
@@ -336,19 +327,21 @@ def profile_batch_execution(
         raise ValueError("Cannot specify both 'repeat' and 'runtime'")
     
     use_runtime_mode = runtime is not None
-    # Calculate warmup iterations based on decode initialization needs
-    warmup = calculate_warmup_iterations(
-        prefill_ctx_lens, decode_gen_lens, max_num_batched_tokens
-    )
     
-    logger.info(
-        f"Profiling batch: {len(prefill_ctx_lens)} prefill reqs, "
-        f"{len(decode_gen_lens)} decode reqs, "
-        f"ctx_lens: {prefill_ctx_lens}, decode_lens: {decode_gen_lens}, "
-        f"prefill_precomputed_tokens: {prefill_precomputed_tokens}, "
-        f"warmup iterations: {warmup}, "
-        f"mode: {'runtime=' + str(runtime) + 's' if use_runtime_mode else 'repeat=' + str(repeat)}"
+    # Calculate warmup iterations for each phase
+    prefill_precompute_iters, decode_init_iters, extra_iter = calculate_warmup_iterations(
+        prefill_precomputed_tokens, decode_gen_lens, max_num_batched_tokens
     )
+    total_warmup = prefill_precompute_iters + decode_init_iters + extra_iter
+    
+    # print(
+    #     f"Profiling batch: {len(prefill_ctx_lens)} prefill reqs, "
+    #     f"{len(decode_gen_lens)} decode reqs, "
+    #     f"ctx_lens: {prefill_ctx_lens}, decode_lens: {decode_gen_lens}, "
+    #     f"prefill_precomputed_tokens: {prefill_precomputed_tokens}, "
+    #     f"warmup phases: prefill_precompute={prefill_precompute_iters}, decode_init={decode_init_iters}, extra={extra_iter} (total={total_warmup}), "
+    #     f"mode: {'runtime=' + str(runtime) + 's' if use_runtime_mode else 'repeat=' + str(repeat)}"
+    # )
     
     # Generate persistent decode request IDs (unique per test)
     decode_req_ids = [f"decode_req_{test_id}_{i}" for i in range(len(decode_gen_lens))]
@@ -358,12 +351,18 @@ def profile_batch_execution(
     
     # Generate persistent prefill request IDs for precomputation
     prefill_req_ids = [f"prefill_req_{test_id}_{i}" for i in range(len(prefill_ctx_lens))]
-    prefill_precomputed_initialized = False  # Track if prefill precomputation is done
+
+    # Track warmup precomputation request IDs (will be finished before profiling)
+    warmup_precompute_req_ids = set()
+
+    # Warmup phase tracking
+    prefill_precomputed_count = 0  # Track how many prefill precomputed tokens processed
+    decode_initialized_count = 0  # Track how many decode requests initialized
+    total_prefill_precompute_tokens = sum(prefill_precomputed_tokens) if prefill_precomputed_tokens else 0
     
     # Warmup + timed iterations
     all_latencies = []
-    previous_prefill_req_ids = set()  # Track prefill request IDs to clean up
-    decode_initialized_count = 0  # Track how many decode requests initialized
+    previous_req_ids_to_finish = set()  # Track request IDs to clean up
     
     # Start power monitoring if enabled
     power_monitor_process = None
@@ -380,78 +379,103 @@ def profile_batch_execution(
             daemon=True
         )
     
-    iteration = 0
-    profiling_start_time = None
-    
-    while True:
-        # Check termination condition
-        if iteration >= warmup:
-            # We're in profiling phase
-            if use_runtime_mode:
-                if profiling_start_time is None:
-                    profiling_start_time = time.perf_counter()
-                elapsed = time.perf_counter() - profiling_start_time
-                if elapsed >= runtime:
-                    break
-            else:
-                # repeat mode
-                if len(all_latencies) >= repeat:
-                    break
+    # ========== WARMUP PHASE 1: Prefill Precomputation ==========
+    if prefill_precompute_iters > 0:
+        # print(f"\n=== Warmup Phase 1: Prefill Precomputation ({prefill_precompute_iters} iterations) ===")
         
-        # During warmup: Initialize prefill precomputation and decode requests
-        # Prefill precomputation: Initialize prefill requests with precomputed tokens
-        if iteration < warmup and prefill_precomputed_tokens and not prefill_precomputed_initialized:
-            # Create prefill requests with only the precomputed portion to initialize KV cache
-            # We only need to compute up to the precomputed tokens during initialization
-            scheduler_output = create_fake_scheduler_output(
-                prefill_ctx_lens=prefill_precomputed_tokens,  # Only process precomputed portion
-                decode_gen_lens=[],  # No decode during prefill precomputation
-                block_size=block_size,
-                num_kv_groups=num_kv_groups,
-                iteration=iteration,
-                prefill_precomputed_tokens=[0] * len(prefill_precomputed_tokens),  # Process all tokens in precomputed portion
-                decode_req_ids=[],
+        for phase1_iter in range(prefill_precompute_iters):
+            # Build batch with as many prefill precompute requests as fit
+            scheduler_output = SchedulerOutput(
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData(
+                    req_ids=[], resumed_from_preemption=[], new_token_ids=[],
+                    new_block_ids=[], num_computed_tokens=[],
+                ),
+                num_scheduled_tokens={},
+                total_num_scheduled_tokens=0,
+                scheduled_spec_decode_tokens={},
+                scheduled_encoder_inputs={},
+                num_common_prefix_blocks=[0] * num_kv_groups,
+                finished_req_ids=previous_req_ids_to_finish,
+                free_encoder_mm_hashes=[],
+                structured_output_request_ids={},
+                grammar_bitmask=None,
+                kv_connector_metadata=None,
+                batch_ID=0,
             )
             
-            # Override request IDs to use persistent IDs
-            for i, req in enumerate(scheduler_output.scheduled_new_reqs):
-                old_req_id = req.req_id
-                req.req_id = prefill_req_ids[i]
-                scheduler_output.num_scheduled_tokens[prefill_req_ids[i]] = scheduler_output.num_scheduled_tokens.pop(old_req_id)
-            
-            prefill_precomputed_initialized = True
-            logger.info(f"Warmup {iteration+1}/{warmup}: Initialized prefill precomputation for {len(prefill_ctx_lens)} requests")
-        # During warmup: Initialize decode requests as dummy prefill
-        # Spread initialization across iterations to respect max_num_batched_tokens
-        elif iteration < warmup and decode_gen_lens and decode_initialized_count < len(decode_gen_lens):
-            # Create base scheduler output with prefill requests
-            scheduler_output = create_fake_scheduler_output(
-                prefill_ctx_lens=prefill_ctx_lens,
-                decode_gen_lens=[],  # No decode yet
-                block_size=block_size,
-                num_kv_groups=num_kv_groups,
-                iteration=iteration,
-                prefill_precomputed_tokens=prefill_precomputed_tokens,
-                decode_req_ids=[],
-            )
-            
-            # Calculate how many tokens we can use for decode initialization
-            prefill_tokens = sum(prefill_ctx_lens) if prefill_ctx_lens else 0
-            available_tokens = max_num_batched_tokens - prefill_tokens
-            
-            # If prefill alone exceeds limit, skip prefill in decode init iterations
-            if available_tokens <= 0:
-                # Clear prefill from this iteration
-                scheduler_output.scheduled_new_reqs = []
-                scheduler_output.num_scheduled_tokens = {}
-                scheduler_output.total_num_scheduled_tokens = 0
-                available_tokens = max_num_batched_tokens
-            
-            # Add as many decode requests as fit within the token limit
             tokens_used = 0
+            reqs_in_batch = 0
+            while prefill_precomputed_count < len(prefill_precomputed_tokens):
+                precompute_len = prefill_precomputed_tokens[prefill_precomputed_count]
+                
+                # Skip entries with 0 precomputed tokens (these are handled as fresh prefill each iteration)
+                if precompute_len == 0:
+                    prefill_precomputed_count += 1
+                    continue
+                
+                if tokens_used + precompute_len > max_num_batched_tokens:
+                    break
+                
+                # Use warmup-specific IDs for precomputation (will be finished after warmup)
+                req_id = f"warmup_precompute_{test_id}_{prefill_precomputed_count}"
+                new_req = create_fake_new_request(
+                    req_id, precompute_len, block_size, num_kv_groups, num_computed_tokens=0
+                )
+                scheduler_output.scheduled_new_reqs.append(new_req)
+                scheduler_output.num_scheduled_tokens[req_id] = precompute_len
+                scheduler_output.total_num_scheduled_tokens += precompute_len
+                
+                warmup_precompute_req_ids.add(req_id)  # Track for cleanup
+                tokens_used += precompute_len
+                prefill_precomputed_count += 1
+                reqs_in_batch += 1
+            
+            # Track these request IDs - they should NOT be finished (they persist)
+            previous_req_ids_to_finish = set()  # Don't finish prefill precompute requests
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            executor.execute_model(scheduler_output, non_block=False)
+            torch.cuda.synchronize()
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            
+            # print(f"  Phase 1 iter {phase1_iter+1}/{prefill_precompute_iters}: "
+            #       f"Initialized {prefill_precomputed_count}/{len(prefill_precomputed_tokens)} prefill precompute reqs, "
+            #       f"{tokens_used} tokens, {latency_ms:.2f}ms")
+
+    # ========== WARMUP PHASE 2: Decode Initialization ==========
+    if decode_init_iters > 0:
+        # print(f"\n=== Warmup Phase 2: Decode Initialization ({decode_init_iters} iterations) ===")
+        
+        for phase2_iter in range(decode_init_iters):
+            # Build batch with as many decode init requests as fit
+            scheduler_output = SchedulerOutput(
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData(
+                    req_ids=[], resumed_from_preemption=[], new_token_ids=[],
+                    new_block_ids=[], num_computed_tokens=[],
+                ),
+                num_scheduled_tokens={},
+                total_num_scheduled_tokens=0,
+                scheduled_spec_decode_tokens={},
+                scheduled_encoder_inputs={},
+                num_common_prefix_blocks=[0] * num_kv_groups,
+                finished_req_ids=previous_req_ids_to_finish,
+                free_encoder_mm_hashes=[],
+                structured_output_request_ids={},
+                grammar_bitmask=None,
+                kv_connector_metadata=None,
+                batch_ID=0,
+            )
+            
+            tokens_used = 0
+            reqs_in_batch = 0
+            start_idx = decode_initialized_count
+            
             while decode_initialized_count < len(decode_gen_lens):
                 ctx_len = decode_gen_lens[decode_initialized_count]
-                if tokens_used + ctx_len > available_tokens:
+                if tokens_used + ctx_len > max_num_batched_tokens:
                     break
                 
                 req_id = decode_req_ids[decode_initialized_count]
@@ -464,117 +488,194 @@ def profile_batch_execution(
                 
                 tokens_used += ctx_len
                 decode_initialized_count += 1
+                reqs_in_batch += 1
             
-            logger.info(f"Warmup {iteration+1}/{warmup}: Initialized {decode_initialized_count}/{len(decode_gen_lens)} decode requests")
-        elif iteration < warmup:
-            # Remaining warmup iterations without special initialization
-            # Just create empty scheduler output to advance warmup
-            scheduler_output = create_fake_scheduler_output(
-                prefill_ctx_lens=[],
-                decode_gen_lens=[],
-                block_size=block_size,
-                num_kv_groups=num_kv_groups,
-                iteration=iteration,
-            )
-            logger.info(f"Warmup {iteration+1}/{warmup}: No action")
-        else:
-            if iteration == warmup and power_monitor_process is not None:
-                power_monitor_process.start()
-            # Normal profiling with actual batch composition
-            decode_fully_initialized = (decode_initialized_count == len(decode_gen_lens))
+            # Track these request IDs - they should NOT be finished (they persist)
+            previous_req_ids_to_finish = set()  # Don't finish decode init requests
             
-            # For prefill requests: use persistent IDs and precomputed tokens if initialized
-            if prefill_precomputed_initialized:
-                # Create scheduler output with decode requests
-                scheduler_output = create_fake_scheduler_output(
-                    prefill_ctx_lens=[],
-                    decode_gen_lens=decode_gen_lens if decode_fully_initialized else [],
-                    block_size=block_size,
-                    num_kv_groups=num_kv_groups,
-                    iteration=iteration,
-                    prefill_precomputed_tokens=None,
-                    decode_req_ids=decode_req_ids if decode_fully_initialized else [],
-                    decode_token_counts=decode_token_counts if decode_fully_initialized else [],
-                )
-                
-                # Add prefill requests as NEW requests with full context and num_computed_tokens set
-                # This allows the model runner to use cached KV from warmup while processing remaining tokens
-                if prefill_ctx_lens:
-                    for i, (ctx_len, num_precomputed) in enumerate(zip(prefill_ctx_lens, prefill_precomputed_tokens)):
-                        req_id = prefill_req_ids[i]
-                        
-                        # Create as NewRequestData with full context but indicate precomputed tokens
-                        new_req = create_fake_new_request(
-                            req_id=req_id,
-                            context_length=ctx_len,
-                            block_size=block_size,
-                            num_kv_groups=num_kv_groups,
-                            num_computed_tokens=num_precomputed,
-                        )
-                        
-                        scheduler_output.scheduled_new_reqs.append(new_req)
-                        scheduler_output.num_scheduled_tokens[req_id] = ctx_len - num_precomputed
-                        scheduler_output.total_num_scheduled_tokens += ctx_len - num_precomputed
-            else:
-                # No precomputation: create normal prefill requests
-                scheduler_output = create_fake_scheduler_output(
-                    prefill_ctx_lens=prefill_ctx_lens,
-                    decode_gen_lens=decode_gen_lens if decode_fully_initialized else [],
-                    block_size=block_size,
-                    num_kv_groups=num_kv_groups,
-                    iteration=iteration,
-                    prefill_precomputed_tokens=prefill_precomputed_tokens,
-                    decode_req_ids=decode_req_ids if decode_fully_initialized else [],
-                    decode_token_counts=decode_token_counts if decode_fully_initialized else [],
-                )
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            executor.execute_model(scheduler_output, non_block=False)
+            torch.cuda.synchronize()
+            latency_ms = (time.perf_counter() - start_time) * 1000
             
-            # Update decode token counts to match model runner's internal state
-            # The model runner tracks output tokens internally, so num_computed_tokens
-            # must increment each iteration to stay in sync
-            if decode_fully_initialized:
-                for i in range(len(decode_token_counts)):
-                    decode_token_counts[i] += 1
+            # print(f"  Phase 2 iter {phase2_iter+1}/{decode_init_iters}: "
+            #       f"Initialized {decode_initialized_count}/{len(decode_gen_lens)} decode reqs, "
+            #       f"{tokens_used} tokens, {latency_ms:.2f}ms")
+    
+    # ========== WARMUP PHASE 3: Extra warmup iteration ==========
+    # print(f"\n=== Warmup Phase 3: Extra warmup ({extra_iter} iteration) ===")
+    
+    # This phase handles any spillover and ensures GPU is fully warmed up
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(
+            req_ids=[], resumed_from_preemption=[], new_token_ids=[],
+            new_block_ids=[], num_computed_tokens=[],
+        ),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[0] * num_kv_groups,
+        finished_req_ids=previous_req_ids_to_finish,
+        free_encoder_mm_hashes=[],
+        structured_output_request_ids={},
+        grammar_bitmask=None,
+        kv_connector_metadata=None,
+        batch_ID=0,
+    )
+    
+    tokens_used = 0
+    
+    # Add any remaining prefill precompute requests
+    while prefill_precomputed_tokens and prefill_precomputed_count < len(prefill_precomputed_tokens):
+        precompute_len = prefill_precomputed_tokens[prefill_precomputed_count]
         
-        # Mark previous iteration's PREFILL requests as finished (decode requests persist)
-        scheduler_output.finished_req_ids = previous_prefill_req_ids
+        # Skip entries with 0 precomputed tokens (these are handled as fresh prefill each iteration)
+        if precompute_len == 0:
+            prefill_precomputed_count += 1
+            continue
+        
+        if tokens_used + precompute_len > max_num_batched_tokens:
+            break
+        
+        # Use warmup-specific IDs for precomputation (will be finished after warmup)
+        req_id = f"warmup_precompute_{test_id}_{prefill_precomputed_count}"
+        new_req = create_fake_new_request(
+            req_id, precompute_len, block_size, num_kv_groups, num_computed_tokens=0
+        )
+        scheduler_output.scheduled_new_reqs.append(new_req)
+        scheduler_output.num_scheduled_tokens[req_id] = precompute_len
+        scheduler_output.total_num_scheduled_tokens += precompute_len
+        
+        warmup_precompute_req_ids.add(req_id)  # Track for cleanup
+        tokens_used += precompute_len
+        prefill_precomputed_count += 1
+
+    # Add any remaining decode init requests
+    while decode_gen_lens and decode_initialized_count < len(decode_gen_lens):
+        ctx_len = decode_gen_lens[decode_initialized_count]
+        if tokens_used + ctx_len > max_num_batched_tokens:
+            break
+        
+        req_id = decode_req_ids[decode_initialized_count]
+        new_req = create_fake_new_request(
+            req_id, ctx_len, block_size, num_kv_groups, num_computed_tokens=0
+        )
+        scheduler_output.scheduled_new_reqs.append(new_req)
+        scheduler_output.num_scheduled_tokens[req_id] = ctx_len
+        scheduler_output.total_num_scheduled_tokens += ctx_len
+        
+        tokens_used += ctx_len
+        decode_initialized_count += 1
+    
+    previous_req_ids_to_finish = set()  # Don't finish any init requests
+    
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+    executor.execute_model(scheduler_output, non_block=False)
+    torch.cuda.synchronize()
+    latency_ms = (time.perf_counter() - start_time) * 1000
+    
+    # print(f"  Phase 3: Extra warmup, {tokens_used} tokens, {latency_ms:.2f}ms")
+    
+    # ========== ASSERTIONS: Verify all initialization is complete ==========
+    # print(f"\n=== Verifying initialization completeness ===")
+    
+    if prefill_precomputed_tokens:
+        assert prefill_precomputed_count == len(prefill_precomputed_tokens), \
+            f"Prefill precomputation incomplete: {prefill_precomputed_count}/{len(prefill_precomputed_tokens)} requests initialized. " \
+            f"Increase max_num_batched_tokens or check for requests exceeding the limit."
+        # print(f"  ✓ Prefill precomputation: {prefill_precomputed_count}/{len(prefill_precomputed_tokens)} complete")
+    
+    if decode_gen_lens:
+        assert decode_initialized_count == len(decode_gen_lens), \
+            f"Decode initialization incomplete: {decode_initialized_count}/{len(decode_gen_lens)} requests initialized. " \
+            f"Increase max_num_batched_tokens or check for requests exceeding the limit."
+        # print(f"  ✓ Decode initialization: {decode_initialized_count}/{len(decode_gen_lens)} complete")
+    
+    print(f"\n=== Starting profiling {test_id} ===")
+    
+    # Finish warmup precomputation requests before profiling
+    # They served their purpose (populating KV cache during warmup)
+    previous_req_ids_to_finish = warmup_precompute_req_ids.copy()
+    
+    # Start power monitoring if enabled
+    if power_monitor_process is not None:
+        power_monitor_process.start()
+    
+    iteration = 0
+    profiling_start_time = None
+    
+    # ========== PROFILING LOOP ==========
+    while True:
+        # Check termination condition
+        if use_runtime_mode:
+            if profiling_start_time is None:
+                profiling_start_time = time.perf_counter()
+            elapsed = time.perf_counter() - profiling_start_time
+            if elapsed >= runtime:
+                break
+        else:
+            # repeat mode
+            if len(all_latencies) >= repeat:
+                break
+        
+        # Create profiling batch
+        decode_fully_initialized = (decode_initialized_count == len(decode_gen_lens))
+        
+        # ALL prefill requests are fresh each iteration (iteration-based IDs)
+        # For those with precomputation, num_computed_tokens will be set appropriately
+        # The warmup phase populated the KV cache, so the model has "seen" similar tokens
+        
+        # Create scheduler output with all prefill and decode requests
+        scheduler_output = create_fake_scheduler_output(
+            prefill_ctx_lens=prefill_ctx_lens,
+            decode_gen_lens=decode_gen_lens if decode_fully_initialized else [],
+            block_size=block_size,
+            num_kv_groups=num_kv_groups,
+            iteration=iteration,
+            prefill_precomputed_tokens=prefill_precomputed_tokens,  # Pass precomputed tokens
+            decode_req_ids=decode_req_ids if decode_fully_initialized else [],
+            decode_token_counts=decode_token_counts if decode_fully_initialized else [],
+        )
+        
+        # Update decode token counts
+        if decode_fully_initialized:
+            for i in range(len(decode_token_counts)):
+                decode_token_counts[i] += 1
+        
+        # Mark previous prefill requests as finished (decode requests persist)
+        scheduler_output.finished_req_ids = previous_req_ids_to_finish
         
         # Track current prefill request IDs for next iteration cleanup
+        # ALL prefill requests are fresh each iteration and need to be finished
         current_prefill_req_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
-        # Don't include decode request IDs - they stay alive across iterations
-        if iteration < warmup and decode_gen_lens:
-            # Remove decode request IDs from the set to finish (they persist)
-            current_prefill_req_ids -= set(decode_req_ids[:decode_initialized_count])
-        # Don't finish prefill requests with precomputation - they persist
-        if prefill_precomputed_initialized and iteration < warmup:
-            current_prefill_req_ids -= set(prefill_req_ids)
-        previous_prefill_req_ids = current_prefill_req_ids
+        # Decode request IDs stay alive (not in scheduled_new_reqs anyway)
+        previous_req_ids_to_finish = current_prefill_req_ids
         
         torch.cuda.synchronize()
         start_time = time.perf_counter()
         
         ret = executor.execute_model(scheduler_output, non_block=False)
-        # print(scheduler_output)
-        # print(ret)
-        # print("\n\n")
         
         torch.cuda.synchronize()
         end_time = time.perf_counter()
         
         latency_ms = (end_time - start_time) * 1000
         
-        if iteration < warmup:
-            logger.info(f"Warmup iteration {iteration+1}/{warmup}: {latency_ms:.2f}ms")
-        else:
-            all_latencies.append(latency_ms)
-            if use_runtime_mode:
-                elapsed = time.perf_counter() - profiling_start_time
-                if len(all_latencies) % max(1, 10) == 0 or elapsed >= runtime:
-                    logger.info(f"Profiling iteration {len(all_latencies)}: {latency_ms:.2f}ms (elapsed: {elapsed:.1f}s/{runtime}s)")
-            else:
-                if (len(all_latencies)) % max(1, repeat // 10) == 0:
-                    logger.info(f"Timed iteration {len(all_latencies)}/{repeat}: {latency_ms:.2f}ms")
+        all_latencies.append(latency_ms)
+        # if use_runtime_mode:
+        #     elapsed = time.perf_counter() - profiling_start_time
+        #     if len(all_latencies) % max(1, 10) == 0 or elapsed >= runtime:
+        #         print(f"Profiling iteration {len(all_latencies)}: {latency_ms:.2f}ms (elapsed: {elapsed:.1f}s/{runtime}s)")
+        # else:
+        #     if (len(all_latencies)) % max(1, repeat // 10) == 0:
+        #         print(f"Timed iteration {len(all_latencies)}/{repeat}: {latency_ms:.2f}ms")
         
         iteration += 1
+
     
     # Stop power monitoring
     if power_monitor_process is not None:
