@@ -66,19 +66,42 @@ def calculate_warmup_iterations(
     Returns:
         Tuple of (prefill_precompute_iters, decode_init_iters, extra_iter)
     """
-    # Phase 1: Calculate iterations for prefill precomputation
+    # Phase 1: Simulate scheduler packing prefill precomputation requests
     prefill_precompute_iters = 0
     if prefill_precomputed_tokens:
-        total_precompute_tokens = sum(prefill_precomputed_tokens)
-        if total_precompute_tokens > 0:
-            prefill_precompute_iters = (total_precompute_tokens + max_num_batched_tokens - 1) // max_num_batched_tokens
+        current_batch_tokens = 0
+        for precompute_len in prefill_precomputed_tokens:
+            if precompute_len == 0:
+                continue  # Skip zero-length requests
+            
+            if current_batch_tokens + precompute_len > max_num_batched_tokens:
+                # Start new batch
+                prefill_precompute_iters += 1
+                current_batch_tokens = precompute_len
+            else:
+                # Add to current batch
+                current_batch_tokens += precompute_len
+        
+        # Count the last partial batch if any
+        if current_batch_tokens > 0:
+            prefill_precompute_iters += 1
     
-    # Phase 2: Calculate iterations for decode initialization
+    # Phase 2: Simulate scheduler packing decode initialization requests
     decode_init_iters = 0
     if decode_gen_lens:
-        total_decode_init_tokens = sum(decode_gen_lens)
-        if total_decode_init_tokens > 0:
-            decode_init_iters = (total_decode_init_tokens + max_num_batched_tokens - 1) // max_num_batched_tokens
+        current_batch_tokens = 0
+        for ctx_len in decode_gen_lens:
+            if current_batch_tokens + ctx_len > max_num_batched_tokens:
+                # Start new batch
+                decode_init_iters += 1
+                current_batch_tokens = ctx_len
+            else:
+                # Add to current batch
+                current_batch_tokens += ctx_len
+        
+        # Count the last partial batch if any
+        if current_batch_tokens > 0:
+            decode_init_iters += 1
     
     # Phase 3: 1 extra warmup iteration (for GPU warmup and any edge cases)
     extra_iter = 1
@@ -686,28 +709,16 @@ def profile_batch_execution(
             power_monitor_process.kill()
     
     return {
-        "mean_ms": np.mean(all_latencies),
-        "std_ms": np.std(all_latencies),
-        "min_ms": np.min(all_latencies),
-        "max_ms": np.max(all_latencies),
-        "median_ms": np.median(all_latencies),
-        "p95_ms": np.percentile(all_latencies, 95),
-        "p99_ms": np.percentile(all_latencies, 99),
+        "latencies": all_latencies,
         "num_prefill_reqs": len(prefill_ctx_lens),
+        "sum_ctx_len": sum(prefill_ctx_lens),
         "mean_ctx_len": np.mean(prefill_ctx_lens) if prefill_ctx_lens else 0,
         "std_ctx_len": np.std(prefill_ctx_lens) if prefill_ctx_lens else 0,
         "num_decode_reqs": len(decode_gen_lens),
+        "sum_decode_len": sum(decode_gen_lens) + (iteration/2) if decode_gen_lens else 0,
         "mean_decode_len": np.mean(decode_gen_lens) + (iteration/2) if decode_gen_lens else 0,
         "std_decode_len": np.std(decode_gen_lens) if decode_gen_lens else 0,
         "prefill_precomputed_tokens": prefill_precomputed_tokens,
-        "mean_ctx_len_w_precomputed": (
-            np.mean([cl + pt for cl, pt in zip(prefill_ctx_lens, prefill_precomputed_tokens)])
-            if prefill_precomputed_tokens else np.mean(prefill_ctx_lens) if prefill_ctx_lens else 0
-        ),
-        "std_ctx_len_w_precomputed": (
-            np.std([cl + pt for cl, pt in zip(prefill_ctx_lens, prefill_precomputed_tokens)])
-            if prefill_precomputed_tokens else np.std(prefill_ctx_lens) if prefill_ctx_lens else 0
-        ),
         "num_iterations": len(all_latencies),
         "total_profiling_time_s": sum(all_latencies) / 1000,
         "mode": "runtime" if use_runtime_mode else "repeat",
