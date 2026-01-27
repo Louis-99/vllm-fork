@@ -60,6 +60,8 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
+import os
+
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
@@ -260,7 +262,7 @@ class BenchmarkDataset(ABC):
 # Utility Functions and Global Caches
 # -----------------------------------------------------------------------------
 
-
+# TODO: (Yunzhao) change this
 def is_valid_sequence(
     prompt_len: int,
     output_len: int,
@@ -276,6 +278,15 @@ def is_valid_sequence(
     and `sample_sharegpt_requests` functions in benchmark_serving.py, as well as
     from `sample_requests` in benchmark_throughput.py.
     """
+
+    if int(os.getenv('MANUAL_INPUT_OUTPUT_LEN_RANGE', 0)) > 0:
+        min_input_len = int(os.getenv('INPUT_LEN_MIN', 2))
+        max_input_len = int(os.getenv('INPUT_LEN_MAX', 1e8))
+        min_output_len = int(os.getenv('OUTPUT_LEN_MIN', 2))
+        max_output_len = int(os.getenv('OUTPUT_LEN_MAX', 1e8))
+        return min_input_len <= prompt_len <= max_input_len \
+            and min_output_len <= output_len <= max_output_len
+    
     # Check for invalid conditions
     prompt_too_short = prompt_len < min_len
     output_too_short = (not skip_min_output_len_check) and (output_len
@@ -418,12 +429,23 @@ class RandomDataset(BenchmarkDataset):
         input_len: int = DEFAULT_INPUT_LEN,
         output_len: int = DEFAULT_OUTPUT_LEN,
         batchsize: int = 1,
+        trace_file: Optional[str] = None,
         **kwargs,
     ) -> list[SampleRequest]:
+        
+        if trace_file is not None:
+            assert trace_file.endswith('.csv'), "Only CSV trace files are supported."
+            df = pd.read_csv(trace_file)
+            num_requests = len(df)
 
         input_lens, output_lens, offsets = self.get_sampling_params(
             num_requests, range_ratio, input_len, output_len, tokenizer
         )
+
+        if trace_file is not None:
+            num_special_tokens = int(tokenizer.num_special_tokens_to_add())
+            input_lens = np.maximum(0, df['num_prefill_tokens'].to_numpy() - num_special_tokens)
+            output_lens = np.maximum(0, df['num_decode_tokens'].to_numpy() - num_special_tokens)
 
         # Generate prefix once
         prefix_token_ids = self.get_prefix(tokenizer, prefix_len)
@@ -553,17 +575,26 @@ class RandomDataset(BenchmarkDataset):
         To avoid uncontrolled change of the prompt length,
         the encoded sequence is truncated before being decoded again.
         """
-        # Build the inner sequence by sampling sequentially from the vocab
-        inner_seq = ((offset + index + np.arange(input_len)) 
-                    % vocab_size).tolist()
-        token_sequence = prefix_token_ids + inner_seq
 
-        # Decode, then re-encode and truncate to preserve token count invariants
-        prompt = tokenizer.decode(token_sequence)
-        total_input_len = prefix_len + int(input_len)
+        # try up to 4 times to get the correct token length
+        scale_factor: int = 2
+        for _ in range(4):
+            # Build the inner sequence by sampling sequentially from the vocab
+            inner_seq = ((offset + index + np.arange(input_len * scale_factor)) 
+                        % vocab_size).tolist()
+            token_sequence = prefix_token_ids + inner_seq
 
-        re_encoded_sequence = tokenizer.encode(
-            prompt, add_special_tokens=False)[:total_input_len]
+            # Decode, then re-encode and truncate to preserve token count invariants
+            prompt = tokenizer.decode(token_sequence)
+            total_input_len = prefix_len + int(input_len)
+
+            re_encoded_sequence = tokenizer.encode(
+                prompt, add_special_tokens=False)[:total_input_len]
+            
+            if len(re_encoded_sequence) == total_input_len:
+                break
+            scale_factor += int(scale_factor * total_input_len / len(re_encoded_sequence))
+
         prompt = tokenizer.decode(re_encoded_sequence)
         total_input_len = len(re_encoded_sequence)
 
@@ -1179,6 +1210,14 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
               "Only used for embeddings benchmark."),
     )
 
+    random_group.add_argument(
+        "--random-input-output-len-trace-file",
+        type=str,
+        default=None,
+        help=("Path to a CSV file containing input/output length of the trace. "
+              "If provided, overrides the random sampling of input/output."),
+    )
+
     # random multimodal dataset options
     random_mm_group = parser.add_argument_group(
         "random multimodal dataset options extended from random dataset")
@@ -1510,6 +1549,7 @@ def get_samples(args, tokenizer) -> list[SampleRequest]:
                 request_id_prefix=args.request_id_prefix,
                 batchsize=args.random_batch_size,
                 no_oversample=args.no_oversample,
+                trace_file=args.random_input_output_len_trace_file,
             ),
             "random-mm":
             lambda: RandomMultiModalDataset(
