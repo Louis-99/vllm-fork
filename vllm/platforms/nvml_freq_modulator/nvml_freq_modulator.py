@@ -17,6 +17,7 @@ import numpy as np
 import onnxruntime as ort
 from scipy.interpolate import interpn
 import pynvml
+import pandas as pd
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.v1.metrics.stats import IterationStats, NVMLFreqModulatorStats
@@ -28,6 +29,7 @@ logger = init_logger(__name__)
 
 # Change this accordingly
 PATH_TO_MODELS = Path(__file__).parent / 'tree_models'
+PATH_TO_DYNAMO_PROFILE_DATA_CSV = Path(__file__).parent / 'dynamo_profile_data' / 'extracted_result_Feb1_MS_dynamo_70b_h100.csv'
 
 # power model prefill
 possible_freq = np.array([ 360,  570,  780, 1080, 1380, 1680, 1830])
@@ -75,11 +77,48 @@ idle_power_values_dict = {
     2: np.array([161.39579638960902, 171.89891114741704, 166.3517919412156, 183.0507797413239, 210.4289325309798, 300.1692712489896, 330.3604991503286]),
 }
 
+class DynamoFreqSelector:
+    def __init__(self, csv_path: str, tp: int, ttft_slo: float, tpot_slo: float):
+        self.df = pd.read_csv(csv_path)
+        self.df = self.df[self.df['tp'] == tp].copy()
+        self.df.sort_values(by='rps', ascending=True)
+        assert len(self.df) > 0
+
+        self.ttft_slo = ttft_slo
+        self.tpot_slo = tpot_slo
+
+        self.freq_df_part_map = {
+            freq: self.df[self.df['freq'] == freq] \
+                for freq in self.df['freq'].unique()
+        }
+
+    def get_freq(self, rps: float):
+        chosen_freq = self.df['freq'].max()
+        power = float('inf')
+        for freq, df_part in self.freq_df_part_map.items():
+            if rps > df_part['rps'].max():
+                continue
+            ttft_estimated = np.interp(rps, df_part['rps'], df_part['ttft_p99'])
+            if ttft_estimated > self.ttft_slo:
+                continue
+            tpot_estimated = np.interp(rps, df_part['rps'], df_part['tpot_p99'])
+            if tpot_estimated > self.tpot_slo:
+                continue
+            power_estimated = np.interp(rps, df_part['rps'], df_part['power'])
+            if power_estimated < power:
+                power = power_estimated
+                chosen_freq = freq
+        return chosen_freq
+
 class NvmlFreqModulatorInterface(ABC):
 
     @abstractmethod
     def step(self,
              scheduler_stats: Optional[NVMLFreqModulatorStats],) -> None:
+        ...
+
+    @abstractmethod
+    def update_rps(self, rps: float) -> None:
         ...
     
     @abstractmethod
@@ -101,21 +140,22 @@ class FreqModMsg(msgspec.Struct):
     Msg from client to server.
     """
     now: float
-    running_queue_tokens: list[int]     # tokens in batch just dispatched
-    running_queue_pre_computed_tokens: list[int]  # precomputed tokens in batch just dispatched
-    running_queue_wait_time: list[float]  # waiting times in running queue
-    kv_cache_usage: float               # fraction of GPU memory used by KV cache
-    waiting_queue_tokens: list[int]  # tokens in wait queue, for batch just dispatched
-    waiting_queue_pre_computed_tokens: list[int]  # tokens in wait queue, for batch just dispatched (should be 0s)
-    waiting_queue_wait_time: list[float]  # waiting times in waiting queue
-    fromWho: str  # can be from scheduler or request_update or request_end
-    batch_ID: int  # batch ID of the current batch
+    rps: float # average RPS
+    # running_queue_tokens: list[int]     # tokens in batch just dispatched
+    # running_queue_pre_computed_tokens: list[int]  # precomputed tokens in batch just dispatched
+    # running_queue_wait_time: list[float]  # waiting times in running queue
+    # kv_cache_usage: float               # fraction of GPU memory used by KV cache
+    # waiting_queue_tokens: list[int]  # tokens in wait queue, for batch just dispatched
+    # waiting_queue_pre_computed_tokens: list[int]  # tokens in wait queue, for batch just dispatched (should be 0s)
+    # waiting_queue_wait_time: list[float]  # waiting times in waiting queue
+    # fromWho: str  # can be from scheduler or request_update or request_end
+    # batch_ID: int  # batch ID of the current batch
 
-    def __post_init__(self):
-        assert len(self.waiting_queue_tokens) == len(
-            self.waiting_queue_wait_time)
-        assert len(self.running_queue_tokens) == len(
-            self.running_queue_wait_time)
+    # def __post_init__(self):
+    #     assert len(self.waiting_queue_tokens) == len(
+    #         self.waiting_queue_wait_time)
+    #     assert len(self.running_queue_tokens) == len(
+    #         self.running_queue_wait_time)
 
 @dataclass
 class FutureState:
@@ -217,43 +257,50 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
 
     def step(self,
              scheduler_stats: NVMLFreqModulatorStats) -> None:
-        with self.stat_buffer_lock:
-            self.stat_buffer = scheduler_stats
-            msg = self.build_msg(scheduler_stats, fromWho="scheduler")
-            msg_encoded = msgspec.msgpack.encode(msg)
-            self.q.put(msg_encoded)
+        pass
+        # with self.stat_buffer_lock:
+        #     self.stat_buffer = scheduler_stats
+        #     msg = self.build_msg(scheduler_stats, fromWho="scheduler")
+        #     msg_encoded = msgspec.msgpack.encode(msg)
+        #     self.q.put(msg_encoded)
+
+    def update_rps(self, rps: float) -> None:
+        msg = FreqModMsg(time.time(), rps)
+        self.q.put(msgspec.msgpack.encode(msg))
 
     def step_update_wait_q(self,
              scheduler_stats: NVMLFreqModulatorStats) -> None:
-        if self.stat_buffer is None:
-            return
-        with self.stat_buffer_lock:
-            time_elapsed = scheduler_stats.now - self.stat_buffer.now
-            scheduler_stats.num_running_reqs = self.stat_buffer.num_running_reqs
-            scheduler_stats.running_computed_tokens_list = self.stat_buffer.running_computed_tokens_list
-            scheduler_stats.running_reqs_num_tokens = self.stat_buffer.running_reqs_num_tokens
-            scheduler_stats.running_reqs_num_time = [x + time_elapsed for x in self.stat_buffer.running_reqs_num_time]
-            scheduler_stats.batch_ID = self.stat_buffer.batch_ID
-        msg = self.build_msg(scheduler_stats, fromWho="request_update")
-        msg_encoded = msgspec.msgpack.encode(msg)
-        self.q.put(msg_encoded)
+        pass
+        # if self.stat_buffer is None:
+        #     return
+        # with self.stat_buffer_lock:
+        #     time_elapsed = scheduler_stats.now - self.stat_buffer.now
+        #     scheduler_stats.num_running_reqs = self.stat_buffer.num_running_reqs
+        #     scheduler_stats.running_computed_tokens_list = self.stat_buffer.running_computed_tokens_list
+        #     scheduler_stats.running_reqs_num_tokens = self.stat_buffer.running_reqs_num_tokens
+        #     scheduler_stats.running_reqs_num_time = [x + time_elapsed for x in self.stat_buffer.running_reqs_num_time]
+        #     scheduler_stats.batch_ID = self.stat_buffer.batch_ID
+        # msg = self.build_msg(scheduler_stats, fromWho="request_update")
+        # msg_encoded = msgspec.msgpack.encode(msg)
+        # self.q.put(msg_encoded)
 
     def step_update_batch_ID_end(self,
                                  batch_ID: int) -> None:
-        msg = FreqModMsg(
-            now = time.time(),
-            running_queue_tokens = [],
-            running_queue_pre_computed_tokens = [],
-            running_queue_wait_time = [],
-            kv_cache_usage = 0.0,
-            waiting_queue_tokens = [],
-            waiting_queue_pre_computed_tokens = [],
-            waiting_queue_wait_time = [],
-            fromWho="request_end",
-            batch_ID=batch_ID,
-        )
-        msg_encoded = msgspec.msgpack.encode(msg)
-        self.q.put(msg_encoded)
+        pass
+        # msg = FreqModMsg(
+        #     now = time.time(),
+        #     running_queue_tokens = [],
+        #     running_queue_pre_computed_tokens = [],
+        #     running_queue_wait_time = [],
+        #     kv_cache_usage = 0.0,
+        #     waiting_queue_tokens = [],
+        #     waiting_queue_pre_computed_tokens = [],
+        #     waiting_queue_wait_time = [],
+        #     fromWho="request_end",
+        #     batch_ID=batch_ID,
+        # )
+        # msg_encoded = msgspec.msgpack.encode(msg)
+        # self.q.put(msg_encoded)
 
     def close(self):
         self.q.put(None)
@@ -328,31 +375,42 @@ class _MPNvmlFreqModulatorServer:
         self._freq_daemon_queues = []
         self._freq_daemon_procs = []
 
-    def _load_models(self):
-        dec = None
-        pre = None
-        dec_path = PATH_TO_MODELS / "decode_model_latency.onnx"
-        pre_path = PATH_TO_MODELS / "prefill_model_latency.onnx"
-        power_dec_path = PATH_TO_MODELS / "decode_model_power.onnx"
-        if dec_path.exists():
-            self.latency_model_decode = ort.InferenceSession(dec_path)
-        if pre_path.exists():
-            self.latency_model_prefill = ort.InferenceSession(pre_path)
-        if power_dec_path.exists():
-            self.power_model_decode = ort.InferenceSession(power_dec_path)             
+        self.freq_selector: None|DynamoFreqSelector = None
+
+    # def _load_models(self):
+    #     dec = None
+    #     pre = None
+    #     dec_path = PATH_TO_MODELS / "decode_model_latency.onnx"
+    #     pre_path = PATH_TO_MODELS / "prefill_model_latency.onnx"
+    #     power_dec_path = PATH_TO_MODELS / "decode_model_power.onnx"
+    #     if dec_path.exists():
+    #         self.latency_model_decode = ort.InferenceSession(dec_path)
+    #     if pre_path.exists():
+    #         self.latency_model_prefill = ort.InferenceSession(pre_path)
+    #     if power_dec_path.exists():
+    #         self.power_model_decode = ort.InferenceSession(power_dec_path)             
 
     def run(self):
         self.start_frequency_manager()
         self.underprediction_lock = threading.Lock()
         # Load models here rather than in __init__() so that we don't pass the
         # loaded models across processes
-        self._load_models()
+        # self._load_models()
+        if self.freq_selector is None:
+            self.freq_selector = DynamoFreqSelector(
+                PATH_TO_DYNAMO_PROFILE_DATA_CSV, 
+                tp=self.tp_degree, 
+                ttft_slo=self.ttft_sla, 
+                tpot_slo=self.tbt_sla,
+            )
 
         # Column `now` used as key column to join with `perf_metrics.csv`
         csv_writer = CSVWriter(col_names=[
             'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
-            'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
-            'max_running_q_wait', 'max_waiting_q_wait',
+            'target_freq', 
+            'average_rps',
+            # 'batch_lat', 'running_q_len', 'waiting_q_len',
+            # 'max_running_q_wait', 'max_waiting_q_wait',
         ],
         filename=self.log_dir / 'freq_mod_log.csv')
 
@@ -361,28 +419,31 @@ class _MPNvmlFreqModulatorServer:
             if msg_encoded is None:
                 self.stop_frequency_manager()
                 break
-            if step_id % self.mod_interval > 0:
-                continue
+            assert isinstance(msg_encoded, float)
+            # if step_id % self.mod_interval > 0:
+            #     continue
             
             mpc_start = time.perf_counter()
             msg: FreqModMsg = msgspec.msgpack.decode(msg_encoded,
                                                      type=FreqModMsg)
-            # logger.info('freq_mod_msg: %s', msg)
+            # # logger.info('freq_mod_msg: %s', msg)
             logger.debug('freq_mod_msg: %s', msg)
-            if msg.fromWho == "request_end":
-                with self.underprediction_lock:
-                    if msg.batch_ID > self.last_finished_ID:
-                        self.last_finished_ID = msg.batch_ID
-                continue
 
-            future_states, prefill_cycles = self.get_future_states(
-                msg, self.future_windows)
+            selected_freq = msg.rps # TODO use the actual function
+            # if msg.fromWho == "request_end":
+            #     with self.underprediction_lock:
+            #         if msg.batch_ID > self.last_finished_ID:
+            #             self.last_finished_ID = msg.batch_ID
+            #     continue
 
-            selected_freq, pred_batch_lat = (
-                self._get_next_freq(msg, future_states, prefill_cycles))
+            # future_states, prefill_cycles = self.get_future_states(
+            #     msg, self.future_windows)
 
-            if msg.kv_cache_usage >= self.mem_util_ceiling:
-                selected_freq = max(self.freq_choices)
+            # selected_freq, pred_batch_lat = (
+            #     self._get_next_freq(msg, future_states, prefill_cycles))
+
+            # if msg.kv_cache_usage >= self.mem_util_ceiling:
+            #     selected_freq = max(self.freq_choices)
 
             freq_mod_start = time.perf_counter()
             with self.underprediction_lock:
@@ -391,12 +452,12 @@ class _MPNvmlFreqModulatorServer:
                     self.last_applied_freq = selected_freq
 
             freq_mod_end = time.perf_counter()
-            if self.engine_role == 'prefill':
-                timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
-                                                           self.check_underprediction, 
-                                                           args=(msg.batch_ID,))
-                timer_to_check_underpred.daemon = True
-                timer_to_check_underpred.start()
+            # if self.engine_role == 'prefill':
+            #     timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
+            #                                                self.check_underprediction, 
+            #                                                args=(msg.batch_ID,))
+            #     timer_to_check_underpred.daemon = True
+            #     timer_to_check_underpred.start()
 
             csv_writer.add_row([
                 msg.now,
@@ -404,409 +465,410 @@ class _MPNvmlFreqModulatorServer:
                 freq_mod_start,
                 freq_mod_end,
                 self.last_applied_freq,
-                pred_batch_lat if self.last_applied_freq == selected_freq else pred_batch_lat+10.0,
-                len(msg.running_queue_wait_time),
-                len(msg.waiting_queue_wait_time),
-                max(msg.running_queue_wait_time) if len(
-                    msg.running_queue_wait_time) > 0 else 0.0,
-                max(msg.waiting_queue_wait_time) if len(
-                    msg.waiting_queue_wait_time) > 0 else 0.0,
+                msg.rps,
+                # pred_batch_lat if self.last_applied_freq == selected_freq else pred_batch_lat+10.0,
+                # len(msg.running_queue_wait_time),
+                # len(msg.waiting_queue_wait_time),
+                # max(msg.running_queue_wait_time) if len(
+                    # msg.running_queue_wait_time) > 0 else 0.0,
+                # max(msg.waiting_queue_wait_time) if len(
+                    # msg.waiting_queue_wait_time) > 0 else 0.0,
             ])
 
         csv_writer.close()
 
-    def check_underprediction(self, ID: int,):
-        """
-        Check if the latency model underpredicted the actual latency.
-        If yes, update the last known state for future corrections.
-        """
-        with self.underprediction_lock:
-            if (self.last_finished_ID >= ID):
-                # The running queue has changed since we set the timer.
-                # Skip this check.
-                return
-            if self.last_applied_freq is not max(self.freq_choices):
-                self.set_frequency_manager(max(self.freq_choices))
-                self.last_applied_freq = max(self.freq_choices)
-                logger.info('Underprediction detected, applied max freq')
+    # def check_underprediction(self, ID: int,):
+    #     """
+    #     Check if the latency model underpredicted the actual latency.
+    #     If yes, update the last known state for future corrections.
+    #     """
+    #     with self.underprediction_lock:
+    #         if (self.last_finished_ID >= ID):
+    #             # The running queue has changed since we set the timer.
+    #             # Skip this check.
+    #             return
+    #         if self.last_applied_freq is not max(self.freq_choices):
+    #             self.set_frequency_manager(max(self.freq_choices))
+    #             self.last_applied_freq = max(self.freq_choices)
+    #             logger.info('Underprediction detected, applied max freq')
 
-    def _get_next_freq(self, freq_mod_msg: FreqModMsg,
-                          future_states: list[FutureState], prefill_cycles):
-        freq_choices_desc = sorted(copy.deepcopy(self.freq_choices),
-                                   reverse=True)
+    # def _get_next_freq(self, freq_mod_msg: FreqModMsg,
+    #                       future_states: list[FutureState], prefill_cycles):
+    #     freq_choices_desc = sorted(copy.deepcopy(self.freq_choices),
+    #                                reverse=True)
         
-        max_future_vision = self.future_windows if max(prefill_cycles) > self.future_windows else max(prefill_cycles)
-        future_states = future_states[:max_future_vision]
-        # Pre-compute latency and power for each future window for each freq
-        lat_mat = self.predict_latencies_future_states(future_states,
-                                    freq_choices_desc)
-        power_mat = self.predict_powers_future_states(
-            future_states, freq_choices_desc)
-        energy_mat = lat_mat * power_mat
-        assert lat_mat.shape == (max_future_vision, len(freq_choices_desc))
-        assert power_mat.shape == (max_future_vision, len(freq_choices_desc))
+    #     max_future_vision = self.future_windows if max(prefill_cycles) > self.future_windows else max(prefill_cycles)
+    #     future_states = future_states[:max_future_vision]
+    #     # Pre-compute latency and power for each future window for each freq
+    #     lat_mat = self.predict_latencies_future_states(future_states,
+    #                                 freq_choices_desc)
+    #     power_mat = self.predict_powers_future_states(
+    #         future_states, freq_choices_desc)
+    #     energy_mat = lat_mat * power_mat
+    #     assert lat_mat.shape == (max_future_vision, len(freq_choices_desc))
+    #     assert power_mat.shape == (max_future_vision, len(freq_choices_desc))
 
-        if self.engine_role == 'decode':
-            # only consider the one future window for decode
-            lat_mat = lat_mat[0:1, :]
-            lat_mask = lat_mat <= self.tbt_sla
-            if self.optim_target == 'power':
-                power_mat = np.where(lat_mask, power_mat[0:1, :], np.inf)
-                selected_freq_idx = [np.argmin(power_mat[0])]
-            else:
-                energy_mat = np.where(lat_mask, energy_mat[0:1, :], np.inf)
-                selected_freq_idx = [np.argmin(energy_mat[0])]
-            selected_freq = freq_choices_desc[selected_freq_idx[0]]
-            predicted_batch_lat = lat_mat[0][selected_freq_idx[0]]
-        else:
-            # Build waiting time vector once (use numpy, ensure float32)
-            run_wait = np.asarray(freq_mod_msg.running_queue_wait_time, dtype=np.float32)
-            wait_wait = np.asarray(freq_mod_msg.waiting_queue_wait_time, dtype=np.float32)
-            waiting_time_per_req = np.concatenate((run_wait, wait_wait), axis=0).reshape(-1, 1)
-            # Start with the highest freq for each window
-            selected_freq_ids = [0 for _ in range(self.future_windows)]
-            for freq_idx in range(1, len(freq_choices_desc) - 1):
-            # Collect the candidates from `selected_freqs`
-                candidates_: list[list[int]] = [[]]
-                for window_idx in range(max_future_vision):
-                    if selected_freq_ids[window_idx] == freq_idx - 1:
-                        freq_ids_this_window = [freq_idx - 1, freq_idx, freq_idx + 1] 
-                    else:
-                        freq_ids_this_window = [selected_freq_ids[window_idx]]
-                    candidates_ = [[
-                        *c, f
-                    ] for c, f in product(candidates_, freq_ids_this_window)]
-                candidates = np.array(candidates_)
-                # [n_candidates, max_future_vision]
-                assert candidates.shape[1] == max_future_vision
+    #     if self.engine_role == 'decode':
+    #         # only consider the one future window for decode
+    #         lat_mat = lat_mat[0:1, :]
+    #         lat_mask = lat_mat <= self.tbt_sla
+    #         if self.optim_target == 'power':
+    #             power_mat = np.where(lat_mask, power_mat[0:1, :], np.inf)
+    #             selected_freq_idx = [np.argmin(power_mat[0])]
+    #         else:
+    #             energy_mat = np.where(lat_mask, energy_mat[0:1, :], np.inf)
+    #             selected_freq_idx = [np.argmin(energy_mat[0])]
+    #         selected_freq = freq_choices_desc[selected_freq_idx[0]]
+    #         predicted_batch_lat = lat_mat[0][selected_freq_idx[0]]
+    #     else:
+    #         # Build waiting time vector once (use numpy, ensure float32)
+    #         run_wait = np.asarray(freq_mod_msg.running_queue_wait_time, dtype=np.float32)
+    #         wait_wait = np.asarray(freq_mod_msg.waiting_queue_wait_time, dtype=np.float32)
+    #         waiting_time_per_req = np.concatenate((run_wait, wait_wait), axis=0).reshape(-1, 1)
+    #         # Start with the highest freq for each window
+    #         selected_freq_ids = [0 for _ in range(self.future_windows)]
+    #         for freq_idx in range(1, len(freq_choices_desc) - 1):
+    #         # Collect the candidates from `selected_freqs`
+    #             candidates_: list[list[int]] = [[]]
+    #             for window_idx in range(max_future_vision):
+    #                 if selected_freq_ids[window_idx] == freq_idx - 1:
+    #                     freq_ids_this_window = [freq_idx - 1, freq_idx, freq_idx + 1] 
+    #                 else:
+    #                     freq_ids_this_window = [selected_freq_ids[window_idx]]
+    #                 candidates_ = [[
+    #                     *c, f
+    #                 ] for c, f in product(candidates_, freq_ids_this_window)]
+    #             candidates = np.array(candidates_)
+    #             # [n_candidates, max_future_vision]
+    #             assert candidates.shape[1] == max_future_vision
 
-                # Keep candidates that meet SLA
-                tbt_arr = lat_mat[np.arange(max_future_vision)[:, None],
-                                candidates.T]
-                # Compute TTFT for all candidates in parallel
-                time_till_finish_per_batch = np.cumsum(tbt_arr, axis=0)
-                time_till_finish_per_req = time_till_finish_per_batch[
-                    np.array(prefill_cycles, dtype=int) - 1, :]
-                ttft_arr = time_till_finish_per_req + waiting_time_per_req[: time_till_finish_per_req.shape[0], :]
-                sla_ttft_mask = np.all(ttft_arr <= self.ttft_sla, axis=0)
-                # Combine masks to filter valid candidates
-                valid_mask = sla_ttft_mask
-                candidates = candidates[valid_mask]
-                # Select the min-energy candidate as `selected_freq_ids`
-                if len(candidates) > 0:
-                    candidates = np.array(candidates)
-                    energy_per_batch = energy_mat[
-                        np.arange(max_future_vision)[:, None], candidates.T]
-                    total_energy = np.sum(energy_per_batch, axis=0)
-                    if self.optim_target == 'energy':
-                        selected_freq_ids = candidates[np.argmin(total_energy)]
-                    elif self.optim_target == 'power':
-                        lat_per_batch = lat_mat[np.arange(max_future_vision)[:,
-                                                                            None],
-                                                candidates.T]
-                        total_lat = np.sum(lat_per_batch, axis=0)
-                        total_power = total_energy / total_lat
-                        selected_freq_ids = candidates[np.argmin(total_power)]
-                else:
-                    break
-            selected_freq = max([
-                freq_choices_desc[selected_freq_ids[i]]
-                for i in range(self.mod_interval)
-            ])
-            predicted_batch_lat = lat_mat[0][selected_freq_ids[0]]
+    #             # Keep candidates that meet SLA
+    #             tbt_arr = lat_mat[np.arange(max_future_vision)[:, None],
+    #                             candidates.T]
+    #             # Compute TTFT for all candidates in parallel
+    #             time_till_finish_per_batch = np.cumsum(tbt_arr, axis=0)
+    #             time_till_finish_per_req = time_till_finish_per_batch[
+    #                 np.array(prefill_cycles, dtype=int) - 1, :]
+    #             ttft_arr = time_till_finish_per_req + waiting_time_per_req[: time_till_finish_per_req.shape[0], :]
+    #             sla_ttft_mask = np.all(ttft_arr <= self.ttft_sla, axis=0)
+    #             # Combine masks to filter valid candidates
+    #             valid_mask = sla_ttft_mask
+    #             candidates = candidates[valid_mask]
+    #             # Select the min-energy candidate as `selected_freq_ids`
+    #             if len(candidates) > 0:
+    #                 candidates = np.array(candidates)
+    #                 energy_per_batch = energy_mat[
+    #                     np.arange(max_future_vision)[:, None], candidates.T]
+    #                 total_energy = np.sum(energy_per_batch, axis=0)
+    #                 if self.optim_target == 'energy':
+    #                     selected_freq_ids = candidates[np.argmin(total_energy)]
+    #                 elif self.optim_target == 'power':
+    #                     lat_per_batch = lat_mat[np.arange(max_future_vision)[:,
+    #                                                                         None],
+    #                                             candidates.T]
+    #                     total_lat = np.sum(lat_per_batch, axis=0)
+    #                     total_power = total_energy / total_lat
+    #                     selected_freq_ids = candidates[np.argmin(total_power)]
+    #             else:
+    #                 break
+    #         selected_freq = max([
+    #             freq_choices_desc[selected_freq_ids[i]]
+    #             for i in range(self.mod_interval)
+    #         ])
+    #         predicted_batch_lat = lat_mat[0][selected_freq_ids[0]]
 
-        return selected_freq, predicted_batch_lat
+    #     return selected_freq, predicted_batch_lat
 
-    def get_future_states(self, msg: FreqModMsg,
-                          future_window: int) -> tuple[list, list]:
-        """
-        Get the future observation for the given index. The future observation
-        is a list of observations for the next `future_windows` batches.
-        Assumptions:
-            - prefills are (poorly) chunked now
-            - no decode requests reach EOS during future calculations
-            - no new requests arrive
-        """
-        # A list that tells you for each request in the wait queue
-        # how many iterations it will take to get the first token
-        prefill_cycles = []
+    # def get_future_states(self, msg: FreqModMsg,
+    #                       future_window: int) -> tuple[list, list]:
+    #     """
+    #     Get the future observation for the given index. The future observation
+    #     is a list of observations for the next `future_windows` batches.
+    #     Assumptions:
+    #         - prefills are (poorly) chunked now
+    #         - no decode requests reach EOS during future calculations
+    #         - no new requests arrive
+    #     """
+    #     # A list that tells you for each request in the wait queue
+    #     # how many iterations it will take to get the first token
+    #     prefill_cycles = []
 
-        # Construct a dummy wait queue to simulate future chunked prefills
-        # list of (total tokens, processed tokens, remaining tokens)
-        dummy_wait_queue = []
-        for i in range(len(msg.running_queue_tokens)):
-            total_tokens = msg.running_queue_tokens[i]
-            processed_tokens = msg.running_queue_pre_computed_tokens[i]
-            remaining_tokens = (total_tokens+1) - processed_tokens
-            if remaining_tokens > 0:
-                dummy_wait_queue.append(
-                    (total_tokens+1, processed_tokens, remaining_tokens))
-                    # +1 because prefill generates the first token
+    #     # Construct a dummy wait queue to simulate future chunked prefills
+    #     # list of (total tokens, processed tokens, remaining tokens)
+    #     dummy_wait_queue = []
+    #     for i in range(len(msg.running_queue_tokens)):
+    #         total_tokens = msg.running_queue_tokens[i]
+    #         processed_tokens = msg.running_queue_pre_computed_tokens[i]
+    #         remaining_tokens = (total_tokens+1) - processed_tokens
+    #         if remaining_tokens > 0:
+    #             dummy_wait_queue.append(
+    #                 (total_tokens+1, processed_tokens, remaining_tokens))
+    #                 # +1 because prefill generates the first token
 
-        # add the reqs in the wait queue, 
-        dummy_wait_queue.extend([
-            (m+1, n, m - n)
-            for m, n in zip(msg.waiting_queue_tokens, msg.waiting_queue_pre_computed_tokens)
-        ])
+    #     # add the reqs in the wait queue, 
+    #     dummy_wait_queue.extend([
+    #         (m+1, n, m - n)
+    #         for m, n in zip(msg.waiting_queue_tokens, msg.waiting_queue_pre_computed_tokens)
+    #     ])
 
-        num_decodes = len(msg.running_queue_tokens)
-        if num_decodes > 0:
-            decode_len_sum = sum(msg.running_queue_tokens)
-            decode_len_mean = np.mean(msg.running_queue_tokens).item()
-            decode_len_std = np.std(
-                msg.running_queue_tokens).item()
-        else:
-            decode_len_sum = 0
-            decode_len_mean = 0
-            decode_len_std = 0
+    #     num_decodes = len(msg.running_queue_tokens)
+    #     if num_decodes > 0:
+    #         decode_len_sum = sum(msg.running_queue_tokens)
+    #         decode_len_mean = np.mean(msg.running_queue_tokens).item()
+    #         decode_len_std = np.std(
+    #             msg.running_queue_tokens).item()
+    #     else:
+    #         decode_len_sum = 0
+    #         decode_len_mean = 0
+    #         decode_len_std = 0
 
-        future_states = []
-        extracted_reqs = 0
-        for i in range(future_window):
-            budget_left = self.token_budget
-            prefills = []
+    #     future_states = []
+    #     extracted_reqs = 0
+    #     for i in range(future_window):
+    #         budget_left = self.token_budget
+    #         prefills = []
 
-            while budget_left > 0 and len(dummy_wait_queue) > 0:
-                # only extract running queue reqs from the first cycle
-                if i == 0 and extracted_reqs >= len(msg.running_queue_tokens):
-                    break
-                num_tokens = min(budget_left, dummy_wait_queue[0][2])
-                # add small overhead for chunking, dont count towards chunking budget
-                prefills.append(num_tokens + int(0.05*dummy_wait_queue[0][1]))
+    #         while budget_left > 0 and len(dummy_wait_queue) > 0:
+    #             # only extract running queue reqs from the first cycle
+    #             if i == 0 and extracted_reqs >= len(msg.running_queue_tokens):
+    #                 break
+    #             num_tokens = min(budget_left, dummy_wait_queue[0][2])
+    #             # add small overhead for chunking, dont count towards chunking budget
+    #             prefills.append(num_tokens + int(0.05*dummy_wait_queue[0][1]))
 
-                total_tokens, \
-                processed_tokens, \
-                remaining_tokens = dummy_wait_queue[0]
-                budget_left -= num_tokens
-                processed_tokens += num_tokens  # Update processed tokens
-                remaining_tokens -= num_tokens  # Update remaining tokens
-                dummy_wait_queue[0] = (total_tokens, processed_tokens,
-                                       remaining_tokens)  # Update tuple
+    #             total_tokens, \
+    #             processed_tokens, \
+    #             remaining_tokens = dummy_wait_queue[0]
+    #             budget_left -= num_tokens
+    #             processed_tokens += num_tokens  # Update processed tokens
+    #             remaining_tokens -= num_tokens  # Update remaining tokens
+    #             dummy_wait_queue[0] = (total_tokens, processed_tokens,
+    #                                    remaining_tokens)  # Update tuple
 
-                if dummy_wait_queue[0][2] == 0:
-                    dummy_wait_queue.pop(0)
-                    prefill_cycles.append(i + 1)
-                extracted_reqs += 1
+    #             if dummy_wait_queue[0][2] == 0:
+    #                 dummy_wait_queue.pop(0)
+    #                 prefill_cycles.append(i + 1)
+    #             extracted_reqs += 1
                     
-            num_prefills = len(prefills)
-            if num_prefills > 0:
-                prefill_len_sum = np.sum(prefills).item()
-                prefill_len_mean = np.mean(prefills).item()
-                prefill_len_std = np.std(prefills).item()
-            else:
-                prefill_len_sum = 0
-                prefill_len_mean = 0
-                prefill_len_std = 0.0
+    #         num_prefills = len(prefills)
+    #         if num_prefills > 0:
+    #             prefill_len_sum = np.sum(prefills).item()
+    #             prefill_len_mean = np.mean(prefills).item()
+    #             prefill_len_std = np.std(prefills).item()
+    #         else:
+    #             prefill_len_sum = 0
+    #             prefill_len_mean = 0
+    #             prefill_len_std = 0.0
 
-            # then decode
-            decode_len_sum += num_decodes   # all decode requests progress by 1
-            decode_len_mean = decode_len_mean + 1 # mean increases by 1
-            decode_len_std = decode_len_std # since everything increases by 1
+    #         # then decode
+    #         decode_len_sum += num_decodes   # all decode requests progress by 1
+    #         decode_len_mean = decode_len_mean + 1 # mean increases by 1
+    #         decode_len_std = decode_len_std # since everything increases by 1
 
-            future_states.append(
-                FutureState(
-                    num_prefills,
-                    prefill_len_sum,
-                    prefill_len_mean,
-                    prefill_len_std,
-                    num_decodes,
-                    decode_len_sum,
-                    decode_len_mean,
-                    decode_len_std,
-                ))
-        return future_states, prefill_cycles
+    #         future_states.append(
+    #             FutureState(
+    #                 num_prefills,
+    #                 prefill_len_sum,
+    #                 prefill_len_mean,
+    #                 prefill_len_std,
+    #                 num_decodes,
+    #                 decode_len_sum,
+    #                 decode_len_mean,
+    #                 decode_len_std,
+    #             ))
+    #     return future_states, prefill_cycles
 
-    def predict_latencies_future_states(self, states: FutureState,
-                          freq_choices) -> np.ndarray[np.ndarray[float]]:
-        """
-        Predict latency of the upcoming batch for each freq in `freq_choices`.
-        Now expects `states` to be a list of FutureState and does a single
-        batched inference for all (state, freq) pairs, returning a matrix
-        shaped (n_states, n_freqs).
-        """
-        n_states = len(states)
-        n_freqs = len(freq_choices)
+    # def predict_latencies_future_states(self, states: FutureState,
+    #                       freq_choices) -> np.ndarray[np.ndarray[float]]:
+    #     """
+    #     Predict latency of the upcoming batch for each freq in `freq_choices`.
+    #     Now expects `states` to be a list of FutureState and does a single
+    #     batched inference for all (state, freq) pairs, returning a matrix
+    #     shaped (n_states, n_freqs).
+    #     """
+    #     n_states = len(states)
+    #     n_freqs = len(freq_choices)
 
-        # Collect column-wise inputs for a single batched inference over
-        # all state x freq combinations
-        freqs = []
-        batch_sizes = []
-        input_len_sums = []
-        input_len_means = []
-        input_len_stds = []
-        tp_degrees = []
+    #     # Collect column-wise inputs for a single batched inference over
+    #     # all state x freq combinations
+    #     freqs = []
+    #     batch_sizes = []
+    #     input_len_sums = []
+    #     input_len_means = []
+    #     input_len_stds = []
+    #     tp_degrees = []
 
-        n_states = len(states)
-        n_freqs = len(freq_choices)
+    #     n_states = len(states)
+    #     n_freqs = len(freq_choices)
 
-        freq_arr = np.array(freq_choices, dtype=np.float32)
-        if self.engine_role == 'prefill':
-            bs_vec = np.array([st.num_prefills for st in states], dtype=np.float32)
-            ils_vec = np.array([st.prefill_len_sum for st in states], dtype=np.float32)
-            ilm_vec = np.array([st.prefill_len_mean for st in states], dtype=np.float32)
-            ilsd_vec = np.array([st.prefill_len_std for st in states], dtype=np.float32)
-        else:
-            bs_vec = np.array([st.num_decodes for st in states], dtype=np.float32)
-            ils_vec = np.array([st.decode_len_sum for st in states], dtype=np.float32)
-            ilm_vec = np.array([st.decode_len_mean for st in states], dtype=np.float32)
-            ilsd_vec = np.array([st.decode_len_std for st in states], dtype=np.float32)
+    #     freq_arr = np.array(freq_choices, dtype=np.float32)
+    #     if self.engine_role == 'prefill':
+    #         bs_vec = np.array([st.num_prefills for st in states], dtype=np.float32)
+    #         ils_vec = np.array([st.prefill_len_sum for st in states], dtype=np.float32)
+    #         ilm_vec = np.array([st.prefill_len_mean for st in states], dtype=np.float32)
+    #         ilsd_vec = np.array([st.prefill_len_std for st in states], dtype=np.float32)
+    #     else:
+    #         bs_vec = np.array([st.num_decodes for st in states], dtype=np.float32)
+    #         ils_vec = np.array([st.decode_len_sum for st in states], dtype=np.float32)
+    #         ilm_vec = np.array([st.decode_len_mean for st in states], dtype=np.float32)
+    #         ilsd_vec = np.array([st.decode_len_std for st in states], dtype=np.float32)
 
-        freqs = np.tile(freq_arr, n_states).astype(np.float32)
-        batch_sizes = np.repeat(bs_vec, n_freqs).astype(np.float32)
-        input_len_sums = np.repeat(ils_vec, n_freqs).astype(np.float32)
-        input_len_means = np.repeat(ilm_vec, n_freqs).astype(np.float32)
-        input_len_stds = np.repeat(ilsd_vec, n_freqs).astype(np.float32)
-        tp_degrees = np.full(n_states * n_freqs, float(self.tp_degree), dtype=np.float32)
+    #     freqs = np.tile(freq_arr, n_states).astype(np.float32)
+    #     batch_sizes = np.repeat(bs_vec, n_freqs).astype(np.float32)
+    #     input_len_sums = np.repeat(ils_vec, n_freqs).astype(np.float32)
+    #     input_len_means = np.repeat(ilm_vec, n_freqs).astype(np.float32)
+    #     input_len_stds = np.repeat(ilsd_vec, n_freqs).astype(np.float32)
+    #     tp_degrees = np.full(n_states * n_freqs, float(self.tp_degree), dtype=np.float32)
 
-        # Keep numpy arrays; avoid converting to Python lists and back.
-        n_rows = n_states * n_freqs
+    #     # Keep numpy arrays; avoid converting to Python lists and back.
+    #     n_rows = n_states * n_freqs
 
-        # Select appropriate latency model for inference
-        latency_model = (self.latency_model_prefill
-                 if self.engine_role == 'prefill'
-                 else self.latency_model_decode)
+    #     # Select appropriate latency model for inference
+    #     latency_model = (self.latency_model_prefill
+    #              if self.engine_role == 'prefill'
+    #              else self.latency_model_decode)
 
-        # Build input feed for the latency model using numpy arrays directly
-        # Build model column using np.full to avoid intermediate Python list
-        model_col = np.full((n_rows, 1), self.model, dtype=str)
-        input_feed = {
-            "model": model_col,
-            "batch_size": batch_sizes.reshape(n_rows, 1).astype(np.float32),
-            "input_len_sum": input_len_sums.reshape(n_rows, 1).astype(np.float32),
-            "input_len_mean": input_len_means.reshape(n_rows, 1).astype(np.float32),
-            "input_len_std": input_len_stds.reshape(n_rows, 1).astype(np.float32),
-            "tp_degree": tp_degrees.reshape(n_rows, 1).astype(np.float32),
-            "freq_mhz": freqs.reshape(n_rows, 1).astype(np.float32),
-        }
+    #     # Build input feed for the latency model using numpy arrays directly
+    #     # Build model column using np.full to avoid intermediate Python list
+    #     model_col = np.full((n_rows, 1), self.model, dtype=str)
+    #     input_feed = {
+    #         "model": model_col,
+    #         "batch_size": batch_sizes.reshape(n_rows, 1).astype(np.float32),
+    #         "input_len_sum": input_len_sums.reshape(n_rows, 1).astype(np.float32),
+    #         "input_len_mean": input_len_means.reshape(n_rows, 1).astype(np.float32),
+    #         "input_len_std": input_len_stds.reshape(n_rows, 1).astype(np.float32),
+    #         "tp_degree": tp_degrees.reshape(n_rows, 1).astype(np.float32),
+    #         "freq_mhz": freqs.reshape(n_rows, 1).astype(np.float32),
+    #     }
 
-        out = latency_model.run(None, input_feed)[0]
+    #     out = latency_model.run(None, input_feed)[0]
 
-        # Mark rows with batch_size == 0 so we can override model output after inference.
-        batch_size_col = batch_sizes.reshape(n_rows)
-        zero_mask = batch_size_col == 0
-        out[zero_mask] = 0.005
+    #     # Mark rows with batch_size == 0 so we can override model output after inference.
+    #     batch_size_col = batch_sizes.reshape(n_rows)
+    #     zero_mask = batch_size_col == 0
+    #     out[zero_mask] = 0.005
         
-        out = np.asarray(out)
-        latency_mat = out.reshape(n_states, n_freqs)
-        return latency_mat
+    #     out = np.asarray(out)
+    #     latency_mat = out.reshape(n_states, n_freqs)
+    #     return latency_mat
 
-    def predict_powers_future_states(self, future_states: list[FutureState],
-                                     freq_choices) -> np.ndarray[np.ndarray[float]]:
-        """
-        Predict power of the all batches for each freq in `freq_choices`.
-        """
-        inputs = []
-        for future_state in future_states:
+    # def predict_powers_future_states(self, future_states: list[FutureState],
+    #                                  freq_choices) -> np.ndarray[np.ndarray[float]]:
+    #     """
+    #     Predict power of the all batches for each freq in `freq_choices`.
+    #     """
+    #     inputs = []
+    #     for future_state in future_states:
 
-            num_prefills = future_state.num_prefills
-            prefill_len_sum = future_state.prefill_len_sum
-            prefill_len_std = future_state.prefill_len_std
-            prefill_len_mean = future_state.prefill_len_mean
-            num_decodes = future_state.num_decodes
-            decode_len_sum = future_state.decode_len_sum
-            decode_len_std = future_state.decode_len_std
-            decode_len_mean = future_state.decode_len_mean
+    #         num_prefills = future_state.num_prefills
+    #         prefill_len_sum = future_state.prefill_len_sum
+    #         prefill_len_std = future_state.prefill_len_std
+    #         prefill_len_mean = future_state.prefill_len_mean
+    #         num_decodes = future_state.num_decodes
+    #         decode_len_sum = future_state.decode_len_sum
+    #         decode_len_std = future_state.decode_len_std
+    #         decode_len_mean = future_state.decode_len_mean
             
-            input = np.array([
-                num_prefills,
-                prefill_len_sum,
-                prefill_len_mean,
-                prefill_len_std,
-                num_decodes,
-                decode_len_sum,
-                decode_len_mean,
-                decode_len_std,
-                self.tp_degree,
-            ], dtype=np.float32)
-            input = np.hstack([
-                np.array(freq_choices).reshape(-1, 1),
-                np.tile(input, (len(freq_choices), 1)),
-            ])
-            inputs.append(input)
+    #         input = np.array([
+    #             num_prefills,
+    #             prefill_len_sum,
+    #             prefill_len_mean,
+    #             prefill_len_std,
+    #             num_decodes,
+    #             decode_len_sum,
+    #             decode_len_mean,
+    #             decode_len_std,
+    #             self.tp_degree,
+    #         ], dtype=np.float32)
+    #         input = np.hstack([
+    #             np.array(freq_choices).reshape(-1, 1),
+    #             np.tile(input, (len(freq_choices), 1)),
+    #         ])
+    #         inputs.append(input)
 
-        #prefill
-        if self.engine_role == 'prefill':
-            freqs = np.array(freq_choices, dtype=np.float32)
-            n_future = len(inputs)
-            n_freqs = len(freqs)
+    #     #prefill
+    #     if self.engine_role == 'prefill':
+    #         freqs = np.array(freq_choices, dtype=np.float32)
+    #         n_future = len(inputs)
+    #         n_freqs = len(freqs)
 
-            # Determine which future states have batch_size == 0 (num_prefills == col 1)
-            batch_sizes = np.array([float(inp[0, 1]) for inp in inputs], dtype=np.float32)
-            idle_mask = batch_sizes == 0
-            busy_mask = ~idle_mask
+    #         # Determine which future states have batch_size == 0 (num_prefills == col 1)
+    #         batch_sizes = np.array([float(inp[0, 1]) for inp in inputs], dtype=np.float32)
+    #         idle_mask = batch_sizes == 0
+    #         busy_mask = ~idle_mask
 
-            output_arr = np.empty((n_future, n_freqs), dtype=np.float32)
+    #         output_arr = np.empty((n_future, n_freqs), dtype=np.float32)
 
-            # Idle rows: directly lookup idle power table (map freq_choices -> nearest possible_freq)
-            if np.any(idle_mask):
-                # For each freq choice, pick nearest index in possible_freq
-                freq_idx = np.argmin(np.abs(possible_freq.reshape(1, -1) - freqs.reshape(-1, 1)), axis=1)
-                idle_vals_for_freqs = idle_power_values_dict[self.tp_degree][freq_idx]
-                # Fill all idle future-state rows with the same idle vector
-                idle_rows = np.where(idle_mask)[0]
-                for r in idle_rows:
-                    output_arr[r, :] = idle_vals_for_freqs
+    #         # Idle rows: directly lookup idle power table (map freq_choices -> nearest possible_freq)
+    #         if np.any(idle_mask):
+    #             # For each freq choice, pick nearest index in possible_freq
+    #             freq_idx = np.argmin(np.abs(possible_freq.reshape(1, -1) - freqs.reshape(-1, 1)), axis=1)
+    #             idle_vals_for_freqs = idle_power_values_dict[self.tp_degree][freq_idx]
+    #             # Fill all idle future-state rows with the same idle vector
+    #             idle_rows = np.where(idle_mask)[0]
+    #             for r in idle_rows:
+    #                 output_arr[r, :] = idle_vals_for_freqs
 
-            # Busy rows: do interpolation like before, then place results back preserving original order
-            if np.any(busy_mask):
-                busy_indices = np.where(busy_mask)[0]
-                busy_inputs = [inputs[i] for i in busy_indices]
+    #         # Busy rows: do interpolation like before, then place results back preserving original order
+    #         if np.any(busy_mask):
+    #             busy_indices = np.where(busy_mask)[0]
+    #             busy_inputs = [inputs[i] for i in busy_indices]
 
-                # Clamp and collect input_len (prefill_len_sum is column 2)
-                input_lens = np.array([
-                    np.clip(float(inp[0, 2]), possible_input_len.min(), possible_input_len.max())
-                    for inp in busy_inputs
-                ], dtype=np.float32)
+    #             # Clamp and collect input_len (prefill_len_sum is column 2)
+    #             input_lens = np.array([
+    #                 np.clip(float(inp[0, 2]), possible_input_len.min(), possible_input_len.max())
+    #                 for inp in busy_inputs
+    #             ], dtype=np.float32)
 
-                # Shape will be (n_busy, n_freqs)
-                input_grid, freq_grid = np.meshgrid(input_lens, freqs, indexing='ij')
-                xi_all = np.stack([input_grid.ravel(), freq_grid.ravel()], axis=-1)
+    #             # Shape will be (n_busy, n_freqs)
+    #             input_grid, freq_grid = np.meshgrid(input_lens, freqs, indexing='ij')
+    #             xi_all = np.stack([input_grid.ravel(), freq_grid.ravel()], axis=-1)
 
-                values = busy_power_values_dict[self.tp_degree]
-                out_all = interpn(
-                    points=(possible_input_len, possible_freq),
-                    values=values,
-                    xi=xi_all,
-                    method='linear',
-                    bounds_error=False,
-                    fill_value=None,
-                )
-                busy_out = np.asarray(out_all, dtype=np.float32).reshape(len(busy_inputs), n_freqs)
+    #             values = busy_power_values_dict[self.tp_degree]
+    #             out_all = interpn(
+    #                 points=(possible_input_len, possible_freq),
+    #                 values=values,
+    #                 xi=xi_all,
+    #                 method='linear',
+    #                 bounds_error=False,
+    #                 fill_value=None,
+    #             )
+    #             busy_out = np.asarray(out_all, dtype=np.float32).reshape(len(busy_inputs), n_freqs)
 
-                # Place back into output_arr according to original order
-                for idx, row in enumerate(busy_indices):
-                    output_arr[row, :] = busy_out[idx, :]
+    #             # Place back into output_arr according to original order
+    #             for idx, row in enumerate(busy_indices):
+    #                 output_arr[row, :] = busy_out[idx, :]
 
-        else:
-            # decode: batch-predict power for all future-state inputs at once
-            power_model = self.power_model_decode
+    #     else:
+    #         # decode: batch-predict power for all future-state inputs at once
+    #         power_model = self.power_model_decode
             
-            # stack inputs: shape (n_future_states * n_freqs, n_cols)
-            stacked = np.vstack(inputs).astype(np.float32)
-            n_rows = stacked.shape[0]
-            n_future = len(inputs)
-            n_freqs = len(freq_choices)
+    #         # stack inputs: shape (n_future_states * n_freqs, n_cols)
+    #         stacked = np.vstack(inputs).astype(np.float32)
+    #         n_rows = stacked.shape[0]
+    #         n_future = len(inputs)
+    #         n_freqs = len(freq_choices)
 
-            # Columns in stacked:
-            # 0: freq, 1: num_prefills, 2: prefill_len_sum, 3: prefill_len_mean,
-            # 4: prefill_len_std, 5: num_decodes, 6: decode_len_sum,
-            # 7: decode_len_mean, 8: decode_len_std, 9: tp_degree
-            model_col = np.full((n_rows, 1), self.model, dtype=str)
-            input_feed = {
-                "model": model_col,
-                "batch_size": stacked[:, 5].reshape(n_rows, 1).astype(np.float32),
-                "input_len_sum": stacked[:, 6].reshape(n_rows, 1).astype(np.float32),
-                "input_len_mean": stacked[:, 7].reshape(n_rows, 1).astype(np.float32),
-                "input_len_std": stacked[:, 8].reshape(n_rows, 1).astype(np.float32),
-                "tp_degree": stacked[:, 9].reshape(n_rows, 1).astype(np.float32),
-                "freq_mhz": stacked[:, 0].reshape(n_rows, 1).astype(np.float32),
-            }
+    #         # Columns in stacked:
+    #         # 0: freq, 1: num_prefills, 2: prefill_len_sum, 3: prefill_len_mean,
+    #         # 4: prefill_len_std, 5: num_decodes, 6: decode_len_sum,
+    #         # 7: decode_len_mean, 8: decode_len_std, 9: tp_degree
+    #         model_col = np.full((n_rows, 1), self.model, dtype=str)
+    #         input_feed = {
+    #             "model": model_col,
+    #             "batch_size": stacked[:, 5].reshape(n_rows, 1).astype(np.float32),
+    #             "input_len_sum": stacked[:, 6].reshape(n_rows, 1).astype(np.float32),
+    #             "input_len_mean": stacked[:, 7].reshape(n_rows, 1).astype(np.float32),
+    #             "input_len_std": stacked[:, 8].reshape(n_rows, 1).astype(np.float32),
+    #             "tp_degree": stacked[:, 9].reshape(n_rows, 1).astype(np.float32),
+    #             "freq_mhz": stacked[:, 0].reshape(n_rows, 1).astype(np.float32),
+    #         }
 
-            out = power_model.run(None, input_feed)[0]
-            out = np.asarray(out).reshape(-1)
-            # reshape back to (n_future_states, n_freq_choices)
-            output_arr = out.reshape(n_future, n_freqs)
-        return output_arr
+    #         out = power_model.run(None, input_feed)[0]
+    #         out = np.asarray(out).reshape(-1)
+    #         # reshape back to (n_future_states, n_freq_choices)
+    #         output_arr = out.reshape(n_future, n_freqs)
+    #     return output_arr
 
     def _persistent_gpu_worker(physical_gpu_index: int, queue: multiprocessing.Queue):
         """

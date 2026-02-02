@@ -186,6 +186,10 @@ class Scheduler(SchedulerInterface):
                 vllm_config, self)
         self.batch_ID: int = 0
 
+        self.request_cnt: int = 0
+        self.request_cnt_last_time: None|float = None
+        self.request_cnt_period_s = 5
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1179,6 +1183,17 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+        
+        self.request_cnt += 1
+        cur_time = time.time()
+        if self.request_cnt_last_time is None:
+            self.request_cnt_last_time = cur_time
+        elif cur_time - self.request_cnt_last_time > self.request_cnt_period_s:
+            period = cur_time - self.request_cnt_last_time
+            average_rps = self.request_cnt / period
+            self.freq_modulator.update_rps(average_rps)
+            self.request_cnt_last_time = cur_time
+            self.request_cnt = 0
 
     def finish_requests(
         self,
