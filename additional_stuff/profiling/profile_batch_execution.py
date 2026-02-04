@@ -325,9 +325,16 @@ def profile_batch_execution(
     enable_power_logging: bool = False,
     power_log_file: Optional[Path] = None,
     max_num_batched_tokens: int = 4096,
-) -> dict:
+    max_num_seqs: int = 1024,
+    kv_cache_max_tokens: int = None,
+    save_dir: Optional[Path] = None,
+) -> list[dict]:
     """
     Profile execution time of a single batch configuration.
+    
+    Automatically runs 5 extra profiling iterations after the main test
+    to amortize KV cache initialization cost. Works for both decode-only
+    and mixed (prefill + decode) profiling modes.
     
     Args:
         executor: vLLM executor instance
@@ -339,9 +346,12 @@ def profile_batch_execution(
         runtime: Runtime in seconds for profiling (mutually exclusive with repeat)
         prefill_precomputed_tokens: List of pre-computed tokens per prefill request
         max_num_batched_tokens: Maximum tokens per batch (for warmup calculation)
+        max_num_seqs: Maximum number of sequences
+        kv_cache_max_tokens: Maximum KV cache tokens (for safety checks)
+        save_dir: Directory to save results (for extra tests)
     
     Returns:
-        Dictionary with timing statistics
+        List of dictionaries with timing statistics (one per test including 5 extras)
     """
     # Validate that exactly one of repeat or runtime is provided
     if repeat is None and runtime is None:
@@ -396,7 +406,7 @@ def profile_batch_execution(
             kwargs={
                 'interval': 0.01,  # 10ms sampling interval
                 'csv_filename': str(power_log_file),
-                'log_interval': 0.3,  # Write to CSV every 0.3 seconds
+                'log_interval': 0.2,  # Write to CSV every 0.2 seconds
                 'power_queue': None,
             },
             daemon=True
@@ -700,7 +710,7 @@ def profile_batch_execution(
         iteration += 1
 
     
-    # Stop power monitoring
+    # Stop power monitoring for main test
     if power_monitor_process is not None:
         logger.info("Stopping power monitoring...")
         power_monitor_process.terminate()
@@ -708,15 +718,17 @@ def profile_batch_execution(
         if power_monitor_process.is_alive():
             power_monitor_process.kill()
     
-    return {
+    # Store main test results
+    main_result = {
+        "test_name": test_id,
         "latencies": all_latencies,
         "num_prefill_reqs": len(prefill_ctx_lens),
-        "sum_ctx_len": sum(prefill_ctx_lens),
+        "sum_ctx_len": sum(prefill_ctx_lens) if prefill_ctx_lens else 0,
         "mean_ctx_len": np.mean(prefill_ctx_lens) if prefill_ctx_lens else 0,
         "std_ctx_len": np.std(prefill_ctx_lens) if prefill_ctx_lens else 0,
         "num_decode_reqs": len(decode_gen_lens),
-        "sum_decode_len": sum(decode_gen_lens) + (iteration/2) if decode_gen_lens else 0,
-        "mean_decode_len": np.mean(decode_gen_lens) + (iteration/2) if decode_gen_lens else 0,
+        "sum_decode_len": sum(decode_gen_lens) + (iteration) if decode_gen_lens else 0,
+        "mean_decode_len": np.mean(decode_gen_lens) + (iteration) if decode_gen_lens else 0,
         "std_decode_len": np.std(decode_gen_lens) if decode_gen_lens else 0,
         "prefill_precomputed_tokens": prefill_precomputed_tokens,
         "num_iterations": len(all_latencies),
@@ -724,7 +736,164 @@ def profile_batch_execution(
         "mode": "runtime" if use_runtime_mode else "repeat",
         "target_runtime_s": runtime if use_runtime_mode else None,
         "target_repeat": repeat if not use_runtime_mode else None,
+        "decode_token_counts_at_end": decode_token_counts.copy() if decode_token_counts else [],
     }
+    
+    all_results = [main_result]
+    
+    # ========== EXTRA PROFILING ITERATIONS ==========
+    # Automatically run 5 extra profiling iterations to amortize KV cache initialization
+    # Works for both decode-only and mixed (prefill + decode) modes
+    NUM_EXTRA_ITERATIONS = 5
+    
+    if decode_gen_lens:  # Only run extra iterations if there are decode requests
+        print(f"\n=== Running {NUM_EXTRA_ITERATIONS} extra profiling iterations ===")
+        
+        for extra_idx in range(NUM_EXTRA_ITERATIONS):
+            extra_name = f"extra_{extra_idx + 1}"
+            
+            # Safety checks before running extra test
+            total_reqs = len(prefill_ctx_lens) + len(decode_gen_lens)
+            
+            # Check max_num_seqs
+            if total_reqs > max_num_seqs:
+                print(f"  Skipping {extra_name}: {total_reqs} total reqs exceeds max_num_seqs={max_num_seqs}")
+                continue
+            
+            # Calculate tokens for this iteration (prefill tokens + decode tokens)
+            prefill_tokens = sum(ctx - precomp for ctx, precomp in zip(prefill_ctx_lens, prefill_precomputed_tokens or [0]*len(prefill_ctx_lens)))
+            decode_tokens = len(decode_gen_lens)  # 1 token per decode request
+            total_tokens_per_iter = prefill_tokens + decode_tokens
+            
+            # Check max_num_batched_tokens
+            if total_tokens_per_iter > max_num_batched_tokens:
+                print(f"  Skipping {extra_name}: {total_tokens_per_iter} tokens exceeds max_num_batched_tokens={max_num_batched_tokens}")
+                continue
+            
+            # Check KV cache capacity if provided
+            if kv_cache_max_tokens is not None:
+                current_total_tokens = sum(decode_token_counts) + sum(prefill_ctx_lens)
+                # Estimate iterations for this extra run
+                est_iters = runtime * 100 if use_runtime_mode else repeat
+                projected_tokens_per_iter = len(decode_gen_lens)  # Only decode grows
+                projected_total = current_total_tokens + (projected_tokens_per_iter * est_iters)
+                if projected_total > kv_cache_max_tokens * 0.95:  # 95% safety margin
+                    print(f"  Skipping {extra_name}: projected KV tokens {projected_total} may exceed capacity {kv_cache_max_tokens}")
+                    continue
+            
+            print(f"\n=== Extra iteration {extra_idx + 1}/{NUM_EXTRA_ITERATIONS}: {extra_name} ===")
+            
+            # Setup power logging for extra test
+            extra_power_process = None
+            if enable_power_logging and save_dir:
+                extra_save_dir = save_dir / extra_name
+                extra_save_dir.mkdir(parents=True, exist_ok=True)
+                extra_power_file = extra_save_dir / "power_log.csv"
+                extra_power_process = multiprocessing.Process(
+                    target=start_nvml_power_monitor,
+                    kwargs={
+                        'interval': 0.01,
+                        'csv_filename': str(extra_power_file),
+                        'log_interval': 0.2,
+                        'power_queue': None,
+                    },
+                    daemon=True
+                )
+                extra_power_process.start()
+            
+            extra_latencies = []
+            extra_start_time = time.perf_counter() if use_runtime_mode else None
+            extra_iter = 0
+            
+            while True:
+                # Check termination condition (same mode as main test)
+                if use_runtime_mode:
+                    elapsed = time.perf_counter() - extra_start_time
+                    if elapsed >= runtime:
+                        break
+                else:
+                    if extra_iter >= repeat:
+                        break
+                
+                # Create batch with same configuration as main test (prefill + decode)
+                decode_fully_initialized = True  # Already initialized during main test
+                
+                scheduler_output = create_fake_scheduler_output(
+                    prefill_ctx_lens=prefill_ctx_lens,
+                    decode_gen_lens=decode_gen_lens,
+                    block_size=block_size,
+                    num_kv_groups=num_kv_groups,
+                    iteration=iteration,
+                    prefill_precomputed_tokens=prefill_precomputed_tokens,
+                    decode_req_ids=decode_req_ids,
+                    decode_token_counts=decode_token_counts,
+                )
+                
+                # Update decode token counts
+                for i in range(len(decode_token_counts)):
+                    decode_token_counts[i] += 1
+                
+                # Mark previous prefill requests as finished
+                scheduler_output.finished_req_ids = previous_req_ids_to_finish
+                
+                # Track current prefill request IDs for next iteration cleanup
+                current_prefill_req_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
+                previous_req_ids_to_finish = current_prefill_req_ids
+                
+                torch.cuda.synchronize()
+                start_time = time.perf_counter()
+                executor.execute_model(scheduler_output, non_block=False)
+                torch.cuda.synchronize()
+                end_time = time.perf_counter()
+                
+                latency_ms = (end_time - start_time) * 1000
+                extra_latencies.append(latency_ms)
+                
+                iteration += 1
+                extra_iter += 1
+            
+            # Stop power monitoring for extra test
+            if extra_power_process is not None:
+                extra_power_process.terminate()
+                extra_power_process.join(timeout=5)
+                if extra_power_process.is_alive():
+                    extra_power_process.kill()
+            
+            # Store extra test results
+            extra_result = {
+                "test_name": extra_name,
+                "latencies": extra_latencies,
+                "num_prefill_reqs": len(prefill_ctx_lens),
+                "sum_ctx_len": sum(prefill_ctx_lens) if prefill_ctx_lens else 0,
+                "mean_ctx_len": np.mean(prefill_ctx_lens) if prefill_ctx_lens else 0,
+                "std_ctx_len": np.std(prefill_ctx_lens) if prefill_ctx_lens else 0,
+                "num_decode_reqs": len(decode_gen_lens),
+                "sum_decode_len": sum(decode_token_counts),
+                "mean_decode_len": np.mean(decode_token_counts),
+                "std_decode_len": np.std(decode_token_counts),
+                "prefill_precomputed_tokens": prefill_precomputed_tokens,
+                "num_iterations": len(extra_latencies),
+                "total_profiling_time_s": sum(extra_latencies) / 1000,
+                "mode": "runtime" if use_runtime_mode else "repeat",
+                "target_runtime_s": runtime if use_runtime_mode else None,
+                "target_repeat": repeat if not use_runtime_mode else None,
+                "decode_token_counts_at_end": decode_token_counts.copy(),
+                "is_extra_iteration": True,
+                "extra_iteration_index": extra_idx + 1,
+            }
+            all_results.append(extra_result)
+            
+            # Save extra test results
+            if save_dir:
+                extra_save_dir = save_dir / extra_name
+                extra_save_dir.mkdir(parents=True, exist_ok=True)
+                results_file = extra_save_dir / "results.json"
+                with open(results_file, 'w') as f:
+                    json.dump(extra_result, f, indent=2)
+            
+            # print(f"  {extra_name} done: {len(extra_latencies)} iterations, mean={np.mean(extra_latencies):.2f}ms")
+    
+    return all_results
 
 
 def run_single_test(
@@ -734,21 +903,23 @@ def run_single_test(
     num_kv_groups: int,
     model_name: str,
     max_num_batched_tokens: int,
+    max_num_seqs: int,
+    kv_cache_max_tokens: int,
     repeat: int = None,
     runtime: float = None,
     cleanup_previous_test: bool = False,
     save_dir: Optional[Path] = None,
     enable_power_logging: bool = False,
-) -> dict:
+) -> list[dict]:
     """Run a single profiling test from config."""
     test_name = test_config.get("name", "unnamed_test")
     prefill_ctx_lens = test_config.get("prefill_ctx_lens", [])
     prefill_precomputed_tokens = test_config.get("prefill_precomputed_tokens", None)
     decode_gen_lens = test_config.get("decode_gen_lens", [])
     
-    logger.info(f"\n{'='*80}")
-    logger.info(f"Running test: {test_name}")
-    logger.info(f"{'='*80}")
+    # logger.info(f"\n{'='*80}")
+    # logger.info(f"Running test: {test_name}")
+    # logger.info(f"{'='*80}")
     
     # Setup power log file if enabled
     power_log_file = None
@@ -756,11 +927,11 @@ def run_single_test(
         test_save_dir = save_dir / test_name
         test_save_dir.mkdir(parents=True, exist_ok=True)
         power_log_file = test_save_dir / "power_log.csv"
-        logger.info(f"Power logging enabled: {power_log_file}")
+        # logger.info(f"Power logging enabled: {power_log_file}")
     
     # Clean up state from previous test if needed
     if cleanup_previous_test:
-        logger.info("Cleaning up state from previous test...")
+        # logger.info("Cleaning up state from previous test...")
         # Create empty scheduler output to flush all requests
         cleanup_output = SchedulerOutput(
             scheduled_new_reqs=[],
@@ -795,7 +966,7 @@ def run_single_test(
         except Exception as e:
             logger.warning(f"Could not clean up previous test state: {e}")
     
-    results = profile_batch_execution(
+    results_list = profile_batch_execution(
         executor=executor,
         prefill_ctx_lens=prefill_ctx_lens,
         decode_gen_lens=decode_gen_lens,
@@ -808,15 +979,20 @@ def run_single_test(
         enable_power_logging=enable_power_logging,
         power_log_file=power_log_file,
         max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=max_num_seqs,
+        kv_cache_max_tokens=kv_cache_max_tokens,
+        save_dir=save_dir / test_name if save_dir else None,
     )
     
-    # Add test metadata to results
-    results["test_name"] = test_name
-    results["model"] = model_name
+    # Add test metadata to all results
+    for result in results_list:
+        if "test_name" not in result:
+            result["test_name"] = test_name
+        result["model"] = model_name
     
     # Print results
     # print("\n" + "="*80)
-    print(f"TEST: {test_name} done")
+    print(f"TEST: {test_name} done ({len(results_list)} sub-tests)")
     # print("="*80)
     # print(f"Configuration:")
     # print(f"  Model: {model_name}")
@@ -839,17 +1015,20 @@ def run_single_test(
     # print(f"  {results['total_tokens'] / (results['mean_ms'] / 1000):.2f} tokens/sec")
     # print("="*80)
     
-    # Save results to file if save_dir is specified
-    if save_dir:
+    # Save main test results to file if save_dir is specified
+    # (Extra test results are already saved by profile_batch_execution)
+    if save_dir and results_list:
         test_save_dir = save_dir / test_name
         test_save_dir.mkdir(parents=True, exist_ok=True)
         
+        # Save the main test result (first in list)
+        main_result = results_list[0]
         results_file = test_save_dir / "results.json"
         with open(results_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        logger.info(f"Results saved to {results_file}")
+            json.dump(main_result, f, indent=2)
+        logger.info(f"Main results saved to {results_file}")
     
-    return results
+    return results_list
 
 
 def main():
@@ -1094,25 +1273,37 @@ def main():
     
     num_kv_groups = len(kv_cache_configs[0].kv_cache_groups)
     
+    # Calculate total KV cache capacity (in tokens)
+    # Sum up num_blocks * block_size for each KV cache group
+    kv_cache_max_tokens = 0
+    for kv_cache_config in kv_cache_configs:
+        for group in kv_cache_config.kv_cache_groups:
+            num_blocks = group.num_blocks
+            # Each block holds block_size tokens
+            kv_cache_max_tokens += num_blocks * args.block_size
+    logger.info(f"Total KV cache capacity: {kv_cache_max_tokens} tokens")
+    
     # Profile execution - run all tests
     logger.info(f"Starting profiling with {len(test_configs)} test(s)...")
     all_results = []
     
     for test_idx, test_config in enumerate(tqdm(test_configs, desc="Tests", unit="test")):
-        result = run_single_test(
+        results_list = run_single_test(
             executor=executor,
             test_config=test_config,
             block_size=args.block_size,
             num_kv_groups=num_kv_groups,
             model_name=args.model,
             max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            kv_cache_max_tokens=kv_cache_max_tokens,
             repeat=repeat,
             runtime=runtime,
             cleanup_previous_test=(test_idx > 0),  # Clean up before 2nd+ tests
             save_dir=save_dir,
             enable_power_logging=args.enable_power_logging,
         )
-        all_results.append(result)
+        all_results.extend(results_list)
 
     # Shutdown executor across all ranks
     logger.info("Shutting down executor...")
