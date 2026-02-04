@@ -1105,8 +1105,8 @@ def main():
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.5,
-        help="Fraction of GPU memory to use for KV cache (default: 0.5)",
+        default=0.1,
+        help="Fraction of GPU memory to use for KV cache (default: 0.1)",
     )
     parser.add_argument(
         "--max-num-seqs",
@@ -1117,8 +1117,8 @@ def main():
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
-        default=4096,
-        help="Maximum tokens per batch. Default: 4096",
+        default=2048,
+        help="Maximum tokens per batch. Default: 2048",
     )
     parser.add_argument(
         "--enable-power-logging",
@@ -1218,6 +1218,7 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        max_model_len=8192
     )
     
     vllm_config = engine_args.create_engine_config()
