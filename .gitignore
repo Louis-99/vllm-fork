@@ -190,6 +190,7 @@ AGENTS.md
 
 # Results
 *.csv
+!vllm/platforms/nvml_freq_modulator/dynamo_profile_data/*.csv
 
 # Python pickle files
 *.pkl
