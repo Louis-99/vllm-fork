@@ -92,7 +92,7 @@ class DynamoFreqSelector:
                 for freq in self.df['freq'].unique()
         }
 
-    def get_freq(self, rps: float):
+    def get_freq(self, rps: float) -> int:
         chosen_freq = self.df['freq'].max()
         power = float('inf')
         for freq, df_part in self.freq_df_part_map.items():
@@ -108,7 +108,7 @@ class DynamoFreqSelector:
             if power_estimated < power:
                 power = power_estimated
                 chosen_freq = freq
-        return chosen_freq
+        return int(chosen_freq + 0.5)
 
 class NvmlFreqModulatorInterface(ABC):
 
@@ -419,7 +419,6 @@ class _MPNvmlFreqModulatorServer:
             if msg_encoded is None:
                 self.stop_frequency_manager()
                 break
-            assert isinstance(msg_encoded, float)
             # if step_id % self.mod_interval > 0:
             #     continue
             
@@ -429,7 +428,7 @@ class _MPNvmlFreqModulatorServer:
             # # logger.info('freq_mod_msg: %s', msg)
             logger.debug('freq_mod_msg: %s', msg)
 
-            selected_freq = msg.rps # TODO use the actual function
+            selected_freq = self.freq_selector.get_freq(msg.rps)
             # if msg.fromWho == "request_end":
             #     with self.underprediction_lock:
             #         if msg.batch_ID > self.last_finished_ID:
