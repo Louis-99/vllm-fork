@@ -127,6 +127,9 @@ class Scheduler(SchedulerInterface):
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self.last_running_len = 0
+        self.last_waiting_len = 0
+        self.last_token_budget_used = 0
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -575,6 +578,10 @@ class Scheduler(SchedulerInterface):
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
                     any_request, len(self.running)))
+            self.last_running_len = len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + \
+                                    len(scheduled_running_reqs)
+            self.last_waiting_len = len(self.waiting)
+            self.last_token_budget_used = self.max_num_scheduled_tokens - token_budget
 
         # Construct the scheduler output.
         new_reqs_data = [
@@ -1264,8 +1271,9 @@ class Scheduler(SchedulerInterface):
 
 
         return SchedulerStats(
-            num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting),
+            num_running_reqs=self.last_running_len,
+            num_waiting_reqs=self.last_waiting_len,
+            token_budget_used=self.last_token_budget_used,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,
