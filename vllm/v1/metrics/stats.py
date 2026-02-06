@@ -47,14 +47,7 @@ class SchedulerStats:
     now: float = 0.0
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
-    waiting_reqs_num_tokens: list[int] = field(default_factory=list)
-    running_reqs_num_tokens: list[int] = field(default_factory=list)
-    waiting_reqs_num_time: list[float] = field(default_factory=list)
-    running_reqs_num_time: list[float] = field(default_factory=list)
-    running_computed_tokens_list: list[int] = field(default_factory=list)
-    waiting_computed_tokens_list: list[int] = field(default_factory=list)
-    running_computed_req_list: list[str] = field(default_factory=list)
-    waiting_computed_req_list: list[str] = field(default_factory=list)
+    token_budget_used: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
