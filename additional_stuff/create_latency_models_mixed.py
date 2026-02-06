@@ -21,8 +21,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, QuantileTransformer
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, HistGradientBoostingRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_absolute_error, make_scorer, mean_squared_error
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType, StringTensorType
 import onnxruntime as ort
@@ -145,19 +145,63 @@ def build_pipeline(role='unified'):
         ('ohe_model', OneHotEncoder(handle_unknown='ignore', sparse_output=False), cat_cols)
     ], remainder=StandardScaler())
 
-    est = GradientBoostingRegressor(
-        n_estimators=200,
-        max_depth=15,
-        n_iter_no_change=10,
-        validation_fraction=0.05,
+    # est = GradientBoostingRegressor(
+    #     n_estimators=500,
+    #     random_state=42,
+    #     verbose=0,
+    #     n_iter_no_change=20,
+    #     validation_fraction=0.05,
+    #     tol=1e-5
+    # )
+
+    est = RandomForestRegressor(
         random_state=42,
-        verbose=2
+        n_jobs=30
     )
+
+    # est = HistGradientBoostingRegressor(
+    #     random_state=42,
+    #     verbose=0,
+    #     n_iter_no_change=20,
+    #     validation_fraction=0.05,
+    # )
+
 
     return Pipeline([('pre', pre), ('est', est)])
 
 
-def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_onnx=True, role: str = 'unified'):
+def get_param_grid():
+    """Define parameter grid for hyperparameter search"""
+    # param_grid = {
+    #     'est__max_depth': [15, 18],
+    #     'est__learning_rate': [0.15, 0.18],
+    #     'est__min_samples_split': [2, 3],
+    #     'est__min_samples_leaf': [2, 3],
+    #     'est__subsample': [0.95]
+    # }
+
+    param_grid = {
+        'est__max_depth': [18, 20, 22],
+        'est__min_samples_split': [2, 3],
+        'est__min_samples_leaf': [2, 3],
+        'est__n_estimators': [200, 300]
+    }
+
+    # param_grid = {
+    #     'est__max_depth': [15, 20],
+    #     'est__learning_rate': [0.1, 0.2],
+    #     'est__max_leaf_nodes': [20, 25, 30],
+    #     'est__max_depth': [10, 15, 20],
+    #     'est__min_samples_leaf': [10, 20, 30],
+    #     'est__monotonic_cst': [ (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),  # no monotonic constraints
+    #                             (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1),  # decreasing with freq_mhz
+    #                             (0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1)]  # decreasing with tp_degree and freq_mhz
+    # }
+    
+    return param_grid
+
+
+def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_onnx=True, role: str = 'unified', use_grid_search=True):
     results = {}
     df_t = df.dropna(subset=[target_col])
     if df_t.shape[0] < 10:
@@ -167,10 +211,56 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
     X = df_t[feature_cols]
     print(f"features used for {target_col}:", feature_cols)
     y = df_t[target_col].astype(float)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.05, random_state=42)
+    
     pipe = build_pipeline(role=role)
-    pipe.fit(X_train, y_train)
-    print("training completed. Max depth of trees:", pipe.named_steps['est'].max_depth)
+    
+    if use_grid_search:
+        print("\n=== Performing hyperparameter search with GridSearchCV ===")
+        param_grid = get_param_grid()
+        
+        # Custom scorer: 0 if abs(error) <= 0.001, else MSE
+        def custom_scorer(y_true, y_pred):
+            errors = np.abs(y_true - y_pred)
+            mse = errors ** 2
+            # Return negative MSE for errors > threshold, 0 for errors within threshold
+            return -np.where(errors <= 0.001, 0, mse).mean()
+        
+        scorer = make_scorer(custom_scorer, greater_is_better=True)
+        
+        grid_search = GridSearchCV(
+            pipe,
+            param_grid,
+            cv=5,
+            scoring=scorer,
+            n_jobs=1,
+            verbose=2,
+            return_train_score=True
+        )
+        
+        grid_search.fit(X_train, y_train)
+        
+        print("\n=== Best parameters found ===")
+        print(grid_search.best_params_)
+        print(f"Best cross-validation MAE: {-grid_search.best_score_:.6f}")
+        
+        # Use the best estimator
+        pipe = grid_search.best_estimator_
+        best_params = grid_search.best_params_
+        cv_results = pd.DataFrame(grid_search.cv_results_)
+        cv_results.to_csv(os.path.join(model_dir, f"{target_col}_grid_search_results.csv"), index=False)
+        print(f"Grid search results saved to: {os.path.join(model_dir, f'{target_col}_grid_search_results.csv')}")
+    else:
+        print("\n=== Training with default parameters (no grid search) ===")
+        pipe.fit(X_train, y_train)
+        best_params = None
+    
+    # Train with best parameters from grid search
+    if use_grid_search and best_params:
+        print("\n=== Retraining on full training set with best parameters ===")
+        pipe.fit(X_train, y_train)
+
+    print("Training completed.")
     y_pred = pipe.predict(X_test)
     mae = mean_absolute_error(y_test, y_pred)
     mape = (abs(y_test - y_pred) / y_test).mean() * 100
@@ -234,7 +324,8 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
         'mae': mae,
         'mape': mape,
         'n_train': len(X_train),
-        'category_metrics': category_metrics
+        'category_metrics': category_metrics,
+        'best_params': best_params
     }
     print(f"trained {target_col}: saved -> {joblib_path}  MAE={mae:.4f}  MAPE={mape:.4f}  train_rows={len(X_train)}")
 
@@ -315,6 +406,7 @@ def predict_with_model(inputs, model, feature_cols):
 def main():
     parser = argparse.ArgumentParser(description='Train unified latency model for prefill and decode')
     parser.add_argument('--model-dir', default=('/export2/obasit/ClusterLevelServing/vllm_profiler_logs/latency_model'), help='Directory to store trained models')
+    parser.add_argument('--no-grid-search', action='store_true', help='Disable hyperparameter grid search')
     args = parser.parse_args()
 
     # Data paths for prefill
@@ -336,7 +428,7 @@ def main():
     CSV_PATH_TP4_D3 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov21_TP4_decoder_latency_batchgt512/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
 
     # Data path for mixed
-    CSV_PATH_MIXED = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/batch_shapes_traces_and_runs/combined_profiling_results.csv"
+    CSV_PATH_MIXED = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/combined_profiling_results.csv"
 
     MODEL_DIR = os.path.join(args.model_dir)
 
@@ -413,7 +505,8 @@ def main():
         UNIFIED_OUT, 
         MODEL_DIR, 
         convert_onnx=True, 
-        role='unified'
+        role='unified',
+        use_grid_search=not args.no_grid_search
     )
 
     # Load model for sample inference
