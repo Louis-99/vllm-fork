@@ -1275,14 +1275,22 @@ def main():
     num_kv_groups = len(kv_cache_configs[0].kv_cache_groups)
     
     # Calculate total KV cache capacity (in tokens)
-    # Sum up num_blocks * block_size for each KV cache group
+    # Sum up num_blocks * block_size for each kv_cache_config
     kv_cache_max_tokens = 0
     for kv_cache_config in kv_cache_configs:
-        for group in kv_cache_config.kv_cache_groups:
-            num_blocks = group.num_blocks
-            # Each block holds block_size tokens
-            kv_cache_max_tokens += num_blocks * args.block_size
-    logger.info(f"Total KV cache capacity: {kv_cache_max_tokens} tokens")
+        # Each kv_cache_config has a pool with num_blocks
+        if hasattr(kv_cache_config, 'num_blocks'):
+            num_blocks = kv_cache_config.num_blocks
+        elif hasattr(kv_cache_config, 'num_gpu_blocks'):
+            num_blocks = kv_cache_config.num_gpu_blocks
+        else:
+            # Fallback: calculate from available memory
+            num_blocks = (available_memory[0] * args.gpu_memory_utilization) // (args.block_size * 2 * 2)  # Rough estimate
+            print(f"fall backfall backfall backfall backfall backfall backfall backfall backfall backfall backfall backfall backfall backfall backfall backfall back")
+        
+        # Each block holds block_size tokens, multiply by num_kv_groups for total capacity
+        kv_cache_max_tokens = num_blocks * args.block_size * num_kv_groups
+    print(f"Total KV cache capacity: {kv_cache_max_tokens} tokens")
     
     # Profile execution - run all tests
     logger.info(f"Starting profiling with {len(test_configs)} test(s)...")
