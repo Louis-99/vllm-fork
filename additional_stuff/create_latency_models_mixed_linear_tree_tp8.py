@@ -17,8 +17,8 @@ import argparse
 import joblib
 import pandas as pd
 import numpy as np
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
+from sklearn.pipeline import FunctionTransformer, Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, QuantileTransformer
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.model_selection import train_test_split, GridSearchCV
@@ -32,8 +32,6 @@ import onnxruntime as ort
 import onnxmltools
 import onnxmltools.convert.lightgbm.shape_calculators 
 import onnxmltools.convert.lightgbm.operator_converters
-
-from sklearn.neural_network import MLPRegressor
 
 from lightgbm import LGBMRegressor
 
@@ -161,6 +159,7 @@ def build_pipeline(role='unified'):
     pre = ColumnTransformer([
         ('ohe_model', OneHotEncoder(handle_unknown='ignore', sparse_output=False), cat_cols)
     ], remainder=StandardScaler())
+    pre.set_output(transform="pandas")  # Preserve DataFrame structure and column names
 
     # est = GradientBoostingRegressor(
     #     n_estimators=500,
@@ -186,11 +185,32 @@ def build_pipeline(role='unified'):
     est = LGBMRegressor(
         random_state=42, 
         linear_tree=True,
-        device_type='gpu',
+        device_type='cpu',
         monotone_constraints_method='intermediate',
+        n_jobs=32,
+        force_col_wise=True,
+        verbose=-1
     )
 
-    return Pipeline([('pre', pre), ('est', est)])
+    pipe = Pipeline([
+        ('pre', pre), 
+        ('est', est),
+        ('exp', FunctionTransformer(np.exp, validate=False))
+    ])
+
+    pipe = Pipeline([
+        ('pre', pre), 
+        ('est', est)
+    ])
+
+    # Wrap pipeline to apply log transform to target and exp to predictions
+    pipe_with_exp = TransformedTargetRegressor(
+        regressor=pipe,
+        func=np.log,
+        inverse_func=np.exp
+    )
+
+    return pipe_with_exp
 
 
 def get_param_grid():
@@ -223,21 +243,19 @@ def get_param_grid():
 
     param_grid = {
         # 'est__boosting_type': ['gbdt', 'dart', 'rf'],
-        'est__boosting_type': ['gbdt'],
-        'est__num_leaves': [30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
-        'est__num_iterations': [100, 200, 300, 400],
-        # 'est__learning_rate': [0.08, 0.1, 0.15, 2.0],
-        'est__learning_rate': [1e-1],
-        'est__min_child_samples': [20, 30, 40, 50],
-        'est__monotonic_cst': [ 
+        'regressor__est__boosting_type': ['gbdt'],
+        'regressor__est__num_leaves': [50, 60, 70],
+        'regressor__est__num_iterations': [200, 300],
+        'regressor__est__learning_rate': [0.08, 0.1],
+        'regressor__est__learning_rate': [1e-1],
+        'regressor__est__min_child_samples': [30, 40, 50],
+        'regressor__est__monotonic_cst': [ 
             (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),      # no monotonic constraints
-            # (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1),     # decreasing with freq_mhz
-            # (0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1),
-        ],   # decreasing with tp_degree and freq_mhz
+        ],   
         # 'est__linear_lambda': [0, 1e-1, 1e-2, 1e-3],
-        'est__linear_lambda': [0, 1e-3],
+        'regressor__est__linear_lambda': [0, 1e-3],
         # 'est__reg_lambda': [0, 1e-1, 1e-2, 1e-3],
-        'est__reg_lambda': [1e-2],
+        'regressor__est__reg_lambda': [1e-2],
     }
     
     return param_grid
@@ -279,7 +297,7 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
                 param_grid,
                 cv=5,
                 scoring=scorer,
-                # n_jobs=1,
+                n_jobs=1,
                 verbose=2,
                 return_train_score=True
             )
@@ -450,7 +468,7 @@ def predict_with_model(inputs, model, feature_cols):
 
 def main():
     parser = argparse.ArgumentParser(description='Train unified latency model for prefill and decode')
-    parser.add_argument('--model-dir', default=('/export1/liu3882/llm_energy/tmp_model_storage/tmp_new_search'), help='Directory to store trained models')
+    parser.add_argument('--model-dir', default=('/export2/obasit/ClusterLevelServing/vllm_profiler_logs/latency_model/lightgbm_tp8'), help='Directory to store trained models')
     parser.add_argument('--no-grid-search', action='store_true', help='Disable hyperparameter grid search')
     args = parser.parse_args()
 
@@ -485,7 +503,7 @@ def main():
         'tp_degree', 'freq_mhz'
     ]
     UNIFIED_TARGET = 'latency_s'
-    UNIFIED_OUT = 'unified_latency_model.joblib'
+    UNIFIED_OUT = 'unified_latency_model_tp8.joblib'
 
     print('\n=== Loading and preprocessing all data (prefill, decode, mixed) ===')
     

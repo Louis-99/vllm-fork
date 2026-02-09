@@ -21,13 +21,12 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor, RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_absolute_error, make_scorer
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType, StringTensorType
 import onnxruntime as ort
-from sklearn.neural_network import MLPRegressor
-
+from lightgbm import LGBMRegressor
 
 def load_and_prepare_prefill(path, model_name, tp=None):
     """Load prefill power data and convert to unified format with decode features = 0"""
@@ -39,7 +38,7 @@ def load_and_prepare_prefill(path, model_name, tp=None):
     # Map to unified format with prefill-specific columns
     df_unified = pd.DataFrame({
         'model': df['model'],
-        'prefill_total_batches': df['batch_size'],
+        'prefill_batch_size': df['batch_size'],
         'prefill_input_len_sum': df['input_len_sum'],
         'prefill_input_len_mean': df['input_len_mean'],
         'prefill_input_len_std': df['input_len_std'],
@@ -65,7 +64,7 @@ def load_and_prepare_decode(path, model_name, tp=None):
     # Map to unified format with decode-specific columns
     df_unified = pd.DataFrame({
         'model': df['model'],
-        'prefill_total_batches': 0,
+        'prefill_batch_size': 0,
         'prefill_input_len_sum': 0,
         'prefill_input_len_mean': 0,
         'prefill_input_len_std': 0,
@@ -91,7 +90,7 @@ def load_and_prepare_mixed(path, model_name):
     df_unified = pd.DataFrame({
         'test_name': df['test_name'],  # keep for reference
         'model': df['model'],
-        'prefill_total_batches': df['num_prefill_reqs'],
+        'prefill_batch_size': df['num_prefill_reqs'],
         'prefill_input_len_sum': df['sum_ctx_len'],
         'prefill_input_len_mean': df['mean_ctx_len'],
         'prefill_input_len_std': df['std_ctx_len'],
@@ -110,7 +109,7 @@ def load_and_prepare_mixed(path, model_name):
 def filter_inputs(df):
     """Filter to keep only median power for duplicate configurations"""
     print("before filtering:", df.shape)
-    group_cols = ['model', 'prefill_total_batches', 'prefill_input_len_sum', 'prefill_input_len_mean', 
+    group_cols = ['model', 'prefill_batch_size', 'prefill_input_len_sum', 'prefill_input_len_mean', 
                   'prefill_input_len_std', 'decode_batch_size', 'decode_input_len_sum', 
                   'decode_input_len_mean', 'decode_input_len_std', 'tp_degree', 'freq_mhz']
     df_filtered = df.groupby(group_cols).median().reset_index()
@@ -127,22 +126,43 @@ def build_pipeline(role='unified'):
     # OneHotEncoder for `model` and StandardScaler for remainder
     cat_cols = ['model']
     pre = ColumnTransformer([
-        ('ohe_model', OneHotEncoder(handle_unknown='ignore'), cat_cols)
+        ('ohe_model', OneHotEncoder(handle_unknown='ignore', sparse_output=False), cat_cols)
     ], remainder=StandardScaler())
+    pre.set_output(transform="pandas")  # Preserve DataFrame structure and column names
 
-    est = GradientBoostingRegressor(
-        n_estimators=200,
-        max_depth=None,
-        n_iter_no_change=10,
-        validation_fraction=0.05,
-        random_state=42,
-        verbose=2
+    est = LGBMRegressor(
+        random_state=42, 
+        linear_tree=True,
+        device_type='cpu',
+        monotone_constraints_method='intermediate',
+        n_jobs=32,
+        force_col_wise=True,
+        verbose=-1
     )
 
     return Pipeline([('pre', pre), ('est', est)])
 
 
-def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_onnx=True, role: str = 'unified'):
+def get_param_grid():
+    """Define parameter grid for hyperparameter search"""
+    param_grid = {
+        'est__boosting_type': ['gbdt'],
+        'est__num_leaves': [70, 80, 90],
+        'est__num_iterations': [300, 400],
+        'est__learning_rate': [0.08, 0.1],
+        'est__learning_rate': [1e-1],
+        'est__min_child_samples': [30, 40],
+        'est__monotonic_cst': [ 
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),      # no monotonic constraints
+        ],   
+        'est__linear_lambda': [0, 1e-3],
+        'est__reg_lambda': [1e-2],
+    }
+    
+    return param_grid
+
+
+def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_onnx=True, role: str = 'unified', use_grid_search=True):
     results = {}
     df_t = df.dropna(subset=[target_col])
     if df_t.shape[0] < 10:
@@ -153,8 +173,53 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
     print(f"features used for {target_col}:", feature_cols)
     y = df_t[target_col].astype(float)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
     pipe = build_pipeline(role=role)
-    pipe.fit(X_train, y_train)
+    
+    if use_grid_search:
+        print("\n=== Performing hyperparameter search with GridSearchCV ===")
+        param_grid = get_param_grid()
+        
+        scorer = make_scorer(mean_absolute_error, greater_is_better=False)
+        
+        grid_search = GridSearchCV(
+            pipe,
+            param_grid,
+            cv=5,
+            scoring=scorer,
+            n_jobs=1,
+            return_train_score=True
+        )
+        
+        grid_search.fit(X_train, y_train)
+        
+        print("\n=== Best parameters found ===")
+        print(grid_search.best_params_)
+        print(f"Best cross-validation MAE: {-grid_search.best_score_:.4f}")
+        
+        # Use the best estimator
+        pipe = grid_search.best_estimator_
+        best_params = grid_search.best_params_
+        cv_results = pd.DataFrame(grid_search.cv_results_)
+        cv_results.to_csv(os.path.join(model_dir, f"{target_col}_grid_search_results.csv"), index=False)
+        print(f"Grid search results saved to: {os.path.join(model_dir, f'{target_col}_grid_search_results.csv')}")
+
+        # Re-train on full training set with best parameters
+        if use_grid_search and best_params:
+            print("\n=== Re-training on full training set with best parameters ===")
+            pipe_final = build_pipeline(role=role)
+            # Set best parameters
+            for param_name, param_value in best_params.items():
+                pipe_final.set_params(**{param_name: param_value})
+            pipe_final.fit(X_train, y_train)
+            pipe = pipe_final
+    else:
+        print("\n=== Training with default parameters (no grid search) ===")
+        pipe.fit(X_train, y_train)
+        best_params = None
+
+    
+    
     y_pred = pipe.predict(X_test)
     mae = mean_absolute_error(y_test, y_pred)
     mape = (abs(y_test - y_pred) / y_test).mean() * 100
@@ -165,9 +230,9 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
     X_test_with_pred['predicted'] = y_pred
     
     # Identify categories based on batch sizes
-    is_prefill_only = (X_test_with_pred['prefill_total_batches'] > 0) & (X_test_with_pred['decode_batch_size'] == 0)
-    is_decode_only = (X_test_with_pred['prefill_total_batches'] == 0) & (X_test_with_pred['decode_batch_size'] > 0)
-    is_mixed = (X_test_with_pred['prefill_total_batches'] > 0) & (X_test_with_pred['decode_batch_size'] > 0)
+    is_prefill_only = (X_test_with_pred['prefill_batch_size'] > 0) & (X_test_with_pred['decode_batch_size'] == 0)
+    is_decode_only = (X_test_with_pred['prefill_batch_size'] == 0) & (X_test_with_pred['decode_batch_size'] > 0)
+    is_mixed = (X_test_with_pred['prefill_batch_size'] > 0) & (X_test_with_pred['decode_batch_size'] > 0)
     
     category_metrics = {}
     for category_name, mask in [('prefill_only', is_prefill_only), 
@@ -218,7 +283,8 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
         'mae': mae,
         'mape': mape,
         'n_train': len(X_train),
-        'category_metrics': category_metrics
+        'category_metrics': category_metrics,
+        'best_params': best_params
     }
     print(f"trained {target_col}: saved -> {joblib_path}  MAE={mae:.4f}  MAPE={mape:.4f}  train_rows={len(X_train)}")
 
@@ -299,6 +365,7 @@ def predict_with_model(inputs, model, feature_cols):
 def main():
     parser = argparse.ArgumentParser(description='Train unified power model for prefill and decode')
     parser.add_argument('--model-dir', default=('/export2/obasit/ClusterLevelServing/vllm_profiler_logs/power_model'), help='Directory to store trained models')
+    parser.add_argument('--no-grid-search', action='store_true', help='Disable hyperparameter grid search')
     args = parser.parse_args()
 
     # Data paths for decode
@@ -323,7 +390,7 @@ def main():
     # Unified feature columns (both prefill and decode features)
     UNIFIED_FEATURE_COLS = [
         'model',
-        'prefill_total_batches', 'prefill_input_len_sum', 'prefill_input_len_mean', 'prefill_input_len_std',
+        'prefill_batch_size', 'prefill_input_len_sum', 'prefill_input_len_mean', 'prefill_input_len_std',
         'decode_batch_size', 'decode_input_len_sum', 'decode_input_len_mean', 'decode_input_len_std',
         'tp_degree', 'freq_mhz'
     ]
@@ -391,7 +458,8 @@ def main():
         UNIFIED_OUT, 
         MODEL_DIR, 
         convert_onnx=True, 
-        role='unified'
+        role='unified',
+        use_grid_search=not args.no_grid_search
     )
 
     # Load model for sample inference
@@ -406,7 +474,7 @@ def main():
         # Example 1: Pure prefill (decode features = 0)
         sample_prefill = [
             'Llama-3.3-70B-Instruct',
-            10,  # prefill_total_batches
+            10,  # prefill_batch_size
             5000,  # prefill_input_len_sum
             500,  # prefill_input_len_mean
             100,  # prefill_input_len_std
@@ -421,7 +489,7 @@ def main():
         # Example 2: Pure decode (prefill features = 0)
         sample_decode = [
             'Llama-3.3-70B-Instruct',
-            0,  # prefill_total_batches
+            0,  # prefill_batch_size
             0,  # prefill_input_len_sum
             0,  # prefill_input_len_mean
             0,  # prefill_input_len_std
@@ -436,7 +504,7 @@ def main():
         # Example 3: Mixed (both prefill and decode)
         sample_mixed = [
             'Llama-3.3-70B-Instruct',
-            1,  # prefill_total_batches
+            1,  # prefill_batch_size
             354,  # prefill_input_len_sum
             354,  # prefill_input_len_mean
             0,  # prefill_input_len_std
