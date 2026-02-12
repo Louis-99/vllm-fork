@@ -296,7 +296,7 @@ class _MPNvmlFreqModulatorServer:
     def run(self):
         if not self.init_done:
             self.init_done = True
-            # self.underprediction_lock = threading.Lock()
+            self.underprediction_lock = threading.Lock()
             self._load_models()
             self.start_frequency_manager()
             self.csv_writer = CSVWriter(col_names=[
@@ -404,7 +404,7 @@ class _MPNvmlFreqModulatorServer:
         run_wait = np.asarray(freq_mod_msg.running_queue_wait_time[future_states[0].num_decodes:], dtype=np.float32)
         wait_wait = np.asarray(freq_mod_msg.waiting_queue_wait_time, dtype=np.float32)
         waiting_time_per_req = np.concatenate((run_wait, wait_wait), axis=0).reshape(-1, 1)
-        logger.info(f'Waiting time per req vector: {waiting_time_per_req.flatten().tolist()}')
+        
         # Start with the highest freq for each window
         selected_freq_ids = [0 for _ in range(max_future_vision)]
         for freq_idx in range(1, len(freq_choices_desc) - 1):
