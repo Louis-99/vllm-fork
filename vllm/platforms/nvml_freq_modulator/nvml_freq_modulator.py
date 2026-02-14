@@ -342,11 +342,11 @@ class _MPNvmlFreqModulatorServer:
             freq_mod_end = time.perf_counter()
 
             # decide later what to do with this
-            # timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
-            #                                             self.check_underprediction, 
-            #                                             args=(msg.batch_ID,))
-            # timer_to_check_underpred.daemon = True
-            # timer_to_check_underpred.start()
+            timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
+                                                        self.check_underprediction, 
+                                                        args=(msg.batch_ID,))
+            timer_to_check_underpred.daemon = True
+            timer_to_check_underpred.start()
 
             
             self.csv_writer.add_row([
