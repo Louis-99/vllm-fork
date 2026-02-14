@@ -583,7 +583,7 @@ class _MPNvmlFreqModulatorServer:
         n_states = len(states)
         n_freqs = len(freq_choices)
 
-        freq_arr = np.array(freq_choices, dtype=np.float32)
+        freq_arr = np.log1p(freq_choices, dtype=np.float32)
         prefill_bs_vec = np.log1p([st.num_prefills for st in states], dtype=np.float32)
         prefill_ils_vec = np.log1p([st.prefill_len_sum for st in states], dtype=np.float32)
         prefill_ilm_vec = np.log1p([st.prefill_len_mean for st in states], dtype=np.float32)
@@ -619,9 +619,8 @@ class _MPNvmlFreqModulatorServer:
         }
 
         out = self.latency_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)
-        out = np.exp(np.asarray(out))
+        out = np.exp(out)
         out = np.clip(out, 0.005, None)
-        
         latency_mat = out.reshape(n_states, n_freqs)
         return latency_mat
 
@@ -634,7 +633,7 @@ class _MPNvmlFreqModulatorServer:
         n_states = len(states)
         n_freqs = len(freq_choices)
 
-        freq_arr = np.array(freq_choices, dtype=np.float32)
+        freq_arr = np.log1p(freq_choices, dtype=np.float32)
         prefill_bs_vec = np.log1p([st.num_prefills for st in states], dtype=np.float32)
         prefill_ils_vec = np.log1p([st.prefill_len_sum for st in states], dtype=np.float32)
         prefill_ilm_vec = np.log1p([st.prefill_len_mean for st in states], dtype=np.float32)
@@ -670,7 +669,6 @@ class _MPNvmlFreqModulatorServer:
         }
 
         out = self.power_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)
-
         # reshape back to (n_future_states, n_freq_choices)
         output_arr = np.exp(np.asarray(out)).reshape(n_states, n_freqs)
         return output_arr
@@ -795,8 +793,10 @@ class _MPNvmlFreqModulatorServer:
 
 if __name__ == '__main__':
     q: SimpleQueue = SimpleQueue()
-    vllm_config = VllmConfig()
+    from vllm.config import ParallelConfig, SchedulerConfig
     from vllm.config.kv_transfer import KVTransferConfig
+    
+    vllm_config = VllmConfig()
     vllm_config.kv_transfer_config = KVTransferConfig()
     vllm_config.model_config = ModelConfig(
         model='meta-llama/Llama-3.3-70B-Instruct',
@@ -808,20 +808,24 @@ if __name__ == '__main__':
         dtype='float32',
         seed=0,
     )
+    vllm_config.parallel_config = ParallelConfig()
     vllm_config.parallel_config.tensor_parallel_size = 4
+    vllm_config.scheduler_config = SchedulerConfig()
+    vllm_config.log_dir = './logs'
+    
     freq_choices = get_preselected_freq(get_gpu_name())
-    s = _MPNvmlFreqModulatorServer(freq_choices=freq_choices,
-                                   vllm_config=vllm_config,
-                                   q=q,
-                                   log_dir=Path('./logs'),
-                                   optim_target='power',
-                                   mod_interval=1,
-                                   future_window=8,
-                                   engine_role='prefill',    
-                                   tbt_sla=0.1,
-                                   ttft_sla=0.6,
-                                   token_budget=2048,
-                                   )
+    s = _MPNvmlFreqModulatorServer(
+        vllm_config=vllm_config,
+        freq_choices=freq_choices,
+        q=q,
+        log_dir=Path('./logs'),
+        optim_target='power',
+        mod_interval=1,
+        tbt_sla=0.1,
+        ttft_sla=0.6,
+        future_window=8,
+        token_budget=2048,
+    )
     msg = [
         FreqModMsg(
             now=0.0,
@@ -832,37 +836,45 @@ if __name__ == '__main__':
             waiting_queue_tokens=[1200, 1200, 1200],
             waiting_queue_pre_computed_tokens=[0, 0, 0],
             waiting_queue_wait_time=[0.15, 0.15, 0.15],
+            fromWho='scheduler',
+            batch_ID=0,
         ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[200, 512],
-        #     running_queue_pre_computed_tokens=[0, 0],
-        #     running_queue_wait_time=[0.001, 0.002],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[1200],
-        #     waiting_queue_pre_computed_tokens=[0],
-        #     waiting_queue_wait_time=[0.15],
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[16],
-        #     running_queue_pre_computed_tokens=[0],
-        #     running_queue_wait_time=[0.001],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[],
-        #     waiting_queue_pre_computed_tokens=[],
-        #     waiting_queue_wait_time=[],
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[520, 0],
-        #     running_queue_wait_time=[0.01, 0.02],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[1200, 1200, 1200, 777, 666, 555, 888],
-        #     waiting_queue_pre_computed_tokens=[0, 0, 0, 0, 0, 0, 0],
-        #     waiting_queue_wait_time=[0.11, 0.12, 0.13, 0.13, 0.14, 0.157, 0.20],
-        # ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[200, 512],
+            running_queue_pre_computed_tokens=[0, 0],
+            running_queue_wait_time=[0.001, 0.002],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[1200],
+            waiting_queue_pre_computed_tokens=[0],
+            waiting_queue_wait_time=[0.15],
+            fromWho='scheduler',
+            batch_ID=1,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[16],
+            running_queue_pre_computed_tokens=[0],
+            running_queue_wait_time=[0.001],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[],
+            waiting_queue_pre_computed_tokens=[],
+            waiting_queue_wait_time=[],
+            fromWho='scheduler',
+            batch_ID=2,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[520, 0],
+            running_queue_wait_time=[0.01, 0.02],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[1200, 1200, 1200, 777, 666, 555, 888],
+            waiting_queue_pre_computed_tokens=[0, 0, 0, 0, 0, 0, 0],
+            waiting_queue_wait_time=[0.11, 0.12, 0.13, 0.13, 0.14, 0.157, 0.20],
+            fromWho='scheduler',
+            batch_ID=3,
+        ),
         ]
     for i in range(len(msg)):
         q.put(msgspec.msgpack.encode(msg[i]))
