@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
 import multiprocessing
 import os
@@ -391,7 +391,7 @@ class _MPNvmlFreqModulatorServer:
         max_future_vision = self.future_windows if max_prefills > self.future_windows else max_prefills
         future_states = future_states[:max_future_vision]
         # Pre-compute latency and power for each future window for each freq
-        with ProcessPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             lat_future = executor.submit(self.predict_latencies_future_states, future_states, freq_choices_desc)
             power_future = executor.submit(self.predict_powers_future_states, future_states, freq_choices_desc)
             lat_mat = lat_future.result()
@@ -583,7 +583,7 @@ class _MPNvmlFreqModulatorServer:
         n_states = len(states)
         n_freqs = len(freq_choices)
 
-        freq_arr = np.log1p(freq_choices, dtype=np.float32)
+        freq_arr = np.array(freq_choices, dtype=np.float32)
         prefill_bs_vec = np.log1p([st.num_prefills for st in states], dtype=np.float32)
         prefill_ils_vec = np.log1p([st.prefill_len_sum for st in states], dtype=np.float32)
         prefill_ilm_vec = np.log1p([st.prefill_len_mean for st in states], dtype=np.float32)
@@ -618,8 +618,7 @@ class _MPNvmlFreqModulatorServer:
             "freq_mhz": freqs,
         }
 
-        out = self.latency_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)[0]
-
+        out = self.latency_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)
         out = np.exp(np.asarray(out))
         out = np.clip(out, 0.005, None)
         
@@ -635,7 +634,7 @@ class _MPNvmlFreqModulatorServer:
         n_states = len(states)
         n_freqs = len(freq_choices)
 
-        freq_arr = np.log1p(freq_choices, dtype=np.float32)
+        freq_arr = np.array(freq_choices, dtype=np.float32)
         prefill_bs_vec = np.log1p([st.num_prefills for st in states], dtype=np.float32)
         prefill_ils_vec = np.log1p([st.prefill_len_sum for st in states], dtype=np.float32)
         prefill_ilm_vec = np.log1p([st.prefill_len_mean for st in states], dtype=np.float32)
@@ -670,7 +669,7 @@ class _MPNvmlFreqModulatorServer:
             "freq_mhz": freqs,
         }
 
-        out = self.power_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)[0]
+        out = self.power_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)
 
         # reshape back to (n_future_states, n_freq_choices)
         output_arr = np.exp(np.asarray(out)).reshape(n_states, n_freqs)
