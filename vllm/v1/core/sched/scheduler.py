@@ -1147,9 +1147,7 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def make_nvml_stats(self, wait_q: list[Request]) -> None:
-        if self.freq_modulator and \
-            self.vllm_config.kv_transfer_config and \
-            self.vllm_config.kv_transfer_config.is_kv_producer:
+        if self.freq_modulator is not None:
 
             now = time.time()
             num_waiting_reqs = len(self.waiting)
