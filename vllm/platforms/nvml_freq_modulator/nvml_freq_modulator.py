@@ -288,9 +288,9 @@ class _MPNvmlFreqModulatorServer:
             lat_path = PATH_TO_MODELS / 'unified_latency_model_tp2_tp4.joblib'
         
         if power_path.exists():
-            self.power_model = joblib.load(power_path)
+            self.power_model = joblib.load(power_path)['model']
         if lat_path.exists():
-            self.latency_model = joblib.load(lat_path)
+            self.latency_model = joblib.load(lat_path)['model']
                     
 
     def run(self):
@@ -391,10 +391,11 @@ class _MPNvmlFreqModulatorServer:
         max_future_vision = self.future_windows if max_prefills > self.future_windows else max_prefills
         future_states = future_states[:max_future_vision]
         # Pre-compute latency and power for each future window for each freq
-        lat_mat = self.predict_latencies_future_states(future_states,
-                                    freq_choices_desc)
-        power_mat = self.predict_powers_future_states(
-            future_states, freq_choices_desc)
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            lat_future = executor.submit(self.predict_latencies_future_states, future_states, freq_choices_desc)
+            power_future = executor.submit(self.predict_powers_future_states, future_states, freq_choices_desc)
+            lat_mat = lat_future.result()
+            power_mat = power_future.result()
         energy_mat = lat_mat * power_mat
         assert lat_mat.shape == (max_future_vision, len(freq_choices_desc))
         assert power_mat.shape == (max_future_vision, len(freq_choices_desc))
@@ -582,15 +583,15 @@ class _MPNvmlFreqModulatorServer:
         n_states = len(states)
         n_freqs = len(freq_choices)
 
-        freq_arr = np.array(freq_choices, dtype=np.float32)
-        prefill_bs_vec = np.array([st.num_prefills for st in states], dtype=np.float32)
-        prefill_ils_vec = np.array([st.prefill_len_sum for st in states], dtype=np.float32)
-        prefill_ilm_vec = np.array([st.prefill_len_mean for st in states], dtype=np.float32)
-        prefill_ilsd_vec = np.array([st.prefill_len_std for st in states], dtype=np.float32)
-        decode_bs_vec = np.array([st.num_decodes for st in states], dtype=np.float32)
-        decode_ils_vec = np.array([st.decode_len_sum for st in states], dtype=np.float32)
-        decode_ilm_vec = np.array([st.decode_len_mean for st in states], dtype=np.float32)
-        decode_ilsd_vec = np.array([st.decode_len_std for st in states], dtype=np.float32)
+        freq_arr = np.log1p(freq_choices, dtype=np.float32)
+        prefill_bs_vec = np.log1p([st.num_prefills for st in states], dtype=np.float32)
+        prefill_ils_vec = np.log1p([st.prefill_len_sum for st in states], dtype=np.float32)
+        prefill_ilm_vec = np.log1p([st.prefill_len_mean for st in states], dtype=np.float32)
+        prefill_ilsd_vec = np.log1p([st.prefill_len_std for st in states], dtype=np.float32)
+        decode_bs_vec = np.log1p([st.num_decodes for st in states], dtype=np.float32)
+        decode_ils_vec = np.log1p([st.decode_len_sum for st in states], dtype=np.float32)
+        decode_ilm_vec = np.log1p([st.decode_len_mean for st in states], dtype=np.float32)
+        decode_ilsd_vec = np.log1p([st.decode_len_std for st in states], dtype=np.float32)
 
         freqs = np.tile(freq_arr, n_states).astype(np.float32)
         batch_sizes = np.repeat(prefill_bs_vec, n_freqs).astype(np.float32)
@@ -603,13 +604,8 @@ class _MPNvmlFreqModulatorServer:
         decode_input_len_stds = np.repeat(decode_ilsd_vec, n_freqs).astype(np.float32)
         tp_degrees = np.full(n_states * n_freqs, float(self.tp_degree), dtype=np.float32)
 
-        n_rows = n_states * n_freqs
-
         # Build input feed for the latency model using numpy arrays directly
-        # Build model column using np.full to avoid intermediate Python list
-        model_col = np.full((n_rows, 1), self.model, dtype=str)
         input_feed = {
-            "model": model_col.flatten(),
             "prefill_batch_size": batch_sizes,
             "prefill_input_len_sum": prefill_input_len_sums,
             "prefill_input_len_mean": prefill_input_len_means,
@@ -622,9 +618,9 @@ class _MPNvmlFreqModulatorServer:
             "freq_mhz": freqs,
         }
 
-        out = self.latency_model.predict(pd.DataFrame(input_feed))
+        out = self.latency_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)[0]
 
-        out = np.asarray(out)
+        out = np.exp(np.asarray(out))
         out = np.clip(out, 0.005, None)
         
         latency_mat = out.reshape(n_states, n_freqs)
@@ -639,15 +635,15 @@ class _MPNvmlFreqModulatorServer:
         n_states = len(states)
         n_freqs = len(freq_choices)
 
-        freq_arr = np.array(freq_choices, dtype=np.float32)
-        prefill_bs_vec = np.array([st.num_prefills for st in states], dtype=np.float32)
-        prefill_ils_vec = np.array([st.prefill_len_sum for st in states], dtype=np.float32)
-        prefill_ilm_vec = np.array([st.prefill_len_mean for st in states], dtype=np.float32)
-        prefill_ilsd_vec = np.array([st.prefill_len_std for st in states], dtype=np.float32)
-        decode_bs_vec = np.array([st.num_decodes for st in states], dtype=np.float32)
-        decode_ils_vec = np.array([st.decode_len_sum for st in states], dtype=np.float32)
-        decode_ilm_vec = np.array([st.decode_len_mean for st in states], dtype=np.float32)
-        decode_ilsd_vec = np.array([st.decode_len_std for st in states], dtype=np.float32)
+        freq_arr = np.log1p(freq_choices, dtype=np.float32)
+        prefill_bs_vec = np.log1p([st.num_prefills for st in states], dtype=np.float32)
+        prefill_ils_vec = np.log1p([st.prefill_len_sum for st in states], dtype=np.float32)
+        prefill_ilm_vec = np.log1p([st.prefill_len_mean for st in states], dtype=np.float32)
+        prefill_ilsd_vec = np.log1p([st.prefill_len_std for st in states], dtype=np.float32)
+        decode_bs_vec = np.log1p([st.num_decodes for st in states], dtype=np.float32)
+        decode_ils_vec = np.log1p([st.decode_len_sum for st in states], dtype=np.float32)
+        decode_ilm_vec = np.log1p([st.decode_len_mean for st in states], dtype=np.float32)
+        decode_ilsd_vec = np.log1p([st.decode_len_std for st in states], dtype=np.float32)
 
         freqs = np.tile(freq_arr, n_states).astype(np.float32)
         batch_sizes = np.repeat(prefill_bs_vec, n_freqs).astype(np.float32)
@@ -660,13 +656,8 @@ class _MPNvmlFreqModulatorServer:
         decode_input_len_stds = np.repeat(decode_ilsd_vec, n_freqs).astype(np.float32)
         tp_degrees = np.full(n_states * n_freqs, float(self.tp_degree), dtype=np.float32)
 
-        n_rows = n_states * n_freqs
-
         # Build input feed for the latency model using numpy arrays directly
-        # Build model column using np.full to avoid intermediate Python list
-        model_col = np.full((n_rows, 1), self.model, dtype=str)
         input_feed = {
-            "model": model_col.flatten(),
             "prefill_batch_size": batch_sizes,
             "prefill_input_len_sum": prefill_input_len_sums,
             "prefill_input_len_mean": prefill_input_len_means,
@@ -679,10 +670,10 @@ class _MPNvmlFreqModulatorServer:
             "freq_mhz": freqs,
         }
 
-        out = self.power_model.predict(pd.DataFrame(input_feed))
+        out = self.power_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)[0]
 
         # reshape back to (n_future_states, n_freq_choices)
-        output_arr = np.asarray(out).reshape(n_states, n_freqs)
+        output_arr = np.exp(np.asarray(out)).reshape(n_states, n_freqs)
         return output_arr
 
 
