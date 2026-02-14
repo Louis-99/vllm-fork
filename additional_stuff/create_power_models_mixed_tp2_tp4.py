@@ -34,11 +34,9 @@ def load_and_prepare_prefill(path, model_name, tp=None):
     df = pd.read_csv(path)
     if tp is not None:
         df['tp_degree'] = tp
-    df['model'] = model_name
     
     # Map to unified format with prefill-specific columns
     df_unified = pd.DataFrame({
-        'model': df['model'],
         'prefill_batch_size': df['batch_size'],
         'prefill_input_len_sum': df['input_len_sum'],
         'prefill_input_len_mean': df['input_len_mean'],
@@ -60,11 +58,9 @@ def load_and_prepare_decode(path, model_name, tp=None):
     df = pd.read_csv(path)
     if tp is not None:
         df['tp_degree'] = tp
-    df['model'] = model_name
     
     # Map to unified format with decode-specific columns
     df_unified = pd.DataFrame({
-        'model': df['model'],
         'prefill_batch_size': 0,
         'prefill_input_len_sum': 0,
         'prefill_input_len_mean': 0,
@@ -84,13 +80,11 @@ def load_and_prepare_decode(path, model_name, tp=None):
 def load_and_prepare_mixed(path, model_name):
     """Load mixed power data from combined_profiling_results.csv"""
     df = pd.read_csv(path)
-    df['model'] = model_name
     
     # Map combined_profiling_results columns to unified format
     # For mixed data, we need to estimate prefill features from the mixed batch
     df_unified = pd.DataFrame({
         'test_name': df['test_name'],  # keep for reference
-        'model': df['model'],
         'prefill_batch_size': df['num_prefill_reqs'],
         'prefill_input_len_sum': df['sum_ctx_len'],
         'prefill_input_len_mean': df['mean_ctx_len'],
@@ -110,7 +104,7 @@ def load_and_prepare_mixed(path, model_name):
 def filter_inputs(df):
     """Filter to keep only median power for duplicate configurations"""
     print("before filtering:", df.shape)
-    group_cols = ['model', 'prefill_batch_size', 'prefill_input_len_sum', 'prefill_input_len_mean', 
+    group_cols = ['prefill_batch_size', 'prefill_input_len_sum', 'prefill_input_len_mean', 
                   'prefill_input_len_std', 'decode_batch_size', 'decode_input_len_sum', 
                   'decode_input_len_mean', 'decode_input_len_std', 'tp_degree', 'freq_mhz']
     df_filtered = df.groupby(group_cols).median().reset_index()
@@ -118,64 +112,65 @@ def filter_inputs(df):
     return df_filtered
 
 
-def build_pipeline(role='unified'):
-    """Build a preprocessing + estimator pipeline.
+def build_model(role='unified'):
+    """Build just the estimator (no pipeline).
 
     Parameters:
     - role: 'unified' for combined prefill/decode model
     """
-    # OneHotEncoder for `model` and StandardScaler for remainder
-    cat_cols = ['model']
-    pre = ColumnTransformer([
-        ('ohe_model', OneHotEncoder(handle_unknown='ignore', sparse_output=False), cat_cols)
-    ], remainder=StandardScaler())
-    pre.set_output(transform="pandas")  # Preserve DataFrame structure and column names
-
     est = LGBMRegressor(
         random_state=42, 
         linear_tree=True,
-        device_type='cpu',
+        device_type='gpu',
         monotone_constraints_method='intermediate',
-        n_jobs=32,
         force_col_wise=True,
         verbose=-1
     )
 
-    pipe = Pipeline([
-        ('pre', pre), 
-        ('est', est)
-    ])
-
-    # Wrap pipeline to apply log transform to target and exp to predictions
-    pipe_with_exp = TransformedTargetRegressor(
-        regressor=pipe,
-        func=np.log,
-        inverse_func=np.exp
-    )
-
-    return pipe_with_exp
+    return est
 
 
 def get_param_grid():
     """Define parameter grid for hyperparameter search"""
     param_grid = {
-        'regressor__est__boosting_type': ['gbdt'],
-        'regressor__est__num_leaves': [70, 80, 90],
-        'regressor__est__num_iterations': [300, 400],
-        'regressor__est__learning_rate': [0.08, 0.1],
-        'regressor__est__learning_rate': [1e-1],
-        'regressor__est__min_child_samples': [30, 40],
-        'regressor__est__monotonic_cst': [ 
-            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),      # no monotonic constraints
-        ],   
-        'regressor__est__linear_lambda': [0, 1e-3],
-        'regressor__est__reg_lambda': [1e-2],
+        'est__boosting_type': ['gbdt'],
+        'est__num_leaves': [70, 80],
+        'est__num_iterations': [200, 300],
+        'est__learning_rate': [0.05, 0.08,],
+        'est__min_child_samples': [30, 40],
+        'est__linear_lambda': [0, 1e-3],
+        'est__reg_lambda': [1e-1, 1e-2],
     }
     
     return param_grid
 
 
-def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_onnx=True, role: str = 'unified', use_grid_search=True):
+def custom_scorer(y_true, y_pred):
+    """
+    Custom scorer that denormalizes predictions and ignores errors <= 0.001.
+    
+    Parameters:
+    - y_true: ground truth in log space
+    - y_pred: predictions in log space
+    
+    Returns:
+    - Negative MAE (for GridSearchCV maximization)
+    """
+    # Denormalize by applying exp
+    y_true_denorm = np.exp(y_true)
+    y_pred_denorm = np.exp(y_pred)
+    
+    # Calculate absolute errors
+    abs_errors = np.abs(y_true_denorm - y_pred_denorm)
+    
+    # Set errors <= 0.001 to 0
+    abs_errors[abs_errors <= 0.001] = 0
+    
+    # Return negative MAE (GridSearchCV maximizes, so negate for minimization)
+    return -np.mean(abs_errors)
+
+
+def train_and_save(df, feature_cols, target_col, out_name, model_dir, role: str = 'unified', use_grid_search=True):
     results = {}
     df_t = df.dropna(subset=[target_col])
     if df_t.shape[0] < 10:
@@ -187,31 +182,45 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
     y = df_t[target_col].astype(float)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    pipe = build_pipeline(role=role)
+    # Log normalization using numpy (log1p handles zeros safely)
+    X_train_scaled = X_train.copy()
+    X_test_scaled = X_test.copy()
+    
+    # Apply log1p normalization to all features except tp_degree
+    feature_cols_to_normalize = [col for col in feature_cols if col != 'tp_degree']
+    X_train_scaled[feature_cols_to_normalize] = np.log1p(X_train[feature_cols_to_normalize])
+    X_test_scaled[feature_cols_to_normalize] = np.log1p(X_test[feature_cols_to_normalize])
+    
+    # Apply log transform to target
+    y_train_log = np.log(y_train)
+    
+    model = build_model(role=role)
     
     if use_grid_search:
         print("\n=== Performing hyperparameter search with GridSearchCV ===")
         param_grid = get_param_grid()
         
-        scorer = make_scorer(mean_absolute_error, greater_is_better=False)
+        # Use custom scorer
+        scorer = make_scorer(custom_scorer)
         
         grid_search = GridSearchCV(
-            pipe,
+            model,
             param_grid,
             cv=5,
             scoring=scorer,
-            n_jobs=1,
-            return_train_score=True
+            n_jobs=2,
+            return_train_score=True,
+            verbose=2
         )
         
-        grid_search.fit(X_train, y_train)
+        grid_search.fit(X_train_scaled, y_train_log)
         
         print("\n=== Best parameters found ===")
         print(grid_search.best_params_)
         print(f"Best cross-validation MAE: {-grid_search.best_score_:.4f}")
         
         # Use the best estimator
-        pipe = grid_search.best_estimator_
+        model = grid_search.best_estimator_
         best_params = grid_search.best_params_
         cv_results = pd.DataFrame(grid_search.cv_results_)
         cv_results.to_csv(os.path.join(model_dir, f"{target_col}_grid_search_results.csv"), index=False)
@@ -220,15 +229,15 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
         # Re-train on full training set with best parameters
         if use_grid_search and best_params:
             print("\n=== Re-training on full training set with best parameters ===")
-            pipe.fit(X_train, y_train)
+            model.fit(X_train_scaled, y_train_log)
     else:
         print("\n=== Training with default parameters (no grid search) ===")
-        pipe.fit(X_train, y_train)
+        model.fit(X_train_scaled, y_train_log)
         best_params = None
 
-    
-    
-    y_pred = pipe.predict(X_test)
+    # Predict and apply exp transform
+    y_pred_log = model.predict(X_test_scaled)
+    y_pred = np.exp(y_pred_log)
     mae = mean_absolute_error(y_test, y_pred)
     mape = (abs(y_test - y_pred) / y_test).mean() * 100
 
@@ -263,31 +272,17 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
 
     os.makedirs(model_dir, exist_ok=True)
     joblib_path = os.path.join(model_dir, out_name)
-    joblib.dump(pipe, joblib_path)
-
-    onnx_path = joblib_path.replace('.joblib', '.onnx')
-    if convert_onnx:
-        # build initial types: for convert_sklearn we declare each input column
-        initial_type = []
-        for name in feature_cols:
-            if name == 'model':
-                initial_type.append((name, StringTensorType([None, 1])))
-            else:
-                initial_type.append((name, FloatTensorType([None, 1])))
-        try:
-            onnx_model = convert_sklearn(pipe, initial_types=initial_type)
-            with open(onnx_path, 'wb') as f:
-                f.write(onnx_model.SerializeToString())
-            converted = True
-        except Exception as e:
-            print(f"ONNX conversion failed for {out_name}: {e}")
-            converted = False
-    else:
-        converted = False
+    
+    # Save model with normalization info
+    model_data = {
+        'model': model,
+        'normalization': 'log1p',
+        'feature_cols': feature_cols
+    }
+    joblib.dump(model_data, joblib_path)
 
     results = {
         'model_path': joblib_path,
-        'onnx_path': onnx_path if converted else None,
         'mae': mae,
         'mape': mape,
         'n_train': len(X_train),
@@ -330,10 +325,10 @@ def load_onnx(path):
     return None
 
 
-def predict_with_model(inputs, model, feature_cols):
+def predict_with_model(inputs, model_data, feature_cols):
     """
     inputs: list/tuple single-row matching feature_cols or pandas.DataFrame
-    model: sklearn Pipeline (joblib) or onnxruntime InferenceSession
+    model_data: dict with 'model', 'normalization' keys
     returns: float prediction
     """
     if isinstance(inputs, (list, tuple)):
@@ -344,30 +339,23 @@ def predict_with_model(inputs, model, feature_cols):
         raise ValueError('inputs must be list/tuple or pandas.DataFrame')
 
     for c in feature_cols:
-        if c != 'model':
-            # keep model as string
-            try:
-                X[c] = pd.to_numeric(X[c], errors='coerce')
-            except Exception:
-                pass
+        try:
+            X[c] = pd.to_numeric(X[c], errors='coerce')
+        except Exception:
+            pass
 
-    # if ONNX session
-    if hasattr(model, 'get_inputs'):
-        input_feed = {}
-        X_enc = X.copy()
-        X_enc['model'] = X_enc['model'].astype(str)
-        for col in feature_cols:
-            val = X_enc[col].values.reshape(-1, 1)
-            if X_enc[col].dtype == object or col == 'model':
-                input_feed[col] = val.astype(str)
-            else:
-                input_feed[col] = val.astype('float32')
-        out = model.run(None, input_feed)[0]
-        return float(out[0][0].item()) if hasattr(out[0][0], 'item') else float(out[0][0])
-
-    # otherwise assume sklearn pipeline
-    pred = model.predict(X)
-    return float(pred[0])
+    model = model_data['model']
+    
+    # Apply log normalization
+    X_scaled = np.log1p(X)
+    
+    # Predict (returns log-transformed values)
+    y_pred_log = model.predict(X_scaled)
+    
+    # Apply exp transform
+    y_pred = np.exp(y_pred_log)
+    
+    return float(y_pred[0])
 
 
 def main():
@@ -397,7 +385,6 @@ def main():
 
     # Unified feature columns (both prefill and decode features)
     UNIFIED_FEATURE_COLS = [
-        'model',
         'prefill_batch_size', 'prefill_input_len_sum', 'prefill_input_len_mean', 'prefill_input_len_std',
         'decode_batch_size', 'decode_input_len_sum', 'decode_input_len_mean', 'decode_input_len_std',
         'tp_degree', 'freq_mhz'
@@ -466,23 +453,18 @@ def main():
         UNIFIED_TARGET, 
         UNIFIED_OUT, 
         MODEL_DIR, 
-        convert_onnx=True, 
         role='unified',
         use_grid_search=not args.no_grid_search
     )
 
     # Load model for sample inference
     print('\n=== Sample inference with unified model ===')
-    if stats_unified and stats_unified.get('onnx_path'):
-        model = load_onnx(stats_unified['onnx_path'])
-    else:
-        model_joblib = os.path.join(MODEL_DIR, UNIFIED_OUT)
-        model = joblib.load(model_joblib) if os.path.exists(model_joblib) else None
+    model_joblib = os.path.join(MODEL_DIR, UNIFIED_OUT)
+    model_data = joblib.load(model_joblib) if os.path.exists(model_joblib) else None
 
-    if model is not None:
+    if model_data is not None:
         # Example 1: Pure prefill (decode features = 0)
         sample_prefill = [
-            'Llama-3.3-70B-Instruct',
             10,  # prefill_batch_size
             5000,  # prefill_input_len_sum
             500,  # prefill_input_len_mean
@@ -497,7 +479,6 @@ def main():
 
         # Example 2: Pure decode (prefill features = 0)
         sample_decode = [
-            'Llama-3.3-70B-Instruct',
             0,  # prefill_batch_size
             0,  # prefill_input_len_sum
             0,  # prefill_input_len_mean
@@ -512,7 +493,6 @@ def main():
 
         # Example 3: Mixed (both prefill and decode)
         sample_mixed = [
-            'Llama-3.3-70B-Instruct',
             1,  # prefill_batch_size
             354,  # prefill_input_len_sum
             354,  # prefill_input_len_mean
@@ -527,7 +507,7 @@ def main():
 
         t0 = time.time()
         try:
-            r_prefill = predict_with_model(sample_prefill, model, UNIFIED_FEATURE_COLS)
+            r_prefill = predict_with_model(sample_prefill, model_data, UNIFIED_FEATURE_COLS)
             print(f'Sample prefill prediction: {r_prefill:.2f}W')
         except Exception as e:
             print(f'Prefill sample predict failed: {e}')
@@ -535,7 +515,7 @@ def main():
 
         t0 = time.time()
         try:
-            r_decode = predict_with_model(sample_decode, model, UNIFIED_FEATURE_COLS)
+            r_decode = predict_with_model(sample_decode, model_data, UNIFIED_FEATURE_COLS)
             print(f'Sample decode prediction: {r_decode:.2f}W')
         except Exception as e:
             print(f'Decode sample predict failed: {e}')
@@ -543,7 +523,7 @@ def main():
 
         t0 = time.time()
         try:
-            r_mixed = predict_with_model(sample_mixed, model, UNIFIED_FEATURE_COLS)
+            r_mixed = predict_with_model(sample_mixed, model_data, UNIFIED_FEATURE_COLS)
             print(f'Sample mixed prediction: {r_mixed:.2f}W')
         except Exception as e:
             print(f'Mixed sample predict failed: {e}')
