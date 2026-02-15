@@ -428,7 +428,7 @@ class _MPNvmlFreqModulatorServer:
             tbt_arr = lat_mat[np.arange(max_future_vision)[:, None],
                             candidates.T]
             # TBT mask
-            sla_tbt_mask = np.mean(tbt_arr, axis=0) <= self.tbt_sla
+            sla_tbt_mask = np.all(tbt_arr <= self.tbt_sla, axis=0)
             # Compute TTFT for all candidates in parallel
             time_till_finish_per_batch = np.cumsum(tbt_arr, axis=0)
             time_till_finish_per_req = time_till_finish_per_batch[
