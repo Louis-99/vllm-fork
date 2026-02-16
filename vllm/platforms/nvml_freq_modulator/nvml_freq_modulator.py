@@ -701,7 +701,8 @@ class _MPNvmlFreqModulatorServer:
             csv_writer = CSVWriter(col_names=[
                 'now',
                 'freq_app_time',
-                'target_freq'
+                'target_freq',
+                'skipped'
             ],
             filename=log_dir / f'freq_apply_log_{physical_gpu_index}.csv')
             while True:
@@ -715,6 +716,12 @@ class _MPNvmlFreqModulatorServer:
                     qsize = queue.qsize()
                     for _skipped in range(qsize):
                         freq, now = queue.get()
+                        csv_writer.add_row([
+                            now, 
+                            time.time(),
+                            freq,
+                            True  # skipped
+                        ])
                         if freq == -1 and now == -1:
                             break
 
@@ -728,6 +735,7 @@ class _MPNvmlFreqModulatorServer:
                         now, 
                         time.time(),
                         freq,
+                        False  # not skipped
                     ])
                 except pynvml.NVMLError as e:
                     logger.error(f"Daemon GPU {physical_gpu_index} failed to set freq {freq}: {e}")
