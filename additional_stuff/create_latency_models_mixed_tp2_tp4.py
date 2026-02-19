@@ -152,12 +152,13 @@ def get_param_grid():
     """Define parameter grid for hyperparameter search"""
     param_grid = {
         'boosting_type': ['gbdt'],
-        'learning_rate': [0.08],
-        'linear_lambda': [0, 1e-3],
-        'min_child_samples': [30, 40],
-        'num_iterations': [400],
-        'num_leaves': [80, 90],
-        'reg_lambda': [1e-1],
+        'learning_rate': [0.1, 0.15],
+        'linear_lambda': [1e-3, 5e-3],
+        'min_child_samples': [30, 40, ],
+        'num_iterations': [400, 500],
+        'num_leaves': [80, 90,],
+        'reg_lambda': [1e-2, 1e-3],
+        'monotonic_cst': [[0, 0, 0, 0, 0, 0, 0, 0, 0, -1]]
     }
     
     return param_grid
@@ -181,8 +182,8 @@ def custom_scorer(y_true, y_pred):
     # Calculate absolute errors
     abs_errors = np.abs(y_true_denorm - y_pred_denorm)
     
-    # Set errors <= 0.001 to 0
-    abs_errors[abs_errors <= 0.001] = 0
+    # underprediction is slightly rewarded
+    abs_errors[(y_true_denorm - y_pred_denorm <= 0.001) & (y_true_denorm > y_pred_denorm)] = 0
     
     # Return negative MAE (GridSearchCV maximizes, so negate for minimization)
     return -np.mean(abs_errors)
@@ -407,6 +408,12 @@ def main():
 
     # Data path for mixed
     CSV_PATH_MIXED = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/combined_profiling_results.csv"
+    CSV_PATH_MIXED_2 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/mixed_inference_results_tp2.csv"
+    CSV_PATH_MIXED_4 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/mixed_inference_results_tp4.csv"
+    CSV_PATH_MIXED_8 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/mixed_inference_results_tp8.csv"
+    CSV_PATH_DECODE_2 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/decode_inference_results_tp2.csv"
+    CSV_PATH_DECODE_4 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/decode_inference_results_tp4.csv"
+    CSV_PATH_DECODE_8 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/decode_inference_results_tp8.csv"
 
     MODEL_DIR = os.path.join(args.model_dir)
 
@@ -456,6 +463,13 @@ def main():
     # Load mixed data
     print('\n--- Loading data from profiler ---')
     df_mixed = load_and_prepare_mixed(CSV_PATH_MIXED, 'Llama-3.3-70B-Instruct')
+    df_mixed_2 = load_and_prepare_mixed(CSV_PATH_MIXED_2, 'Llama-3.3-70B-Instruct')
+    df_mixed_4 = load_and_prepare_mixed(CSV_PATH_MIXED_4, 'Llama-3.3-70B-Instruct')
+    df_mixed_8 = load_and_prepare_mixed(CSV_PATH_MIXED_8, 'Llama-3.3-70B-Instruct')
+    df_decode_2 = load_and_prepare_mixed(CSV_PATH_DECODE_2, 'Llama-3.3-70B-Instruct')
+    df_decode_4 = load_and_prepare_mixed(CSV_PATH_DECODE_4, 'Llama-3.3-70B-Instruct')
+    df_decode_8 = load_and_prepare_mixed(CSV_PATH_DECODE_8, 'Llama-3.3-70B-Instruct')
+    df_mixed = pd.concat([df_mixed, df_mixed_2, df_mixed_4, df_mixed_8, df_decode_2, df_decode_4, df_decode_8], ignore_index=True)
     print(f"Total mixed samples: {len(df_mixed)}")
     print(f' TP2 mixed samples: {len(df_mixed[(df_mixed["tp_degree"]==2) & (df_mixed["test_name"].str.contains("mixed"))])}, prefill samples: {len(df_mixed[(df_mixed["tp_degree"]==2) & (df_mixed["test_name"].str.contains("prefill"))])}, decode samples: {len(df_mixed[(df_mixed["tp_degree"]==2) & (df_mixed["test_name"].str.contains("decode"))])}')
     print(f' TP4 mixed samples: {len(df_mixed[(df_mixed["tp_degree"]==4) & (df_mixed["test_name"].str.contains("mixed"))])}, prefill samples: {len(df_mixed[(df_mixed["tp_degree"]==4) & (df_mixed["test_name"].str.contains("prefill"))])}, decode samples: {len(df_mixed[(df_mixed["tp_degree"]==4) & (df_mixed["test_name"].str.contains("decode"))])}')
