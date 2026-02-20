@@ -922,7 +922,7 @@ class Scheduler(SchedulerInterface):
         if self.freq_modulator:
             self.freq_modulator.step_update_batch_ID_end(
                 batch_ID=scheduler_output.batch_ID,
-                time=time.time()
+                out_time=time.time()
             )
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)

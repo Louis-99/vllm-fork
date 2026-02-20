@@ -47,7 +47,7 @@ class NvmlFreqModulatorInterface(ABC):
 
     def step_update_batch_ID_end(self,
                                  batch_ID: int,
-                                 time: float) -> None:
+                                 out_time: float) -> None:
         ...
 
     @abstractmethod
