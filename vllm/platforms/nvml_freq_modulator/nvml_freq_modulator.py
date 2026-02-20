@@ -46,7 +46,8 @@ class NvmlFreqModulatorInterface(ABC):
         ...
 
     def step_update_batch_ID_end(self,
-                                 batch_ID: int) -> None:
+                                 batch_ID: int,
+                                 time: float) -> None:
         ...
 
     @abstractmethod
@@ -193,9 +194,10 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
         self.q.put(msg_encoded)
 
     def step_update_batch_ID_end(self,
-                                 batch_ID: int) -> None:
+                                 batch_ID: int,
+                                 out_time: float) -> None:
         msg = FreqModMsg(
-            now = time.time(),
+            now = out_time,
             running_queue_tokens = [],
             running_queue_pre_computed_tokens = [],
             running_queue_wait_time = [],
@@ -300,7 +302,7 @@ class _MPNvmlFreqModulatorServer:
             self._load_models()
             self.start_frequency_manager()
             self.csv_writer = CSVWriter(col_names=[
-                'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
+                'now', 'mpc_start', 'future_states_time', 'freq_mod_start', 'freq_mod_end',
                 'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
                 'max_running_q_wait', 'max_waiting_q_wait', 'fromWho'
             ],
@@ -314,10 +316,10 @@ class _MPNvmlFreqModulatorServer:
             if step_id % self.mod_interval > 0:
                 continue
             
-            mpc_start = time.perf_counter()
+            mpc_start = time.time()
             msg: FreqModMsg = msgspec.msgpack.decode(msg_encoded,
                                                      type=FreqModMsg)
-            logger.debug('freq_mod_msg: %s', msg)
+            # logger.debug('freq_mod_msg: %s', msg)
             if msg.fromWho == "request_end":
                 with self.underprediction_lock:
                     if msg.batch_ID > self.last_finished_ID:
@@ -326,7 +328,8 @@ class _MPNvmlFreqModulatorServer:
 
             future_states, prefill_cycles = self.get_future_states(
                 msg, self.future_windows)
-
+            
+            future_states_time = time.time()
             selected_freq, pred_batch_lat = (
                 self._get_next_freq(msg, future_states, prefill_cycles))
             
@@ -334,13 +337,13 @@ class _MPNvmlFreqModulatorServer:
                 selected_freq = max(self.freq_choices)
 
 
-            freq_mod_start = time.perf_counter()
+            freq_mod_start = time.time()
             with self.underprediction_lock:
                 if self.last_applied_freq != selected_freq:
                     self.set_frequency_manager(selected_freq, msg.now)
                     self.last_applied_freq = selected_freq
 
-            freq_mod_end = time.perf_counter()
+            freq_mod_end = time.time()
 
             # decide later what to do with this
             timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
@@ -353,10 +356,11 @@ class _MPNvmlFreqModulatorServer:
             self.csv_writer.add_row([
                 msg.now,
                 mpc_start,
+                future_states_time,
                 freq_mod_start,
                 freq_mod_end,
                 self.last_applied_freq,
-                pred_batch_lat if self.last_applied_freq == selected_freq else pred_batch_lat+10.0,
+                pred_batch_lat,
                 len(msg.running_queue_wait_time),
                 len(msg.waiting_queue_wait_time),
                 max(msg.running_queue_wait_time) if len(
@@ -705,6 +709,7 @@ class _MPNvmlFreqModulatorServer:
                 'skipped'
             ],
             filename=log_dir / f'freq_apply_log_{physical_gpu_index}.csv')
+            prev_now = -float('inf')
             while True:
                 # This blocks until a frequency is sent from the main process
                 freq, now = queue.get()
@@ -727,6 +732,12 @@ class _MPNvmlFreqModulatorServer:
 
                 if freq == -1 and now == -1:
                     break
+                
+                # Skip if now value is lower than previous now
+                if now < prev_now:
+                    continue
+                
+                prev_now = now
                     
                 try:
                     # Apply the frequency
