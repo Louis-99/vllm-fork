@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
+import gc
 import multiprocessing
 import os
 import threading
@@ -26,6 +27,9 @@ from vllm.platforms.nvml_utils import CSVWriter, get_gpu_name, get_preselected_f
 from vllm.utils import get_mp_context
 
 logger = init_logger(__name__)
+
+# Disable garbage collection for performance
+gc.disable()
 
 # Change this accordingly
 PATH_TO_MODELS = Path(__file__).parent / 'tree_models'
@@ -296,6 +300,9 @@ class _MPNvmlFreqModulatorServer:
                     
 
     def run(self):
+        # Explicitly disable GC in this process
+        gc.disable()
+        
         if not self.init_done:
             self.init_done = True
             self.underprediction_lock = threading.Lock()
@@ -698,6 +705,9 @@ class _MPNvmlFreqModulatorServer:
         `self.__class__._persistent_gpu_worker` it will be picklable by the
         spawn/forkserver start methods.
         """
+        # Explicitly disable GC in this worker process
+        gc.disable()
+        
         try:
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_index)
