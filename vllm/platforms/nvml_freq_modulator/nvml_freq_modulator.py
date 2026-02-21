@@ -250,6 +250,7 @@ class _MPNvmlFreqModulatorServer:
         future_window: int = 4,
         mem_util_ceiling: float = 0.8,
         token_budget: int = 2048,
+        freq_switch_delay: float = 0.04,
     ):
         self.vllm_config = vllm_config
         self.freq_choices = freq_choices
@@ -263,6 +264,7 @@ class _MPNvmlFreqModulatorServer:
         self.mem_util_ceiling = mem_util_ceiling
         self.optim_target = optim_target
         self.token_budget = token_budget
+        self.freq_switch_delay = freq_switch_delay
 
         self.model = vllm_config.model_config.model
         self.tp_degree = vllm_config.parallel_config.tensor_parallel_size
@@ -346,17 +348,17 @@ class _MPNvmlFreqModulatorServer:
             freq_mod_start = time.time()
             with self.underprediction_lock:
                 if self.last_applied_freq != selected_freq:
-                    self.set_frequency_manager(selected_freq, msg.now)
+                    # self.set_frequency_manager(selected_freq, msg.now)
                     self.last_applied_freq = selected_freq
 
             freq_mod_end = time.time()
 
             # decide later what to do with this
-            timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
-                                                        self.check_underprediction, 
-                                                        args=(msg.batch_ID,))
-            timer_to_check_underpred.daemon = True
-            timer_to_check_underpred.start()
+            # timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
+            #                                             self.check_underprediction, 
+            #                                             args=(msg.batch_ID,))
+            # timer_to_check_underpred.daemon = True
+            # timer_to_check_underpred.start()
 
             
             self.csv_writer.add_row([
@@ -394,6 +396,65 @@ class _MPNvmlFreqModulatorServer:
                 logger.info('Underprediction detected, applied max freq')
 
 
+    def _compute_transition_tensors(self, lat_mat: np.ndarray,
+                                    power_mat: np.ndarray):
+        """
+        Compute effective latency and power tensors that account for the
+        frequency switch delay.  When switching from freq_from → freq_to the
+        GPU keeps running at freq_from for min(switch_delay, batch_lat_from)
+        seconds, then runs the remainder of the batch at freq_to.
+
+        Returns
+        -------
+        eff_lat : ndarray, shape (n_states, n_freqs, n_freqs)
+            Effective batch latency for each (state, from_freq, to_freq).
+        eff_pow : ndarray, shape (n_states, n_freqs, n_freqs)
+            Effective average power for each (state, from_freq, to_freq).
+        """
+        D = self.freq_switch_delay
+        n_freqs = lat_mat.shape[1]
+
+        if D <= 0:
+            # No delay – effective values equal the target-freq values
+            eff_lat = np.broadcast_to(
+                lat_mat[:, None, :],
+                (lat_mat.shape[0], n_freqs, n_freqs)).copy()
+            eff_pow = np.broadcast_to(
+                power_mat[:, None, :],
+                (power_mat.shape[0], n_freqs, n_freqs)).copy()
+            return eff_lat, eff_pow
+
+        # Expand to (n_states, n_freqs_from, n_freqs_to)
+        lat_from = lat_mat[:, :, None]      # (S, F, 1)
+        lat_to   = lat_mat[:, None, :]      # (S, 1, F)
+        pow_from = power_mat[:, :, None]
+        pow_to   = power_mat[:, None, :]
+
+        # Fraction of batch work completed during the switch delay
+        # at the old frequency's processing rate
+        frac_done = np.minimum(1.0, D / lat_from)
+
+        batch_done_during_delay = (frac_done >= 1.0)
+
+        # Effective latency:
+        #   If batch finishes during delay  → lat_from
+        #   Otherwise → D  +  (1 - frac_done) * lat_to
+        eff_lat = np.where(batch_done_during_delay,
+                           lat_from,
+                           D + (1.0 - frac_done) * lat_to)
+
+        # Effective power (time-weighted average):
+        #   If batch finishes during delay  → pow_from
+        #   Otherwise → (D*pow_from + remaining_time*pow_to) / eff_lat
+        remaining_time = np.maximum(eff_lat - D, 0.0)
+        eff_pow = np.where(
+            batch_done_during_delay,
+            pow_from,
+            (D * pow_from + remaining_time * pow_to) / eff_lat)
+
+        return eff_lat, eff_pow
+
+
     def _get_next_freq(self, freq_mod_msg: FreqModMsg,
                           future_states: list[FutureState], prefill_cycles):
         freq_choices_desc = sorted(copy.deepcopy(self.freq_choices),
@@ -407,16 +468,32 @@ class _MPNvmlFreqModulatorServer:
             power_future = executor.submit(self.predict_powers_future_states, future_states, freq_choices_desc)
             lat_mat = lat_future.result()
             power_mat = power_future.result()
-        energy_mat = lat_mat * power_mat
         assert lat_mat.shape == (max_future_vision, len(freq_choices_desc))
         assert power_mat.shape == (max_future_vision, len(freq_choices_desc))
+
+        # ---- Transition-aware tensors (n_states, n_freqs_from, n_freqs_to) --
+        # These account for the freq-switch delay: during the delay the batch
+        # keeps running at the *previous* frequency before switching.
+        eff_lat, eff_pow = self._compute_transition_tensors(lat_mat, power_mat)
+        eff_energy = eff_lat * eff_pow
+
+        # Index of the currently applied frequency in freq_choices_desc
+        if self.last_applied_freq in freq_choices_desc:
+            last_applied_freq_idx = freq_choices_desc.index(
+                self.last_applied_freq)
+        else:
+            last_applied_freq_idx = int(np.argmin(
+                np.abs(np.array(freq_choices_desc) - self.last_applied_freq)))
 
         # Build waiting time vector once (use numpy, ensure float32)
         # running_queue_wait_time contains decodes and then prefills. Don't care about decode wait times
         run_wait = np.asarray(freq_mod_msg.running_queue_wait_time[future_states[0].num_decodes:], dtype=np.float32)
         wait_wait = np.asarray(freq_mod_msg.waiting_queue_wait_time, dtype=np.float32)
         waiting_time_per_req = np.concatenate((run_wait, wait_wait), axis=0).reshape(-1, 1)
-        
+
+        # Precompute window index array for advanced indexing
+        windows = np.arange(max_future_vision)
+
         # Start with the highest freq for each window
         selected_freq_ids = [0 for _ in range(max_future_vision)]
         for freq_idx in range(1, len(freq_choices_desc) - 1):
@@ -434,9 +511,17 @@ class _MPNvmlFreqModulatorServer:
             # [n_candidates, max_future_vision]
             assert candidates.shape[1] == max_future_vision
 
+            # Build from-frequency indices for each candidate.
+            # Window 0: transition from the currently applied frequency.
+            # Window i>0: transition from the freq selected for window i-1.
+            from_indices = np.empty_like(candidates)
+            from_indices[:, 0] = last_applied_freq_idx
+            from_indices[:, 1:] = candidates[:, :-1]
+
             # Keep candidates that meet SLA
-            tbt_arr = lat_mat[np.arange(max_future_vision)[:, None],
-                            candidates.T]
+            # Use transition-aware latencies: eff_lat[window, from_freq, to_freq]
+            tbt_arr = eff_lat[windows[:, None],
+                              from_indices.T, candidates.T]
             # TBT mask
             sla_tbt_mask = np.all(tbt_arr <= self.tbt_sla, axis=0)
             # Compute TTFT for all candidates in parallel
@@ -448,17 +533,17 @@ class _MPNvmlFreqModulatorServer:
             # Combine masks to filter valid candidates
             valid_mask = sla_tbt_mask & sla_ttft_mask
             candidates = candidates[valid_mask]
+            from_indices = from_indices[valid_mask]
             # Select the min-energy candidate as `selected_freq_ids`
             if len(candidates) > 0:
-                candidates = np.array(candidates)
-                energy_per_batch = energy_mat[
-                    np.arange(max_future_vision)[:, None], candidates.T]
+                energy_per_batch = eff_energy[
+                    windows[:, None], from_indices.T, candidates.T]
                 total_energy = np.sum(energy_per_batch, axis=0)
                 if self.optim_target == 'energy':
                     selected_freq_ids = candidates[np.argmin(total_energy)]
                 elif self.optim_target == 'power':
-                    lat_per_batch = lat_mat[np.arange(max_future_vision)[:,
-                                                                        None],
+                    lat_per_batch = eff_lat[windows[:, None],
+                                            from_indices.T,
                                             candidates.T]
                     total_lat = np.sum(lat_per_batch, axis=0)
                     total_power = total_energy / total_lat
@@ -476,8 +561,10 @@ class _MPNvmlFreqModulatorServer:
                 freq_choices_desc[selected_freq_ids[i]]
                 for i in range(self.mod_interval)
             ])
-        predicted_batch_lat = lat_mat[0][selected_freq_ids[0]]
-
+        # Use transition-aware latency for the underprediction timer
+        predicted_batch_lat = eff_lat[0, last_applied_freq_idx,
+                                      selected_freq_ids[0]]
+        print(f"Selected freq: {selected_freq} MHz, Predicted batch latency: {predicted_batch_lat:.4f} s")
         return selected_freq, predicted_batch_lat
 
 
@@ -865,42 +952,42 @@ if __name__ == '__main__':
         token_budget=2048,
     )
     msg = [
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[1023, 0],
-        #     running_queue_wait_time=[0.02, 0.01,],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[500, ],
-        #     waiting_queue_pre_computed_tokens=[0,],
-        #     waiting_queue_wait_time=[0.10,],
-        #     fromWho='scheduler',
-        #     batch_ID=0,
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[1023, 0],
-        #     running_queue_wait_time=[0.02, 0.01,],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[500, 500 ],
-        #     waiting_queue_pre_computed_tokens=[0, 0],
-        #     waiting_queue_wait_time=[0.12, 0.02],
-        #     fromWho='scheduler',
-        #     batch_ID=1,
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[1023, 0],
-        #     running_queue_wait_time=[0.02, 0.01],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[500, 500],
-        #     waiting_queue_pre_computed_tokens=[0, 0,],
-        #     waiting_queue_wait_time=[0.12, 0.02,],
-        #     fromWho='request_update',
-        #     batch_ID=2,
-        # ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[1023, 0],
+            running_queue_wait_time=[0.02, 0.01,],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[500, ],
+            waiting_queue_pre_computed_tokens=[0,],
+            waiting_queue_wait_time=[0.10,],
+            fromWho='scheduler',
+            batch_ID=0,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[1023, 0],
+            running_queue_wait_time=[0.02, 0.01,],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[500, 500 ],
+            waiting_queue_pre_computed_tokens=[0, 0],
+            waiting_queue_wait_time=[0.12, 0.02],
+            fromWho='scheduler',
+            batch_ID=1,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[1023, 0],
+            running_queue_wait_time=[0.02, 0.01],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[500, 500],
+            waiting_queue_pre_computed_tokens=[0, 0,],
+            waiting_queue_wait_time=[0.12, 0.02,],
+            fromWho='request_update',
+            batch_ID=2,
+        ),
         FreqModMsg(
             now=0.0,
             running_queue_tokens=[1024, 512],
@@ -913,42 +1000,42 @@ if __name__ == '__main__':
             fromWho='scheduler',
             batch_ID=3,
         ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[200, 512],
-        #     running_queue_pre_computed_tokens=[0, 0],
-        #     running_queue_wait_time=[0.001, 0.002],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[1200],
-        #     waiting_queue_pre_computed_tokens=[0],
-        #     waiting_queue_wait_time=[0.15],
-        #     fromWho='scheduler',
-        #     batch_ID=1,
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[16],
-        #     running_queue_pre_computed_tokens=[0],
-        #     running_queue_wait_time=[0.001],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[],
-        #     waiting_queue_pre_computed_tokens=[],
-        #     waiting_queue_wait_time=[],
-        #     fromWho='scheduler',
-        #     batch_ID=2,
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[520, 0],
-        #     running_queue_wait_time=[0.01, 0.02],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[1200, 1200, 1200, 777, 666, 555, 888],
-        #     waiting_queue_pre_computed_tokens=[0, 0, 0, 0, 0, 0, 0],
-        #     waiting_queue_wait_time=[0.11, 0.12, 0.13, 0.13, 0.14, 0.157, 0.20],
-        #     fromWho='scheduler',
-        #     batch_ID=3,
-        # ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[200, 512],
+            running_queue_pre_computed_tokens=[0, 0],
+            running_queue_wait_time=[0.001, 0.002],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[1200],
+            waiting_queue_pre_computed_tokens=[0],
+            waiting_queue_wait_time=[0.15],
+            fromWho='scheduler',
+            batch_ID=4,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[16],
+            running_queue_pre_computed_tokens=[0],
+            running_queue_wait_time=[0.001],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[],
+            waiting_queue_pre_computed_tokens=[],
+            waiting_queue_wait_time=[],
+            fromWho='scheduler',
+            batch_ID=5,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[520, 0],
+            running_queue_wait_time=[0.01, 0.02],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[1200, 1200, 1200, 777, 666, 555, 888],
+            waiting_queue_pre_computed_tokens=[0, 0, 0, 0, 0, 0, 0],
+            waiting_queue_wait_time=[0.11, 0.12, 0.13, 0.13, 0.14, 0.157, 0.20],
+            fromWho='scheduler',
+            batch_ID=6,
+        ),
         ]
     for i in range(len(msg)):
         q.put(msgspec.msgpack.encode(msg[i]))
