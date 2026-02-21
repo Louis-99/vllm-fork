@@ -250,7 +250,6 @@ class _MPNvmlFreqModulatorServer:
         future_window: int = 4,
         mem_util_ceiling: float = 0.8,
         token_budget: int = 2048,
-        freq_switch_delay: float = 0.04,
     ):
         self.vllm_config = vllm_config
         self.freq_choices = freq_choices
@@ -264,7 +263,6 @@ class _MPNvmlFreqModulatorServer:
         self.mem_util_ceiling = mem_util_ceiling
         self.optim_target = optim_target
         self.token_budget = token_budget
-        self.freq_switch_delay = freq_switch_delay
 
         self.model = vllm_config.model_config.model
         self.tp_degree = vllm_config.parallel_config.tensor_parallel_size
@@ -291,9 +289,9 @@ class _MPNvmlFreqModulatorServer:
         self.tbt_sla_min = 0.5 * tbt_sla    # floor = 50% of ceiling
         self.dynamic_tbt_sla = tbt_sla       # starts at max
         self._last_batch_end_time: Optional[float] = None
-        # EWMA span ~1000 samples → alpha = 2/(1000+1)
-        self._ewma_alpha = 2.0 / (1000.0 + 1.0)
-        self._ewma_tbt = 0.0                 # EWMA of actual TBT
+        # Asymmetric EWMA: tighten fast (~10 samples), relax slow (~200 samples)
+        self._ewma_alpha_fast = 2.0 / (10.0 + 1.0)   # violation rate rising  → scale down SLA
+        self._ewma_alpha_slow = 2.0 / (200.0 + 1.0)  # violation rate falling → scale up SLA
         self._ewma_violation_rate = 0.0       # EWMA of binary violations
         self._tbt_sample_count = 0            # warm-up counter
 
@@ -324,7 +322,7 @@ class _MPNvmlFreqModulatorServer:
                 'now', 'mpc_start', 'future_states_time', 'freq_mod_start', 'freq_mod_end',
                 'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
                 'max_running_q_wait', 'max_waiting_q_wait', 'fromWho',
-                'dynamic_tbt_sla', 'ewma_tbt', 'ewma_violation_rate'
+                'dynamic_tbt_sla', 'ewma_violation_rate'
             ],
             filename=self.log_dir / 'freq_mod_log.csv')
 
@@ -391,7 +389,6 @@ class _MPNvmlFreqModulatorServer:
                     msg.waiting_queue_wait_time) > 0 else 0.0,
                 msg.fromWho,
                 self.dynamic_tbt_sla,
-                self._ewma_tbt,
                 self._ewma_violation_rate,
             ])
         self.csv_writer.close()
@@ -414,16 +411,17 @@ class _MPNvmlFreqModulatorServer:
         if actual_tbt <= 0:
             return  # ignore non-positive deltas (out-of-order, duplicates)
 
-        alpha = self._ewma_alpha
         self._tbt_sample_count += 1
+        violation = 1.0 if actual_tbt > self.tbt_sla_max else 0.0
 
-        # Use a bias-corrected EWMA during warm-up
         if self._tbt_sample_count == 1:
-            self._ewma_tbt = actual_tbt
-            self._ewma_violation_rate = float(actual_tbt > self.tbt_sla_max)
+            self._ewma_violation_rate = violation
         else:
-            self._ewma_tbt = alpha * actual_tbt + (1.0 - alpha) * self._ewma_tbt
-            violation = 1.0 if actual_tbt > self.tbt_sla_max else 0.0
+            # Use fast alpha when violation rate is rising (tighten SLA faster),
+            # slow alpha when it is falling (relax SLA slower).
+            alpha = (self._ewma_alpha_fast
+                     if violation > self._ewma_violation_rate
+                     else self._ewma_alpha_slow)
             self._ewma_violation_rate = (
                 alpha * violation + (1.0 - alpha) * self._ewma_violation_rate
             )
@@ -452,65 +450,6 @@ class _MPNvmlFreqModulatorServer:
                 logger.info('Underprediction detected, applied max freq')
 
 
-    def _compute_transition_tensors(self, lat_mat: np.ndarray,
-                                    power_mat: np.ndarray):
-        """
-        Compute effective latency and power tensors that account for the
-        frequency switch delay.  When switching from freq_from → freq_to the
-        GPU keeps running at freq_from for min(switch_delay, batch_lat_from)
-        seconds, then runs the remainder of the batch at freq_to.
-
-        Returns
-        -------
-        eff_lat : ndarray, shape (n_states, n_freqs, n_freqs)
-            Effective batch latency for each (state, from_freq, to_freq).
-        eff_pow : ndarray, shape (n_states, n_freqs, n_freqs)
-            Effective average power for each (state, from_freq, to_freq).
-        """
-        D = self.freq_switch_delay
-        n_freqs = lat_mat.shape[1]
-
-        if D <= 0:
-            # No delay – effective values equal the target-freq values
-            eff_lat = np.broadcast_to(
-                lat_mat[:, None, :],
-                (lat_mat.shape[0], n_freqs, n_freqs)).copy()
-            eff_pow = np.broadcast_to(
-                power_mat[:, None, :],
-                (power_mat.shape[0], n_freqs, n_freqs)).copy()
-            return eff_lat, eff_pow
-
-        # Expand to (n_states, n_freqs_from, n_freqs_to)
-        lat_from = lat_mat[:, :, None]      # (S, F, 1)
-        lat_to   = lat_mat[:, None, :]      # (S, 1, F)
-        pow_from = power_mat[:, :, None]
-        pow_to   = power_mat[:, None, :]
-
-        # Fraction of batch work completed during the switch delay
-        # at the old frequency's processing rate
-        frac_done = np.minimum(1.0, D / lat_from)
-
-        batch_done_during_delay = (frac_done >= 1.0)
-
-        # Effective latency:
-        #   If batch finishes during delay  → lat_from
-        #   Otherwise → D  +  (1 - frac_done) * lat_to
-        eff_lat = np.where(batch_done_during_delay,
-                           lat_from,
-                           D + (1.0 - frac_done) * lat_to)
-
-        # Effective power (time-weighted average):
-        #   If batch finishes during delay  → pow_from
-        #   Otherwise → (D*pow_from + remaining_time*pow_to) / eff_lat
-        remaining_time = np.maximum(eff_lat - D, 0.0)
-        eff_pow = np.where(
-            batch_done_during_delay,
-            pow_from,
-            (D * pow_from + remaining_time * pow_to) / eff_lat)
-
-        return eff_lat, eff_pow
-
-
     def _get_next_freq(self, freq_mod_msg: FreqModMsg,
                           future_states: list[FutureState], prefill_cycles):
         freq_choices_desc = sorted(copy.deepcopy(self.freq_choices),
@@ -524,32 +463,16 @@ class _MPNvmlFreqModulatorServer:
             power_future = executor.submit(self.predict_powers_future_states, future_states, freq_choices_desc)
             lat_mat = lat_future.result()
             power_mat = power_future.result()
+        energy_mat = lat_mat * power_mat
         assert lat_mat.shape == (max_future_vision, len(freq_choices_desc))
         assert power_mat.shape == (max_future_vision, len(freq_choices_desc))
-
-        # ---- Transition-aware tensors (n_states, n_freqs_from, n_freqs_to) --
-        # These account for the freq-switch delay: during the delay the batch
-        # keeps running at the *previous* frequency before switching.
-        eff_lat, eff_pow = self._compute_transition_tensors(lat_mat, power_mat)
-        eff_energy = eff_lat * eff_pow
-
-        # Index of the currently applied frequency in freq_choices_desc
-        if self.last_applied_freq in freq_choices_desc:
-            last_applied_freq_idx = freq_choices_desc.index(
-                self.last_applied_freq)
-        else:
-            last_applied_freq_idx = int(np.argmin(
-                np.abs(np.array(freq_choices_desc) - self.last_applied_freq)))
 
         # Build waiting time vector once (use numpy, ensure float32)
         # running_queue_wait_time contains decodes and then prefills. Don't care about decode wait times
         run_wait = np.asarray(freq_mod_msg.running_queue_wait_time[future_states[0].num_decodes:], dtype=np.float32)
         wait_wait = np.asarray(freq_mod_msg.waiting_queue_wait_time, dtype=np.float32)
         waiting_time_per_req = np.concatenate((run_wait, wait_wait), axis=0).reshape(-1, 1)
-
-        # Precompute window index array for advanced indexing
-        windows = np.arange(max_future_vision)
-
+        
         # Start with the highest freq for each window
         selected_freq_ids = [0 for _ in range(max_future_vision)]
         for freq_idx in range(1, len(freq_choices_desc) - 1):
@@ -567,18 +490,10 @@ class _MPNvmlFreqModulatorServer:
             # [n_candidates, max_future_vision]
             assert candidates.shape[1] == max_future_vision
 
-            # Build from-frequency indices for each candidate.
-            # Window 0: transition from the currently applied frequency.
-            # Window i>0: transition from the freq selected for window i-1.
-            from_indices = np.empty_like(candidates)
-            from_indices[:, 0] = last_applied_freq_idx
-            from_indices[:, 1:] = candidates[:, :-1]
-
             # Keep candidates that meet SLA
-            # Use transition-aware latencies: eff_lat[window, from_freq, to_freq]
-            tbt_arr = eff_lat[windows[:, None],
-                              from_indices.T, candidates.T]
-            # TBT mask (use dynamic SLA adjusted by EWMA feedback)
+            tbt_arr = lat_mat[np.arange(max_future_vision)[:, None],
+                            candidates.T]
+            # TBT mask
             sla_tbt_mask = np.all(tbt_arr <= self.dynamic_tbt_sla, axis=0)
             # Compute TTFT for all candidates in parallel
             time_till_finish_per_batch = np.cumsum(tbt_arr, axis=0)
@@ -589,17 +504,17 @@ class _MPNvmlFreqModulatorServer:
             # Combine masks to filter valid candidates
             valid_mask = sla_tbt_mask & sla_ttft_mask
             candidates = candidates[valid_mask]
-            from_indices = from_indices[valid_mask]
             # Select the min-energy candidate as `selected_freq_ids`
             if len(candidates) > 0:
-                energy_per_batch = eff_energy[
-                    windows[:, None], from_indices.T, candidates.T]
+                candidates = np.array(candidates)
+                energy_per_batch = energy_mat[
+                    np.arange(max_future_vision)[:, None], candidates.T]
                 total_energy = np.sum(energy_per_batch, axis=0)
                 if self.optim_target == 'energy':
                     selected_freq_ids = candidates[np.argmin(total_energy)]
                 elif self.optim_target == 'power':
-                    lat_per_batch = eff_lat[windows[:, None],
-                                            from_indices.T,
+                    lat_per_batch = lat_mat[np.arange(max_future_vision)[:,
+                                                                        None],
                                             candidates.T]
                     total_lat = np.sum(lat_per_batch, axis=0)
                     total_power = total_energy / total_lat
@@ -617,9 +532,8 @@ class _MPNvmlFreqModulatorServer:
                 freq_choices_desc[selected_freq_ids[i]]
                 for i in range(self.mod_interval)
             ])
-        # Use transition-aware latency for the underprediction timer
-        predicted_batch_lat = eff_lat[0, last_applied_freq_idx,
-                                      selected_freq_ids[0]]
+        predicted_batch_lat = lat_mat[0][selected_freq_ids[0]]
+
         return selected_freq, predicted_batch_lat
 
 
