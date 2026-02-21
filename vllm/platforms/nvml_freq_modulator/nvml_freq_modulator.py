@@ -300,10 +300,9 @@ class _MPNvmlFreqModulatorServer:
                     
 
     def run(self):
-        # Explicitly disable GC in this process
-        gc.disable()
-        
         if not self.init_done:
+            # Explicitly disable GC in this process
+            gc.disable()
             self.init_done = True
             self.underprediction_lock = threading.Lock()
             self._load_models()
