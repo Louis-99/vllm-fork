@@ -348,17 +348,17 @@ class _MPNvmlFreqModulatorServer:
             freq_mod_start = time.time()
             with self.underprediction_lock:
                 if self.last_applied_freq != selected_freq:
-                    # self.set_frequency_manager(selected_freq, msg.now)
+                    self.set_frequency_manager(selected_freq, msg.now)
                     self.last_applied_freq = selected_freq
 
             freq_mod_end = time.time()
 
             # decide later what to do with this
-            # timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
-            #                                             self.check_underprediction, 
-            #                                             args=(msg.batch_ID,))
-            # timer_to_check_underpred.daemon = True
-            # timer_to_check_underpred.start()
+            timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
+                                                        self.check_underprediction, 
+                                                        args=(msg.batch_ID,))
+            timer_to_check_underpred.daemon = True
+            timer_to_check_underpred.start()
 
             
             self.csv_writer.add_row([
@@ -564,7 +564,6 @@ class _MPNvmlFreqModulatorServer:
         # Use transition-aware latency for the underprediction timer
         predicted_batch_lat = eff_lat[0, last_applied_freq_idx,
                                       selected_freq_ids[0]]
-        print(f"Selected freq: {selected_freq} MHz, Predicted batch latency: {predicted_batch_lat:.4f} s")
         return selected_freq, predicted_batch_lat
 
 
