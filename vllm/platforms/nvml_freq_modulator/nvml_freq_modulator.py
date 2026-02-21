@@ -275,7 +275,7 @@ class _MPNvmlFreqModulatorServer:
         self.power_model: joblib.Memory
         self.latency_model: joblib.Memory
 
-        self.last_applied_freq: int = 2000
+        self.last_applied_freq: int = 1830
 
         self.underprediction_lock = None
         self.last_finished_ID: int = -1
@@ -285,6 +285,17 @@ class _MPNvmlFreqModulatorServer:
 
         self.init_done = False
         self.csv_writer = None
+
+        # ── Dynamic TBT SLA via EWMA feedback ──
+        self.tbt_sla_max = tbt_sla          # original ceiling
+        self.tbt_sla_min = 0.5 * tbt_sla    # floor = 50% of ceiling
+        self.dynamic_tbt_sla = tbt_sla       # starts at max
+        self._last_batch_end_time: Optional[float] = None
+        # EWMA span ~1000 samples → alpha = 2/(1000+1)
+        self._ewma_alpha = 2.0 / (1000.0 + 1.0)
+        self._ewma_tbt = 0.0                 # EWMA of actual TBT
+        self._ewma_violation_rate = 0.0       # EWMA of binary violations
+        self._tbt_sample_count = 0            # warm-up counter
 
 
     def _load_models(self):
@@ -312,7 +323,8 @@ class _MPNvmlFreqModulatorServer:
             self.csv_writer = CSVWriter(col_names=[
                 'now', 'mpc_start', 'future_states_time', 'freq_mod_start', 'freq_mod_end',
                 'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
-                'max_running_q_wait', 'max_waiting_q_wait', 'fromWho'
+                'max_running_q_wait', 'max_waiting_q_wait', 'fromWho',
+                'dynamic_tbt_sla', 'ewma_tbt', 'ewma_violation_rate'
             ],
             filename=self.log_dir / 'freq_mod_log.csv')
 
@@ -332,6 +344,8 @@ class _MPNvmlFreqModulatorServer:
                 with self.underprediction_lock:
                     if msg.batch_ID > self.last_finished_ID:
                         self.last_finished_ID = msg.batch_ID
+                # ── Dynamic TBT SLA: track actual TBT from out_time diffs ──
+                self._update_dynamic_tbt_sla(msg.now)
                 continue
 
             future_states, prefill_cycles = self.get_future_states(
@@ -376,9 +390,51 @@ class _MPNvmlFreqModulatorServer:
                 max(msg.waiting_queue_wait_time) if len(
                     msg.waiting_queue_wait_time) > 0 else 0.0,
                 msg.fromWho,
+                self.dynamic_tbt_sla,
+                self._ewma_tbt,
+                self._ewma_violation_rate,
             ])
         self.csv_writer.close()
 
+
+    def _update_dynamic_tbt_sla(self, out_time: float):
+        """
+        Update the dynamic TBT SLA based on EWMA of observed TBT values.
+        The diff of successive out_time gives the actual per-batch TBT.
+        An EWMA violation rate drives the SLA between
+        [tbt_sla_min, tbt_sla_max].
+        """
+        if self._last_batch_end_time is None:
+            self._last_batch_end_time = out_time
+            return
+
+        actual_tbt = out_time - self._last_batch_end_time
+        self._last_batch_end_time = out_time
+
+        if actual_tbt <= 0:
+            return  # ignore non-positive deltas (out-of-order, duplicates)
+
+        alpha = self._ewma_alpha
+        self._tbt_sample_count += 1
+
+        # Use a bias-corrected EWMA during warm-up
+        if self._tbt_sample_count == 1:
+            self._ewma_tbt = actual_tbt
+            self._ewma_violation_rate = float(actual_tbt > self.tbt_sla_max)
+        else:
+            self._ewma_tbt = alpha * actual_tbt + (1.0 - alpha) * self._ewma_tbt
+            violation = 1.0 if actual_tbt > self.tbt_sla_max else 0.0
+            self._ewma_violation_rate = (
+                alpha * violation + (1.0 - alpha) * self._ewma_violation_rate
+            )
+
+        # Map violation rate [0, 1] → SLA scaling [1.0, 0.5]
+        # High violations → tighten SLA (lower); no violations → relax (higher)
+        scale = 1.0 - 0.5 * self._ewma_violation_rate
+        self.dynamic_tbt_sla = self.tbt_sla_max * scale
+        # Clamp to [min, max] for safety
+        self.dynamic_tbt_sla = max(self.tbt_sla_min,
+                                   min(self.tbt_sla_max, self.dynamic_tbt_sla))
 
     def check_underprediction(self, ID: int,):
         """
@@ -522,8 +578,8 @@ class _MPNvmlFreqModulatorServer:
             # Use transition-aware latencies: eff_lat[window, from_freq, to_freq]
             tbt_arr = eff_lat[windows[:, None],
                               from_indices.T, candidates.T]
-            # TBT mask
-            sla_tbt_mask = np.all(tbt_arr <= self.tbt_sla, axis=0)
+            # TBT mask (use dynamic SLA adjusted by EWMA feedback)
+            sla_tbt_mask = np.all(tbt_arr <= self.dynamic_tbt_sla, axis=0)
             # Compute TTFT for all candidates in parallel
             time_till_finish_per_batch = np.cumsum(tbt_arr, axis=0)
             time_till_finish_per_req = time_till_finish_per_batch[
