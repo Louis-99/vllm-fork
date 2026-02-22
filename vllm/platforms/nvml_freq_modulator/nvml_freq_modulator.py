@@ -291,7 +291,7 @@ class _MPNvmlFreqModulatorServer:
         self._last_batch_end_time: Optional[float] = None
         # Asymmetric EWMA: tighten fast (~10 samples), relax slow (~200 samples)
         self._ewma_alpha_fast = 2.0 / (10.0 + 1.0)   # violation rate rising  → scale down SLA
-        self._ewma_alpha_slow = 2.0 / (200.0 + 1.0)  # violation rate falling → scale up SLA
+        self._ewma_alpha_slow = 2.0 / (500.0 + 1.0)  # violation rate falling → scale up SLA
         self._ewma_violation_rate = 0.0       # EWMA of binary violations
         self._tbt_sample_count = 0            # warm-up counter
 
