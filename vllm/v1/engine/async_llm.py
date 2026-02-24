@@ -162,6 +162,7 @@ class AsyncLLM(EngineClient):
             self.logger_manager.log_engine_initialized()
         
         # power logs
+        self.power_monitor_process = None
         if vllm_config.log_power:
             self.power_monitor_process = multiprocessing.Process(
                     target=start_nvml_power_monitor,
