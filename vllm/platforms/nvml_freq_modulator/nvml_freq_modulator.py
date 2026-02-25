@@ -15,9 +15,8 @@ from abc import ABC, abstractmethod
 
 import msgspec
 import numpy as np
-import joblib
+import lightgbm as lgb
 import pandas as pd
-from scipy.interpolate import interpn
 import pynvml
 
 from vllm.config import ModelConfig, VllmConfig
@@ -270,8 +269,8 @@ class _MPNvmlFreqModulatorServer:
         model_name = vllm_config.model_config.model.split('/')[-1]
         combo_name = f'{get_gpu_name()}_{model_name}'
 
-        self.power_model: joblib.Memory
-        self.latency_model: joblib.Memory
+        self.power_model: lgb.Booster
+        self.latency_model: lgb.Booster
 
         self.last_applied_freq: int = 1830
 
@@ -298,16 +297,16 @@ class _MPNvmlFreqModulatorServer:
 
     def _load_models(self):
         if self.tp_degree == 8: 
-            power_path = PATH_TO_MODELS / 'unified_power_model_tp8.joblib'
-            lat_path = PATH_TO_MODELS / 'unified_latency_model_tp8.joblib'
+            power_path = PATH_TO_MODELS / 'unified_power_model_tp8.txt'
+            lat_path = PATH_TO_MODELS / 'unified_latency_model_tp8.txt'
         else:
-            power_path = PATH_TO_MODELS / 'unified_power_model_tp2_tp4.joblib'
-            lat_path = PATH_TO_MODELS / 'unified_latency_model_tp2_tp4.joblib'
+            power_path = PATH_TO_MODELS / 'unified_power_model_tp2_tp4.txt'
+            lat_path = PATH_TO_MODELS / 'unified_latency_model_tp2_tp4.txt'
         
         if power_path.exists():
-            self.power_model = joblib.load(power_path)['model']
+            self.power_model = lgb.Booster(model_file=power_path)
         if lat_path.exists():
-            self.latency_model = joblib.load(lat_path)['model']
+            self.latency_model = lgb.Booster(model_file=lat_path)
                     
 
     def run(self):
@@ -681,20 +680,20 @@ class _MPNvmlFreqModulatorServer:
         tp_degrees = np.full(n_states * n_freqs, float(self.tp_degree), dtype=np.float32)
 
         # Build input feed for the latency model using numpy arrays directly
-        input_feed = {
-            "prefill_batch_size": batch_sizes,
-            "prefill_input_len_sum": prefill_input_len_sums,
-            "prefill_input_len_mean": prefill_input_len_means,
-            "prefill_input_len_std": prefill_input_len_stds,
-            "decode_batch_size": decode_batch_sizes,
-            "decode_input_len_sum": decode_input_len_sums,
-            "decode_input_len_mean": decode_input_len_means,
-            "decode_input_len_std": decode_input_len_stds,
-            "tp_degree": tp_degrees,
-            "freq_mhz": freqs,
-        }
+        input_feed = np.stack([
+            batch_sizes,
+            prefill_input_len_sums,
+            prefill_input_len_means,
+            prefill_input_len_stds,
+            decode_batch_sizes,
+            decode_input_len_sums,
+            decode_input_len_means,
+            decode_input_len_stds,
+            tp_degrees,
+            freqs,
+        ], axis=1).astype(np.float32)
 
-        out = self.latency_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)
+        out = self.latency_model.predict(input_feed)
         out = np.exp(out)
         out = np.clip(out, 0.005, None)
         latency_mat = out.reshape(n_states, n_freqs)
@@ -730,23 +729,23 @@ class _MPNvmlFreqModulatorServer:
         decode_input_len_stds = np.repeat(decode_ilsd_vec, n_freqs).astype(np.float32)
         tp_degrees = np.full(n_states * n_freqs, float(self.tp_degree), dtype=np.float32)
 
-        # Build input feed for the latency model using numpy arrays directly
-        input_feed = {
-            "prefill_batch_size": batch_sizes,
-            "prefill_input_len_sum": prefill_input_len_sums,
-            "prefill_input_len_mean": prefill_input_len_means,
-            "prefill_input_len_std": prefill_input_len_stds,
-            "decode_batch_size": decode_batch_sizes,
-            "decode_input_len_sum": decode_input_len_sums,
-            "decode_input_len_mean": decode_input_len_means,
-            "decode_input_len_std": decode_input_len_stds,
-            "tp_degree": tp_degrees,
-            "freq_mhz": freqs,
-        }
+        # Build input feed for the power model using numpy arrays directly
+        input_feed = np.stack([
+            batch_sizes,
+            prefill_input_len_sums,
+            prefill_input_len_means,
+            prefill_input_len_stds,
+            decode_batch_sizes,
+            decode_input_len_sums,
+            decode_input_len_means,
+            decode_input_len_stds,
+            tp_degrees,
+            freqs,
+        ], axis=1).astype(np.float32)
 
-        out = self.power_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)
+        out = self.power_model.predict(input_feed)
         # reshape back to (n_future_states, n_freq_choices)
-        output_arr = np.exp(np.asarray(out)).reshape(n_states, n_freqs)
+        output_arr = np.asarray(out).clip(min=0.0).reshape(n_states, n_freqs)
         return output_arr
 
 
