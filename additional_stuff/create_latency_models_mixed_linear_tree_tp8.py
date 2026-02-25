@@ -14,34 +14,20 @@ Features:
 import os
 import time
 import argparse
-import joblib
 import pandas as pd
 import numpy as np
+import lightgbm as lgb
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
 from sklearn.pipeline import FunctionTransformer, Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, QuantileTransformer
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import mean_absolute_error, make_scorer, mean_squared_error
-import skl2onnx
-from skl2onnx import convert_sklearn
-from skl2onnx.common.data_types import FloatTensorType, StringTensorType
-import onnxruntime as ort
-
-# from onnxmltools.convert.lightgbm import 
 import onnxmltools
 import onnxmltools.convert.lightgbm.shape_calculators 
 import onnxmltools.convert.lightgbm.operator_converters
 
 from lightgbm import LGBMRegressor
-
-skl2onnx.update_registered_converter(
-    LGBMRegressor, 
-    "LightGbmLGBMRegressor",
-    onnxmltools.convert.lightgbm.shape_calculators.Regressor.calculate_linear_regressor_output_shapes,
-    onnxmltools.convert.lightgbm.operator_converters.LightGbm.convert_lightgbm,
-    options={"nocl": [True, False], "zipmap": [True, False, "columns"]},
-)
 
 def load_and_prepare(path, model_name, tp=None, numeric_cols=None):
     df = pd.read_csv(path)
@@ -162,31 +148,6 @@ def build_model(role='unified'):
 
 def get_param_grid():
     """Define parameter grid for hyperparameter search"""
-    # param_grid = {
-    #     'est__max_depth': [15, 18],
-    #     'est__learning_rate': [0.15, 0.18],
-    #     'est__min_samples_split': [2, 3],
-    #     'est__min_samples_leaf': [2, 3],
-    #     'est__subsample': [0.95]
-    # }
-
-    # param_grid = {
-    #     'est__max_depth': [18, 20, 22],
-    #     'est__min_samples_split': [2, 3],
-    #     'est__min_samples_leaf': [2, 3],
-    #     'est__n_estimators': [200, 300]
-    # }
-
-    # param_grid = {
-    #     'est__max_depth': [15, 20],
-    #     'est__learning_rate': [0.1, 0.2],
-    #     'est__max_leaf_nodes': [20, 25, 30],
-    #     'est__max_depth': [10, 15, 20],
-    #     'est__min_samples_leaf': [10, 20, 30],
-    #     'est__monotonic_cst': [ (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),  # no monotonic constraints
-    #                             (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1),  # decreasing with freq_mhz
-    #                             (0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1)]  # decreasing with tp_degree and freq_mhz
-    # }
 
     param_grid = {
         'boosting_type': ['gbdt'],
@@ -196,6 +157,7 @@ def get_param_grid():
         'num_iterations': [400, 500],
         'num_leaves': [90, 100],
         'reg_lambda': [1e-3],
+        'monotonic_cst': [[0, 0, 0, 0, 0, 0, 0, 0, 0, -1]]
     }
     
     return param_grid
@@ -259,17 +221,16 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, role: str 
         # Use custom scorer
         scorer = make_scorer(custom_scorer)
         
-        with joblib.parallel_backend('threading'):
-            grid_search = GridSearchCV(
-                model,
-                param_grid,
-                cv=5,
-                scoring=scorer,
-                n_jobs=1,
-                verbose=2,
-                return_train_score=True
-            )
-            grid_search.fit(X_train_scaled, y_train_log)
+        grid_search = GridSearchCV(
+            model,
+            param_grid,
+            cv=5,
+            scoring=scorer,
+            n_jobs=1,
+            verbose=2,
+            return_train_score=True
+        )
+        grid_search.fit(X_train_scaled, y_train_log)
         
         print("\n=== Best parameters found ===")
         print(grid_search.best_params_)
@@ -285,11 +246,8 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, role: str 
         print("\n=== Training with default parameters (no grid search) ===")
         model.fit(X_train_scaled, y_train_log)
         best_params = None
+        
     
-    # Train with best parameters from grid search
-    if use_grid_search and best_params:
-        print("\n=== Retraining on full training set with best parameters ===")
-        model.fit(X_train_scaled, y_train_log)
 
     print("Training completed.")
     # Predict and apply exp transform
@@ -329,14 +287,10 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, role: str 
 
     os.makedirs(model_dir, exist_ok=True)
     joblib_path = os.path.join(model_dir, out_name)
-    
-    # Save model with normalization info
-    model_data = {
-        'model': model,
-        'normalization': 'log1p',
-        'feature_cols': feature_cols
-    }
-    joblib.dump(model_data, joblib_path)
+
+    # Save native LightGBM txt model (compatible with C++ inference via lightgbm C API)
+    model.booster_.save_model(joblib_path)
+    print(f"  Native LightGBM model saved -> {joblib_path}")
 
     results = {
         'model_path': joblib_path,
@@ -376,39 +330,24 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, role: str 
     return results
 
 
-def load_onnx(path):
-    if path and os.path.exists(path):
-        return ort.InferenceSession(path)
-    return None
-
-
-def predict_with_model(inputs, model_data, feature_cols):
+def predict_with_model(inputs, model):
     """
     inputs: list/tuple single-row matching feature_cols or pandas.DataFrame
-    model_data: dict with 'model', 'normalization' keys
     returns: float prediction
     """
-    if isinstance(inputs, (list, tuple)):
-        X = pd.DataFrame([inputs], columns=feature_cols)
-    elif isinstance(inputs, pd.DataFrame):
-        X = inputs.copy()
-    else:
-        raise ValueError('inputs must be list/tuple or pandas.DataFrame')
-
-    for c in feature_cols:
-        try:
-            X[c] = pd.to_numeric(X[c], errors='coerce')
-        except Exception:
-            pass
-
-    model = model_data['model']
+    # Convert to 2D numpy array if needed
+    if isinstance(inputs, list):
+        inputs = np.array(inputs)
+    if inputs.ndim == 1:
+        inputs = inputs.reshape(1, -1)
     
-    # Apply log normalization
-    X_scaled = np.log1p(X)
+    # Apply log normalization to all features except tp_degree (index 8)
+    X_scaled = np.log1p(inputs)
+    X_scaled[:, 8] = inputs[:, 8]
     
     # Predict (returns log-transformed values)
     y_pred_log = model.predict(X_scaled)
-    
+
     # Apply exp transform
     y_pred = np.exp(y_pred_log)
     
@@ -457,7 +396,7 @@ def main():
         'tp_degree', 'freq_mhz'
     ]
     UNIFIED_TARGET = 'latency_s'
-    UNIFIED_OUT = 'unified_latency_model_tp8.joblib'
+    UNIFIED_OUT = 'unified_latency_model_tp8.txt'
 
     print('\n=== Loading and preprocessing all data (prefill, decode, mixed) ===')
     
@@ -535,77 +474,30 @@ def main():
 
     # Load model for sample inference
     print('\n=== Sample inference with unified model ===')
-    model_joblib = os.path.join(MODEL_DIR, UNIFIED_OUT)
-    model_data = joblib.load(model_joblib) if os.path.exists(model_joblib) else None
+    model_path = os.path.join(MODEL_DIR, UNIFIED_OUT)
+    if not os.path.exists(model_path):
+        print(f'Model not found at {model_path}, skipping inference.')
+    else:
+        booster = lgb.Booster(model_file=model_path)
 
-    if model_data is not None:
-        # Example 1: Pure prefill (decode features = 0)
-        pre_sm = np.array([590, 267, 476, 10, 47, 102])
-        sample_prefill = [
-            len(pre_sm),  # prefill_batch_size
-            np.sum(pre_sm),  # prefill_input_len_sum
-            np.mean(pre_sm),  # prefill_input_len_mean
-            np.std(pre_sm),  # prefill_input_len_std
-            0,  # decode_batch_size
-            0,  # decode_input_len_sum
-            0,  # decode_input_len_mean
-            0,  # decode_input_len_std
-            2,  # tp_degree
-            360,  # freq_mhz
-        ]
+        # prefill_batch_size, prefill_input_len_sum, prefill_input_len_mean, prefill_input_len_std,
+        # decode_batch_size, decode_input_len_sum, decode_input_len_mean, decode_input_len_std,
+        # tp_degree, freq_mhz
 
-        # Example 2: Pure decode (prefill features = 0)
-        dec_samp = np.array([34, 17, 75, 11, 7, 648, 117, 20, 17, 63, 10, 30, 26, 13, 19, 31, 15, 11, 40, 264]) + np.array([115, 104, 104, 99, 98, 93, 92, 87, 87, 87, 84, 83, 83, 81, 80, 79, 77, 76, 75, 74])
-        sample_decode = [
-            0,  # prefill_batch_size
-            0,  # prefill_input_len_sum
-            0,  # prefill_input_len_mean
-            0,  # prefill_input_len_std
-            len(dec_samp),  # decode_batch_size
-            np.sum(dec_samp),  # decode_input_len_sum
-            np.mean(dec_samp),  # decode_input_len_mean
-            np.std(dec_samp),  # decode_input_len_std
-            4,  # tp_degree
-            1830,  # freq_mhz
-        ]
+        samples = {
+            'prefill only (tp8, 1830MHz)': [4, 2048, 512, 200,   0, 0, 0, 0,       8, 1830],
+            'decode only  (tp8, 1830MHz)': [0, 0, 0, 0,   64, 16384, 256, 120,     8, 1830],
+            'decode only  (tp8, 1080MHz)': [0, 0, 0, 0,   256, 65536, 256, 120,    8, 1080],
+            'mixed        (tp8, 1830MHz)': [4, 2048, 512, 200,  32, 8192, 256, 80,  8, 1830],
+        }
 
-        # Example 3: Mixed (both prefill and decode)
-        sample_mixed = [
-            1,  # prefill_batch_size
-            354,  # prefill_input_len_sum
-            354.0,  # prefill_input_len_mean
-            0.0,  # prefill_input_len_std
-            6,  # decode_batch_size
-            1589,  # decode_input_len_sum
-            266.5,  # decode_input_len_mean
-            231.13,  # decode_input_len_std
-            2,  # tp_degree
-            360,  # freq_mhz
-        ]
-
-        t0 = time.time()
-        try:
-            r_prefill = predict_with_model(sample_prefill, model_data, UNIFIED_FEATURE_COLS)
-            print(f'Sample prefill prediction: {r_prefill:.6f}s')
-        except Exception as e:
-            print(f'Prefill sample predict failed: {e}')
-        print(f'Prefill inference time: {time.time()-t0:.6f}s')
-
-        t0 = time.time()
-        try:
-            r_decode = predict_with_model(sample_decode, model_data, UNIFIED_FEATURE_COLS)
-            print(f'Sample decode prediction: {r_decode:.6f}s')
-        except Exception as e:
-            print(f'Decode sample predict failed: {e}')
-        print(f'Decode inference time: {time.time()-t0:.6f}s')
-
-        t0 = time.time()
-        try:
-            r_mixed = predict_with_model(sample_mixed, model_data, UNIFIED_FEATURE_COLS)
-            print(f'Sample mixed prediction: {r_mixed:.6f}s')
-        except Exception as e:
-            print(f'Mixed sample predict failed: {e}')
-        print(f'Mixed inference time: {time.time()-t0:.6f}s')
+        for label, sample in samples.items():
+            t0 = time.time()
+            try:
+                pred = predict_with_model(sample, booster)
+                print(f'  {label}: {pred*1e3:.3f}ms  ({(time.time()-t0)*1e3:.3f}ms)')
+            except Exception as e:
+                print(f'  {label}: FAILED - {e}')
 
     print('\nDone.')
 
