@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
+import gc
 import multiprocessing
 import os
 import threading
@@ -14,9 +15,8 @@ from abc import ABC, abstractmethod
 
 import msgspec
 import numpy as np
-import joblib
+import lightgbm as lgb
 import pandas as pd
-from scipy.interpolate import interpn
 import pynvml
 
 from vllm.config import ModelConfig, VllmConfig
@@ -26,6 +26,9 @@ from vllm.platforms.nvml_utils import CSVWriter, get_gpu_name, get_preselected_f
 from vllm.utils import get_mp_context
 
 logger = init_logger(__name__)
+
+# Disable garbage collection for performance
+gc.disable()
 
 # Change this accordingly
 PATH_TO_MODELS = Path(__file__).parent / 'tree_models'
@@ -46,7 +49,8 @@ class NvmlFreqModulatorInterface(ABC):
         ...
 
     def step_update_batch_ID_end(self,
-                                 batch_ID: int) -> None:
+                                 batch_ID: int,
+                                 out_time: float) -> None:
         ...
 
     @abstractmethod
@@ -193,9 +197,10 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
         self.q.put(msg_encoded)
 
     def step_update_batch_ID_end(self,
-                                 batch_ID: int) -> None:
+                                 batch_ID: int,
+                                 out_time: float) -> None:
         msg = FreqModMsg(
-            now = time.time(),
+            now = out_time,
             running_queue_tokens = [],
             running_queue_pre_computed_tokens = [],
             running_queue_wait_time = [],
@@ -264,10 +269,10 @@ class _MPNvmlFreqModulatorServer:
         model_name = vllm_config.model_config.model.split('/')[-1]
         combo_name = f'{get_gpu_name()}_{model_name}'
 
-        self.power_model: joblib.Memory
-        self.latency_model: joblib.Memory
+        self.power_model: lgb.Booster
+        self.latency_model: lgb.Booster
 
-        self.last_applied_freq: int = 2000
+        self.last_applied_freq: int = 1830
 
         self.underprediction_lock = None
         self.last_finished_ID: int = -1
@@ -278,31 +283,45 @@ class _MPNvmlFreqModulatorServer:
         self.init_done = False
         self.csv_writer = None
 
+        # ── Dynamic TBT SLA via EWMA feedback ──
+        self.tbt_sla_max = tbt_sla          # original ceiling
+        self.tbt_sla_min = 0.3 * tbt_sla    # floor = 30% of ceiling
+        self.dynamic_tbt_sla = tbt_sla       # starts at max
+        self._last_batch_end_time: Optional[float] = None
+        # Asymmetric EWMA: tighten fast (~10 samples), relax slow (~200 samples)
+        self._ewma_alpha_fast = 2.0 / (10.0 + 1.0)   # violation rate rising  → scale down SLA
+        self._ewma_alpha_slow = 2.0 / (500.0 + 1.0)  # violation rate falling → scale up SLA
+        self._ewma_violation_rate = 0.0       # EWMA of binary violations
+        self._tbt_sample_count = 0            # warm-up counter
+
 
     def _load_models(self):
         if self.tp_degree == 8: 
-            power_path = PATH_TO_MODELS / 'unified_power_model_tp8.joblib'
-            lat_path = PATH_TO_MODELS / 'unified_latency_model_tp8.joblib'
+            power_path = PATH_TO_MODELS / 'unified_power_model_tp8.txt'
+            lat_path = PATH_TO_MODELS / 'unified_latency_model_tp8.txt'
         else:
-            power_path = PATH_TO_MODELS / 'unified_power_model_tp2_tp4.joblib'
-            lat_path = PATH_TO_MODELS / 'unified_latency_model_tp2_tp4.joblib'
+            power_path = PATH_TO_MODELS / 'unified_power_model_tp2_tp4.txt'
+            lat_path = PATH_TO_MODELS / 'unified_latency_model_tp2_tp4.txt'
         
         if power_path.exists():
-            self.power_model = joblib.load(power_path)['model']
+            self.power_model = lgb.Booster(model_file=power_path)
         if lat_path.exists():
-            self.latency_model = joblib.load(lat_path)['model']
+            self.latency_model = lgb.Booster(model_file=lat_path)
                     
 
     def run(self):
         if not self.init_done:
+            # Explicitly disable GC in this process
+            gc.disable()
             self.init_done = True
             self.underprediction_lock = threading.Lock()
             self._load_models()
             self.start_frequency_manager()
             self.csv_writer = CSVWriter(col_names=[
-                'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
+                'now', 'mpc_start', 'future_states_time', 'freq_mod_start', 'freq_mod_end',
                 'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
-                'max_running_q_wait', 'max_waiting_q_wait', 'fromWho'
+                'max_running_q_wait', 'max_waiting_q_wait', 'fromWho',
+                'dynamic_tbt_sla', 'ewma_violation_rate'
             ],
             filename=self.log_dir / 'freq_mod_log.csv')
 
@@ -314,19 +333,22 @@ class _MPNvmlFreqModulatorServer:
             if step_id % self.mod_interval > 0:
                 continue
             
-            mpc_start = time.perf_counter()
+            mpc_start = time.time()
             msg: FreqModMsg = msgspec.msgpack.decode(msg_encoded,
                                                      type=FreqModMsg)
-            logger.debug('freq_mod_msg: %s', msg)
+            # logger.debug('freq_mod_msg: %s', msg)
             if msg.fromWho == "request_end":
                 with self.underprediction_lock:
                     if msg.batch_ID > self.last_finished_ID:
                         self.last_finished_ID = msg.batch_ID
+                # ── Dynamic TBT SLA: track actual TBT from out_time diffs ──
+                self._update_dynamic_tbt_sla(msg.now)
                 continue
 
             future_states, prefill_cycles = self.get_future_states(
                 msg, self.future_windows)
-
+            
+            future_states_time = time.time()
             selected_freq, pred_batch_lat = (
                 self._get_next_freq(msg, future_states, prefill_cycles))
             
@@ -334,13 +356,13 @@ class _MPNvmlFreqModulatorServer:
                 selected_freq = max(self.freq_choices)
 
 
-            freq_mod_start = time.perf_counter()
+            freq_mod_start = time.time()
             with self.underprediction_lock:
                 if self.last_applied_freq != selected_freq:
                     self.set_frequency_manager(selected_freq, msg.now)
                     self.last_applied_freq = selected_freq
 
-            freq_mod_end = time.perf_counter()
+            freq_mod_end = time.time()
 
             # decide later what to do with this
             timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
@@ -353,10 +375,11 @@ class _MPNvmlFreqModulatorServer:
             self.csv_writer.add_row([
                 msg.now,
                 mpc_start,
+                future_states_time,
                 freq_mod_start,
                 freq_mod_end,
                 self.last_applied_freq,
-                pred_batch_lat if self.last_applied_freq == selected_freq else pred_batch_lat+10.0,
+                pred_batch_lat,
                 len(msg.running_queue_wait_time),
                 len(msg.waiting_queue_wait_time),
                 max(msg.running_queue_wait_time) if len(
@@ -364,9 +387,51 @@ class _MPNvmlFreqModulatorServer:
                 max(msg.waiting_queue_wait_time) if len(
                     msg.waiting_queue_wait_time) > 0 else 0.0,
                 msg.fromWho,
+                self.dynamic_tbt_sla,
+                self._ewma_violation_rate,
             ])
         self.csv_writer.close()
 
+
+    def _update_dynamic_tbt_sla(self, out_time: float):
+        """
+        Update the dynamic TBT SLA based on EWMA of observed TBT values.
+        The diff of successive out_time gives the actual per-batch TBT.
+        An EWMA violation rate drives the SLA between
+        [tbt_sla_min, tbt_sla_max].
+        """
+        if self._last_batch_end_time is None:
+            self._last_batch_end_time = out_time
+            return
+
+        actual_tbt = out_time - self._last_batch_end_time
+        self._last_batch_end_time = out_time
+
+        if actual_tbt <= 0:
+            return  # ignore non-positive deltas (out-of-order, duplicates)
+
+        self._tbt_sample_count += 1
+        violation = 1.0 if actual_tbt > self.tbt_sla_max else 0.0
+
+        if self._tbt_sample_count == 1:
+            self._ewma_violation_rate = violation
+        else:
+            # Use fast alpha when violation rate is rising (tighten SLA faster),
+            # slow alpha when it is falling (relax SLA slower).
+            alpha = (self._ewma_alpha_fast
+                     if violation > self._ewma_violation_rate
+                     else self._ewma_alpha_slow)
+            self._ewma_violation_rate = (
+                alpha * violation + (1.0 - alpha) * self._ewma_violation_rate
+            )
+
+        # Map violation rate [0, 1] → SLA scaling [1.0, 0.5]
+        # High violations → tighten SLA (lower); no violations → relax (higher)
+        scale = 1.0 - self._ewma_violation_rate
+        self.dynamic_tbt_sla = self.tbt_sla_max * scale
+        # Clamp to [min, max] for safety
+        self.dynamic_tbt_sla = max(self.tbt_sla_min,
+                                   min(self.tbt_sla_max, self.dynamic_tbt_sla))
 
     def check_underprediction(self, ID: int,):
         """
@@ -428,7 +493,7 @@ class _MPNvmlFreqModulatorServer:
             tbt_arr = lat_mat[np.arange(max_future_vision)[:, None],
                             candidates.T]
             # TBT mask
-            sla_tbt_mask = np.all(tbt_arr <= self.tbt_sla, axis=0)
+            sla_tbt_mask = np.all(tbt_arr <= self.dynamic_tbt_sla, axis=0)
             # Compute TTFT for all candidates in parallel
             time_till_finish_per_batch = np.cumsum(tbt_arr, axis=0)
             time_till_finish_per_req = time_till_finish_per_batch[
@@ -615,20 +680,20 @@ class _MPNvmlFreqModulatorServer:
         tp_degrees = np.full(n_states * n_freqs, float(self.tp_degree), dtype=np.float32)
 
         # Build input feed for the latency model using numpy arrays directly
-        input_feed = {
-            "prefill_batch_size": batch_sizes,
-            "prefill_input_len_sum": prefill_input_len_sums,
-            "prefill_input_len_mean": prefill_input_len_means,
-            "prefill_input_len_std": prefill_input_len_stds,
-            "decode_batch_size": decode_batch_sizes,
-            "decode_input_len_sum": decode_input_len_sums,
-            "decode_input_len_mean": decode_input_len_means,
-            "decode_input_len_std": decode_input_len_stds,
-            "tp_degree": tp_degrees,
-            "freq_mhz": freqs,
-        }
+        input_feed = np.stack([
+            batch_sizes,
+            prefill_input_len_sums,
+            prefill_input_len_means,
+            prefill_input_len_stds,
+            decode_batch_sizes,
+            decode_input_len_sums,
+            decode_input_len_means,
+            decode_input_len_stds,
+            tp_degrees,
+            freqs,
+        ], axis=1).astype(np.float32)
 
-        out = self.latency_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)
+        out = self.latency_model.predict(input_feed)
         out = np.exp(out)
         out = np.clip(out, 0.005, None)
         latency_mat = out.reshape(n_states, n_freqs)
@@ -664,23 +729,23 @@ class _MPNvmlFreqModulatorServer:
         decode_input_len_stds = np.repeat(decode_ilsd_vec, n_freqs).astype(np.float32)
         tp_degrees = np.full(n_states * n_freqs, float(self.tp_degree), dtype=np.float32)
 
-        # Build input feed for the latency model using numpy arrays directly
-        input_feed = {
-            "prefill_batch_size": batch_sizes,
-            "prefill_input_len_sum": prefill_input_len_sums,
-            "prefill_input_len_mean": prefill_input_len_means,
-            "prefill_input_len_std": prefill_input_len_stds,
-            "decode_batch_size": decode_batch_sizes,
-            "decode_input_len_sum": decode_input_len_sums,
-            "decode_input_len_mean": decode_input_len_means,
-            "decode_input_len_std": decode_input_len_stds,
-            "tp_degree": tp_degrees,
-            "freq_mhz": freqs,
-        }
+        # Build input feed for the power model using numpy arrays directly
+        input_feed = np.stack([
+            batch_sizes,
+            prefill_input_len_sums,
+            prefill_input_len_means,
+            prefill_input_len_stds,
+            decode_batch_sizes,
+            decode_input_len_sums,
+            decode_input_len_means,
+            decode_input_len_stds,
+            tp_degrees,
+            freqs,
+        ], axis=1).astype(np.float32)
 
-        out = self.power_model.predict(pd.DataFrame(input_feed), device_type='cpu', n_jobs=1)
+        out = self.power_model.predict(input_feed)
         # reshape back to (n_future_states, n_freq_choices)
-        output_arr = np.exp(np.asarray(out)).reshape(n_states, n_freqs)
+        output_arr = np.asarray(out).clip(min=0.0).reshape(n_states, n_freqs)
         return output_arr
 
 
@@ -694,6 +759,9 @@ class _MPNvmlFreqModulatorServer:
         `self.__class__._persistent_gpu_worker` it will be picklable by the
         spawn/forkserver start methods.
         """
+        # Explicitly disable GC in this worker process
+        gc.disable()
+        
         try:
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_index)
@@ -705,6 +773,7 @@ class _MPNvmlFreqModulatorServer:
                 'skipped'
             ],
             filename=log_dir / f'freq_apply_log_{physical_gpu_index}.csv')
+            prev_now = -float('inf')
             while True:
                 # This blocks until a frequency is sent from the main process
                 freq, now = queue.get()
@@ -727,6 +796,12 @@ class _MPNvmlFreqModulatorServer:
 
                 if freq == -1 and now == -1:
                     break
+                
+                # Skip if now value is lower than previous now
+                if now < prev_now:
+                    continue
+                
+                prev_now = now
                     
                 try:
                     # Apply the frequency
@@ -845,42 +920,42 @@ if __name__ == '__main__':
         token_budget=2048,
     )
     msg = [
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[1023, 0],
-        #     running_queue_wait_time=[0.02, 0.01,],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[500, ],
-        #     waiting_queue_pre_computed_tokens=[0,],
-        #     waiting_queue_wait_time=[0.10,],
-        #     fromWho='scheduler',
-        #     batch_ID=0,
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[1023, 0],
-        #     running_queue_wait_time=[0.02, 0.01,],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[500, 500 ],
-        #     waiting_queue_pre_computed_tokens=[0, 0],
-        #     waiting_queue_wait_time=[0.12, 0.02],
-        #     fromWho='scheduler',
-        #     batch_ID=1,
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[1023, 0],
-        #     running_queue_wait_time=[0.02, 0.01],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[500, 500],
-        #     waiting_queue_pre_computed_tokens=[0, 0,],
-        #     waiting_queue_wait_time=[0.12, 0.02,],
-        #     fromWho='request_update',
-        #     batch_ID=2,
-        # ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[1023, 0],
+            running_queue_wait_time=[0.02, 0.01,],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[500, ],
+            waiting_queue_pre_computed_tokens=[0,],
+            waiting_queue_wait_time=[0.10,],
+            fromWho='scheduler',
+            batch_ID=0,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[1023, 0],
+            running_queue_wait_time=[0.02, 0.01,],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[500, 500 ],
+            waiting_queue_pre_computed_tokens=[0, 0],
+            waiting_queue_wait_time=[0.12, 0.02],
+            fromWho='scheduler',
+            batch_ID=1,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[1023, 0],
+            running_queue_wait_time=[0.02, 0.01],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[500, 500],
+            waiting_queue_pre_computed_tokens=[0, 0,],
+            waiting_queue_wait_time=[0.12, 0.02,],
+            fromWho='request_update',
+            batch_ID=2,
+        ),
         FreqModMsg(
             now=0.0,
             running_queue_tokens=[1024, 512],
@@ -893,42 +968,42 @@ if __name__ == '__main__':
             fromWho='scheduler',
             batch_ID=3,
         ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[200, 512],
-        #     running_queue_pre_computed_tokens=[0, 0],
-        #     running_queue_wait_time=[0.001, 0.002],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[1200],
-        #     waiting_queue_pre_computed_tokens=[0],
-        #     waiting_queue_wait_time=[0.15],
-        #     fromWho='scheduler',
-        #     batch_ID=1,
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[16],
-        #     running_queue_pre_computed_tokens=[0],
-        #     running_queue_wait_time=[0.001],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[],
-        #     waiting_queue_pre_computed_tokens=[],
-        #     waiting_queue_wait_time=[],
-        #     fromWho='scheduler',
-        #     batch_ID=2,
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[520, 0],
-        #     running_queue_wait_time=[0.01, 0.02],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[1200, 1200, 1200, 777, 666, 555, 888],
-        #     waiting_queue_pre_computed_tokens=[0, 0, 0, 0, 0, 0, 0],
-        #     waiting_queue_wait_time=[0.11, 0.12, 0.13, 0.13, 0.14, 0.157, 0.20],
-        #     fromWho='scheduler',
-        #     batch_ID=3,
-        # ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[200, 512],
+            running_queue_pre_computed_tokens=[0, 0],
+            running_queue_wait_time=[0.001, 0.002],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[1200],
+            waiting_queue_pre_computed_tokens=[0],
+            waiting_queue_wait_time=[0.15],
+            fromWho='scheduler',
+            batch_ID=4,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[16],
+            running_queue_pre_computed_tokens=[0],
+            running_queue_wait_time=[0.001],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[],
+            waiting_queue_pre_computed_tokens=[],
+            waiting_queue_wait_time=[],
+            fromWho='scheduler',
+            batch_ID=5,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[520, 0],
+            running_queue_wait_time=[0.01, 0.02],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[1200, 1200, 1200, 777, 666, 555, 888],
+            waiting_queue_pre_computed_tokens=[0, 0, 0, 0, 0, 0, 0],
+            waiting_queue_wait_time=[0.11, 0.12, 0.13, 0.13, 0.14, 0.157, 0.20],
+            fromWho='scheduler',
+            batch_ID=6,
+        ),
         ]
     for i in range(len(msg)):
         q.put(msgspec.msgpack.encode(msg[i]))

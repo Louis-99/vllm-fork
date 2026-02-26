@@ -581,12 +581,12 @@ class EngineCoreProc(EngineCore):
                 req, request_wave = payload
                 # Stage only; scheduler mutation happens in core loop
                 self.staged_adds.put_nowait((req, request_wave))
-                if time.time() - nvml_sender_time >= 0.05 and self.input_queue.qsize() == 0:
-                    nvml_sender_time = time.time()
-                    # Update NVML stats for waiting requests
-                    wait_q = list(self.staged_adds.queue)
-                    wait_q = [req for req, _ in wait_q]
-                    self.scheduler.make_nvml_stats(wait_q)
+                # if time.time() - nvml_sender_time >= 0.05 and self.input_queue.qsize() == 0:
+                #     nvml_sender_time = time.time()
+                #     # Update NVML stats for waiting requests
+                #     wait_q = list(self.staged_adds.queue)
+                #     wait_q = [req for req, _ in wait_q]
+                #     self.scheduler.make_nvml_stats(wait_q)
             elif req_type == EngineCoreRequestType.ABORT:
                 # Stage aborts to apply in core loop
                 self.staged_aborts.put_nowait(payload)
