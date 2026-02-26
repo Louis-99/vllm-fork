@@ -427,7 +427,7 @@ class _MPNvmlFreqModulatorServer:
 
         # Map violation rate [0, 1] → SLA scaling [1.0, 0.5]
         # High violations → tighten SLA (lower); no violations → relax (higher)
-        scale = 1.0 - 0.5 * self._ewma_violation_rate
+        scale = 1.0 - 0.3 * self._ewma_violation_rate
         self.dynamic_tbt_sla = self.tbt_sla_max * scale
         # Clamp to [min, max] for safety
         self.dynamic_tbt_sla = max(self.tbt_sla_min,
