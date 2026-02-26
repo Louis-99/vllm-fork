@@ -285,7 +285,7 @@ class _MPNvmlFreqModulatorServer:
 
         # ── Dynamic TBT SLA via EWMA feedback ──
         self.tbt_sla_max = tbt_sla          # original ceiling
-        self.tbt_sla_min = 0.5 * tbt_sla    # floor = 50% of ceiling
+        self.tbt_sla_min = 0.3 * tbt_sla    # floor = 30% of ceiling
         self.dynamic_tbt_sla = tbt_sla       # starts at max
         self._last_batch_end_time: Optional[float] = None
         # Asymmetric EWMA: tighten fast (~10 samples), relax slow (~200 samples)
