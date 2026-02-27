@@ -283,16 +283,15 @@ class _MPNvmlFreqModulatorServer:
         self.init_done = False
         self.csv_writer = None
 
-        # ── Dynamic TBT SLA via EWMA feedback ──
+        # ── Dynamic TBT SLA via AIMD (Additive Increase / Multiplicative Decrease) ──
         self.tbt_sla_max = tbt_sla          # original ceiling
         self.tbt_sla_min = 0.3 * tbt_sla    # floor = 30% of ceiling
         self.dynamic_tbt_sla = tbt_sla       # starts at max
         self._last_batch_end_time: Optional[float] = None
-        # Asymmetric EWMA: tighten fast (~10 samples), relax slow (~200 samples)
-        self._ewma_alpha_fast = 2.0 / (10.0 + 1.0)   # violation rate rising  → scale down SLA
-        self._ewma_alpha_slow = 2.0 / (500.0 + 1.0)  # violation rate falling → scale up SLA
-        self._ewma_violation_rate = 0.0       # EWMA of binary violations
-        self._tbt_sample_count = 0            # warm-up counter
+        # AIMD parameters
+        self._aimd_additive_step = (tbt_sla - self.tbt_sla_min) / 200.0  # additive increase step 
+        self._aimd_mult_decrease = float(1/1.2)       # multiplicative decrease factor on violation 
+        self._last_violation: float = 0.0    # last violation indicator (for logging)
 
 
     def _load_models(self):
@@ -321,7 +320,7 @@ class _MPNvmlFreqModulatorServer:
                 'now', 'mpc_start', 'future_states_time', 'freq_mod_start', 'freq_mod_end',
                 'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
                 'max_running_q_wait', 'max_waiting_q_wait', 'fromWho',
-                'dynamic_tbt_sla', 'ewma_violation_rate'
+                'dynamic_tbt_sla', 'last_violation'
             ],
             filename=self.log_dir / 'freq_mod_log.csv')
 
@@ -388,17 +387,18 @@ class _MPNvmlFreqModulatorServer:
                     msg.waiting_queue_wait_time) > 0 else 0.0,
                 msg.fromWho,
                 self.dynamic_tbt_sla,
-                self._ewma_violation_rate,
+                self._last_violation,
             ])
         self.csv_writer.close()
 
 
     def _update_dynamic_tbt_sla(self, out_time: float):
         """
-        Update the dynamic TBT SLA based on EWMA of observed TBT values.
+        Update the dynamic TBT SLA using AIMD:
+        - Additive Increase: on no violation, raise SLA by a fixed step
+        - Multiplicative Decrease: on violation, halve the SLA
         The diff of successive out_time gives the actual per-batch TBT.
-        An EWMA violation rate drives the SLA between
-        [tbt_sla_min, tbt_sla_max].
+        SLA is clamped to [tbt_sla_min, tbt_sla_max].
         """
         if self._last_batch_end_time is None:
             self._last_batch_end_time = out_time
@@ -410,25 +410,15 @@ class _MPNvmlFreqModulatorServer:
         if actual_tbt <= 0:
             return  # ignore non-positive deltas (out-of-order, duplicates)
 
-        self._tbt_sample_count += 1
-        violation = 1.0 if actual_tbt > self.tbt_sla_max else 0.0
-
-        if self._tbt_sample_count == 1:
-            self._ewma_violation_rate = violation
+        if actual_tbt > self.tbt_sla_max:
+            # Violation → multiplicative decrease (tighten fast)
+            self.dynamic_tbt_sla *= self._aimd_mult_decrease
+            self._last_violation = 1.0
         else:
-            # Use fast alpha when violation rate is rising (tighten SLA faster),
-            # slow alpha when it is falling (relax SLA slower).
-            alpha = (self._ewma_alpha_fast
-                     if violation > self._ewma_violation_rate
-                     else self._ewma_alpha_slow)
-            self._ewma_violation_rate = (
-                alpha * violation + (1.0 - alpha) * self._ewma_violation_rate
-            )
+            # No violation → additive increase (relax slowly)
+            self.dynamic_tbt_sla += self._aimd_additive_step
+            self._last_violation = 0.0
 
-        # Map violation rate [0, 1] → SLA scaling [1.0, 0.5]
-        # High violations → tighten SLA (lower); no violations → relax (higher)
-        scale = 1.0 - self._ewma_violation_rate
-        self.dynamic_tbt_sla = self.tbt_sla_max * scale
         # Clamp to [min, max] for safety
         self.dynamic_tbt_sla = max(self.tbt_sla_min,
                                    min(self.tbt_sla_max, self.dynamic_tbt_sla))
