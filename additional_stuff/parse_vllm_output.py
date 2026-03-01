@@ -23,10 +23,6 @@ class PerfStats:
     power_w: float
     energy_j: float
     energy_per_token: float
-    energy_prefill: float
-    prefill_energy_per_token: float
-    energy_decode: float
-    decode_energy_per_token: float
     avg_running_q: float
     avg_waiting_q: float
     kv_usage_mean: float
@@ -63,11 +59,6 @@ def calc_perf_stats(expr_dir: Path) -> PerfStats:
     total_decode = sum(p.num_tokens_decoded for _, p in perfstats_list)
     total_prefill = sum(p.num_tokens_prefilled for _, p in perfstats_list)
 
-    prefill_decodes = sum(p.num_tokens_decoded for k, p in perfstats_list if "prefill" in k)
-    prefill_energy = sum(p.energy_j for k, p in perfstats_list if "prefill" in k)
-    decode_decodes = sum(p.num_tokens_decoded for k, p in perfstats_list if "decode" in k)
-    decode_energy = sum(p.energy_j for k, p in perfstats_list if "decode" in k)
-
     total_perfstats = PerfStats(
         throughput_rps=total_xput,
         ttft_mean=np.mean(ttft_list),
@@ -78,11 +69,7 @@ def calc_perf_stats(expr_dir: Path) -> PerfStats:
         tpot_p99=np.percentile(tpot_list, 99),
         power_w=total_energy / total_duration,
         energy_j=total_energy,
-        energy_prefill=prefill_energy,
-        energy_decode=decode_energy,
-        energy_per_token=total_energy / (total_decode),
-        prefill_energy_per_token=prefill_energy / prefill_decodes,
-        decode_energy_per_token=decode_energy / decode_decodes,
+        energy_per_token=total_energy / (total_decode + total_requests),
         avg_running_q=0,
         avg_waiting_q=0,
         kv_usage_mean=0,
@@ -224,8 +211,6 @@ def calc_perf_stats_single_instance(root_name: str,
         kv_usage_p99=float(percentile_or_nan(kv_usage_list, q=99)),
         power_w=power_w,
         energy_j=energy_j_steady,
-        energy_prefill=0,
-        energy_decode=0,
         freq_mhz_mean=float(np.mean(freq_arr_list)),
         freq_mhz_p10=float(percentile_or_nan(
             freq_arr_list, q=10)),
@@ -237,8 +222,6 @@ def calc_perf_stats_single_instance(root_name: str,
         num_tokens_decoded= total_decoded,
         num_tokens_prefilled=total_prefilled,
         energy_per_token=energy_j_steady / (total_decoded),
-        prefill_energy_per_token=0,
-        decode_energy_per_token=0,
         avg_req_len=avg_req_len,
         p99_req_len=p99_req_len,
     ), ttft_list, tpot_list
