@@ -62,18 +62,18 @@ def build_pipeline(role):
 
     # Choose defaults by role but allow overrides
     if role == 'prefill':
-        # est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
-        est = HistGradientBoostingRegressor(max_iter=200,
-                                            loss='absolute_error',
-                                            learning_rate=0.05,
-                                            l2_regularization=0.1,
-                                            max_leaf_nodes=None,
-                                            max_depth=None,
-                                            scoring='neg_mean_absolute_percentage_error',
-                                            random_state=42,
-                                            monotonic_cst=[0, 0, 0, 0, 0, 0, -1],
-                                            verbose=2,
-                                            )
+        est = RandomForestRegressor(n_estimators=20, random_state=42, n_jobs=-1, max_depth=50, verbose=1, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
+        # est = HistGradientBoostingRegressor(max_iter=200,
+        #                                     loss='absolute_error',
+        #                                     learning_rate=0.05,
+        #                                     l2_regularization=0.1,
+        #                                     max_leaf_nodes=None,
+        #                                     max_depth=None,
+        #                                     scoring='neg_mean_absolute_percentage_error',
+        #                                     random_state=42,
+        #                                     monotonic_cst=[0, 0, 0, 0, 0, 0, -1],
+        #                                     verbose=2,
+        #                                     )
     elif role == 'decode':
         # est = RandomForestRegressor(n_estimators=10, random_state=42, n_jobs=-1, max_depth=20, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
         est = HistGradientBoostingRegressor(max_iter=200, random_state=42, verbose=2, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
