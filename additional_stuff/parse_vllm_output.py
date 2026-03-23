@@ -117,6 +117,7 @@ def calc_perf_stats_single_instance(root_name: str,
     prefill_min = df_perf_metric_prefill_steady['now'].min() if not df_perf_metric_prefill_steady.empty else None
     prefill_max = df_perf_metric_prefill_steady['now'].max() if not df_perf_metric_prefill_steady.empty else None
 
+    print(f"decode_min: {decode_min}, decode_max: {decode_max}, prefill_min: {prefill_min}, prefill_max: {prefill_max}")
     min_time = min([t for t in [decode_min, prefill_min] if t is not None])
     max_time = max([t for t in [decode_max, prefill_max] if t is not None])
     duration = max_time - min_time
