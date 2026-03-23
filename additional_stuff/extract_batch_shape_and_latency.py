@@ -23,17 +23,25 @@ class LatencyAndShape:
     latency_prefill_s: float
     latency_decode_s: float
     freq_mhz: float
+    tp_degree: int
 
 def calc_stats_decode(expr_dir: Path) -> list[LatencyAndShape]:
     """Collect decode stats from subfolders under expr_dir."""
     logs_dict = load_logs(expr_dir, require="decode")
 
     stats_list: list[LatencyAndShape] = []
-    for k, v in logs_dict.items():
+    import concurrent.futures
+    
+    def process_logs_entry(k, v):
         df_perf_metric_decode, df_perf_metric_prefill, df_power = v
         if df_perf_metric_decode is None or df_power is None:
-            continue
-        stats_l = calc_stats_single_instance_decode(df_perf_metric_decode, df_power)
+            return []
+        return calc_stats_single_instance_decode(df_perf_metric_decode, df_power)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda item: process_logs_entry(item[0], item[1]), logs_dict.items()))
+    
+    for stats_l in results:
         stats_list.extend(stats_l)
 
     return stats_list
@@ -43,11 +51,18 @@ def calc_stats_prefill(expr_dir: Path) -> list[LatencyAndShape]:
     logs_dict = load_logs(expr_dir, require="prefill")
 
     stats_list: list[LatencyAndShape] = []
-    for k, v in logs_dict.items():
+    import concurrent.futures
+    
+    def process_logs_entry(k, v):
         df_perf_metric_decode, df_perf_metric_prefill, df_power = v
         if df_perf_metric_prefill is None or df_power is None:
-            continue
-        stats_l = calc_stats_single_instance_prefill(df_perf_metric_prefill, df_power)
+            return []
+        return calc_stats_single_instance_prefill(df_perf_metric_prefill, df_power)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda item: process_logs_entry(item[0], item[1]), logs_dict.items()))
+    
+    for stats_l in results:
         stats_list.extend(stats_l)
 
     return stats_list
@@ -96,6 +111,7 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
         latency_decode_s = np.median(latencies) if len(latencies) > 0 else np.nan
 
         freq_mhz = np.median(df_power[(df_power['Timestamp'] >= row.now - 0.05) & (df_power['Timestamp'] <= row.now + 0.05)]['freq_mhz'])
+        tp = len([col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")])
 
         return LatencyAndShape(
             batch_size=batch_size,
@@ -105,6 +121,7 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
             latency_prefill_s=np.nan,  # no prefill in decode logs
             latency_decode_s=latency_decode_s,
             freq_mhz=freq_mhz,
+            tp_degree=tp,
         )
 
     rows = list(df_perf_metric_decode_steady.itertuples())
@@ -150,6 +167,7 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
         latency_prefill_s = np.median(latencies) if len(latencies) > 0 else np.nan
 
         freq_mhz = np.median(df_power[(df_power['Timestamp'] >= row.now - 0.05) & (df_power['Timestamp'] <= row.now + 0.05)]['freq_mhz'])
+        tp = len([col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")])
 
         return LatencyAndShape(
             batch_size=batch_size,
@@ -159,6 +177,7 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
             latency_prefill_s=latency_prefill_s,
             latency_decode_s=np.nan,
             freq_mhz=freq_mhz,
+            tp_degree=tp,
         )
 
     rows = list(df_perf_metric_prefill_steady.itertuples())
@@ -255,7 +274,7 @@ if __name__ == '__main__':
         
         merged_stats_df = pd.DataFrame(decode_stats_all, columns=[
             'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std',
-            'latency_prefill_s', 'latency_decode_s', 'freq_mhz'])
+            'latency_prefill_s', 'latency_decode_s', 'freq_mhz', 'tp_degree'])
 
         print(f'len of decode stats: {len(decode_stats_all)}')
 
@@ -277,7 +296,7 @@ if __name__ == '__main__':
         
         merged_stats_df = pd.DataFrame(prefill_stats_all, columns=[
             'batch_size', 'input_len_sum', 'input_len_mean', 'input_len_std',
-            'latency_prefill_s', 'latency_decode_s', 'freq_mhz'])
+            'latency_prefill_s', 'latency_decode_s', 'freq_mhz', 'tp_degree'])
 
         merged_stats_df = merged_stats_df[merged_stats_df['input_len_sum'] < 8001]
 
