@@ -41,7 +41,7 @@ def calc_stats_mixed(expr_dir: Path) -> list[LatencyAndShape]:
     - Combined metrics
     """
     logs_dict = load_logs(expr_dir)
-
+    print(f'Found {len(logs_dict)} subfolders with complete logs in {expr_dir}')
     stats_list: list[LatencyAndShape] = []
     with ProcessPoolExecutor(max_workers=mp.cpu_count()) as executor:
         futures = [
@@ -64,8 +64,8 @@ def calc_stats_single_instance_mixed(
     For each prefill iteration, find the closest decode iteration in time and
     combine them into mixed workload records.
     """
-    # get single freq_mhz for all gpus
-    df_power['freq_mhz'] = df_power[[col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]].mean(axis=1)
+    # get single freq_mhz for all gpus    
+    freq_mhz = df_power[[col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]].mean(axis=1).median()
     tp_degree = len([col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")])
     # Prepare prefill data
     df_perf_metric_prefill_steady = df_perf_metric_prefill[df_perf_metric_prefill['KV_usage_perc'] < 0.95].copy()
@@ -101,9 +101,9 @@ def calc_stats_single_instance_mixed(
             sum_decode_len=sum(decode_lens),
             mean_decode_len=np.mean(decode_lens) if decode_lens else 0,
             std_decode_len=np.std(decode_lens) if decode_lens else 0,
-            frequency=row.freq_mhz,
+            frequency=freq_mhz,
             tp_size=tp_degree,
-            mean_latency=row.inter_token_latencies_iter_evald[-1] if row.inter_token_latencies_iter_evald else np.nan
+            mean_latency=row.inter_token_latencies_iter_evald[0] if row.inter_token_latencies_iter_evald else np.nan
         ))
     return lat_and_shape_list
 
@@ -133,7 +133,7 @@ def load_logs(expr_dir: Path) -> dict:
             has_decode = df_perf_metric_decode is not None and (not df_perf_metric_decode.empty)
             has_prefill = df_perf_metric_prefill is not None and (not df_perf_metric_prefill.empty)
 
-            if has_decode and has_prefill and has_power:
+            if has_prefill and has_power:
                 logs[subfolder.name] = (df_perf_metric_decode, df_perf_metric_prefill, df_power)
         except Exception as e:
             print(f"Skipping {subfolder} due to error: {e}")

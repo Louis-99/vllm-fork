@@ -151,11 +151,11 @@ def get_param_grid():
     """Define parameter grid for hyperparameter search"""
     param_grid = {
         'boosting_type': ['gbdt'],
-        'learning_rate': [0.1, 0.15],
+        'learning_rate': [0.1],
         'linear_lambda': [1e-3, 5e-3],
         'min_child_samples': [30, 40, ],
-        'num_iterations': [400, 500],
-        'num_leaves': [80, 90,],
+        'num_iterations': [400],
+        'num_leaves': [80],
         'reg_lambda': [1e-2, 1e-3],
         'monotonic_cst': [[0, 0, 0, 0, 0, 0, 0, 0, 0, -1]]
     }
@@ -396,6 +396,12 @@ def main():
     CSV_PATH_DECODE_4 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/decode_inference_results_tp4.csv"
     CSV_PATH_DECODE_8 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/decode_inference_results_tp8.csv"
 
+    # together ai logs
+    CSV_PATH_MIXED1 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/placeonly_collo/mixed_latencies.csv"
+    CSV_PATH_MIXED2 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/dynamo/mixed_latencies.csv"
+    CSV_PATH_P1 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/placeonly_disag/prefill_latencies.csv"
+    CSV_PATH_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/placeonly_disag/decode_latencies.csv"
+
     MODEL_DIR = os.path.join(args.model_dir)
 
     # Unified feature columns (both prefill and decode features)
@@ -422,8 +428,10 @@ def main():
     df_p42 = load_and_prepare_prefill(CSV_PATH_TP4_P2, 'Llama-3.3-70B-Instruct', tp=4)
     df_p43 = load_and_prepare_prefill(CSV_PATH_TP4_P3, 'Llama-3.3-70B-Instruct', tp=4)
     print(f"Prefill TP4 samples: {len(df_p4)} + {len(df_p41)} + {len(df_p42)} + {len(df_p43)}")
+
+    df_p_t = load_and_prepare_prefill(CSV_PATH_P1, 'Llama-3.3-70B-Instruct')
     
-    df_prefill_all = pd.concat([df_p2, df_p21, df_p22, df_p23, df_p4, df_p41, df_p42, df_p43], ignore_index=True)
+    df_prefill_all = pd.concat([df_p2, df_p21, df_p22, df_p23, df_p4, df_p41, df_p42, df_p43, df_p_t], ignore_index=True)
     print(f"Total prefill samples: {len(df_prefill_all)}")
 
     # Load decode data
@@ -437,20 +445,24 @@ def main():
     df_d42 = load_and_prepare_decode(CSV_PATH_TP4_D2, 'Llama-3.3-70B-Instruct', tp=4)
     df_d43 = load_and_prepare_decode(CSV_PATH_TP4_D3, 'Llama-3.3-70B-Instruct', tp=4)
     print(f"Decode TP4 samples: {len(df_d4)} + {len(df_d41)} + {len(df_d42)} + {len(df_d43)}")
+
+    df_d_t = load_and_prepare_decode(CSV_PATH_D1, 'Llama-3.3-70B-Instruct')
     
-    df_decode_all = pd.concat([df_d2, df_d21, df_d4, df_d41, df_d42, df_d43], ignore_index=True)
+    df_decode_all = pd.concat([df_d2, df_d21, df_d4, df_d41, df_d42, df_d43, df_d_t], ignore_index=True)
     print(f"Total decode samples: {len(df_decode_all)}")
 
     # Load mixed data
     print('\n--- Loading data from profiler ---')
     df_mixed = load_and_prepare_mixed(CSV_PATH_MIXED, 'Llama-3.3-70B-Instruct')
+    df_mixed1 = load_and_prepare_mixed(CSV_PATH_MIXED1, 'Llama-3.3-70B-Instruct')
+    df_mixed2 = load_and_prepare_mixed(CSV_PATH_MIXED2, 'Llama-3.3-70B-Instruct')
     df_mixed_2 = load_and_prepare_mixed(CSV_PATH_MIXED_2, 'Llama-3.3-70B-Instruct')
     df_mixed_4 = load_and_prepare_mixed(CSV_PATH_MIXED_4, 'Llama-3.3-70B-Instruct')
     df_mixed_8 = load_and_prepare_mixed(CSV_PATH_MIXED_8, 'Llama-3.3-70B-Instruct')
     df_decode_2 = load_and_prepare_mixed(CSV_PATH_DECODE_2, 'Llama-3.3-70B-Instruct')
     df_decode_4 = load_and_prepare_mixed(CSV_PATH_DECODE_4, 'Llama-3.3-70B-Instruct')
     df_decode_8 = load_and_prepare_mixed(CSV_PATH_DECODE_8, 'Llama-3.3-70B-Instruct')
-    df_mixed = pd.concat([df_mixed, df_mixed_2, df_mixed_4, df_mixed_8, df_decode_2, df_decode_4, df_decode_8], ignore_index=True)
+    df_mixed = pd.concat([df_mixed, df_mixed1, df_mixed2, df_mixed_2, df_mixed_4, df_mixed_8, df_decode_2, df_decode_4, df_decode_8], ignore_index=True)
     print(f"Total mixed samples: {len(df_mixed)}")
     print(f' TP2 mixed samples: {len(df_mixed[(df_mixed["tp_degree"]==2) & (df_mixed["test_name"].str.contains("mixed"))])}, prefill samples: {len(df_mixed[(df_mixed["tp_degree"]==2) & (df_mixed["test_name"].str.contains("prefill"))])}, decode samples: {len(df_mixed[(df_mixed["tp_degree"]==2) & (df_mixed["test_name"].str.contains("decode"))])}')
     print(f' TP4 mixed samples: {len(df_mixed[(df_mixed["tp_degree"]==4) & (df_mixed["test_name"].str.contains("mixed"))])}, prefill samples: {len(df_mixed[(df_mixed["tp_degree"]==4) & (df_mixed["test_name"].str.contains("prefill"))])}, decode samples: {len(df_mixed[(df_mixed["tp_degree"]==4) & (df_mixed["test_name"].str.contains("decode"))])}')
