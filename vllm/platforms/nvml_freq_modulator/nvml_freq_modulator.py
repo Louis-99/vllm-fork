@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 import msgspec
 import numpy as np
 import onnxruntime as ort
+import lightgbm as lgb
 from scipy.interpolate import interpn
 import pynvml
 
@@ -317,7 +318,7 @@ class _MPNvmlFreqModulatorServer:
 
         self.power_model_prefill: ort.InferenceSession
         self.power_model_decode: ort.InferenceSession
-        self.latency_model_prefill: ort.InferenceSession
+        self.latency_model_prefill: lgb.Booster
         self.latency_model_decode: ort.InferenceSession
 
         self.last_applied_freq: int = 2000
@@ -328,33 +329,35 @@ class _MPNvmlFreqModulatorServer:
         self._freq_daemon_queues = []
         self._freq_daemon_procs = []
 
+        self.init_done = False
+        self.csv_writer = None
+
+
     def _load_models(self):
         dec = None
         pre = None
         dec_path = PATH_TO_MODELS / "decode_model_latency.onnx"
-        pre_path = PATH_TO_MODELS / "prefill_model_latency.onnx"
+        pre_path = PATH_TO_MODELS / "unified_latency_model_tp2_tp4_use_for_prefill.txt"
         power_dec_path = PATH_TO_MODELS / "decode_model_power.onnx"
         if dec_path.exists():
             self.latency_model_decode = ort.InferenceSession(dec_path)
         if pre_path.exists():
-            self.latency_model_prefill = ort.InferenceSession(pre_path)
+            self.latency_model_prefill = lgb.Booster(model_file=pre_path)
         if power_dec_path.exists():
             self.power_model_decode = ort.InferenceSession(power_dec_path)             
 
     def run(self):
-        self.start_frequency_manager()
-        self.underprediction_lock = threading.Lock()
-        # Load models here rather than in __init__() so that we don't pass the
-        # loaded models across processes
-        self._load_models()
-
-        # Column `now` used as key column to join with `perf_metrics.csv`
-        csv_writer = CSVWriter(col_names=[
-            'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
-            'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
-            'max_running_q_wait', 'max_waiting_q_wait',
-        ],
-        filename=self.log_dir / 'freq_mod_log.csv')
+        if not self.init_done:
+            self.init_done = True
+            self.underprediction_lock = threading.Lock()
+            self._load_models()
+            self.start_frequency_manager()
+            self.csv_writer = CSVWriter(col_names=[
+                'now', 'mpc_start', 'freq_mod_start', 'freq_mod_end',
+                'target_freq', 'batch_lat', 'running_q_len', 'waiting_q_len',
+                'max_running_q_wait', 'max_waiting_q_wait',
+            ],
+            filename=self.log_dir / 'freq_mod_log.csv')
 
         for step_id in count():
             msg_encoded = self.q.get()
@@ -387,7 +390,7 @@ class _MPNvmlFreqModulatorServer:
             freq_mod_start = time.perf_counter()
             with self.underprediction_lock:
                 if self.last_applied_freq != selected_freq:
-                    self.set_frequency_manager(selected_freq)
+                    self.set_frequency_manager(selected_freq, msg.now)
                     self.last_applied_freq = selected_freq
 
             freq_mod_end = time.perf_counter()
@@ -398,7 +401,8 @@ class _MPNvmlFreqModulatorServer:
                 timer_to_check_underpred.daemon = True
                 timer_to_check_underpred.start()
 
-            csv_writer.add_row([
+            
+            self.csv_writer.add_row([
                 msg.now,
                 mpc_start,
                 freq_mod_start,
@@ -412,8 +416,7 @@ class _MPNvmlFreqModulatorServer:
                 max(msg.waiting_queue_wait_time) if len(
                     msg.waiting_queue_wait_time) > 0 else 0.0,
             ])
-
-        csv_writer.close()
+        self.csv_writer.close()
 
     def check_underprediction(self, ID: int,):
         """
@@ -426,7 +429,7 @@ class _MPNvmlFreqModulatorServer:
                 # Skip this check.
                 return
             if self.last_applied_freq is not max(self.freq_choices):
-                self.set_frequency_manager(max(self.freq_choices))
+                self.set_frequency_manager(max(self.freq_choices), time.time())
                 self.last_applied_freq = max(self.freq_choices)
                 logger.info('Underprediction detected, applied max freq')
 
@@ -641,10 +644,11 @@ class _MPNvmlFreqModulatorServer:
 
         freq_arr = np.array(freq_choices, dtype=np.float32)
         if self.engine_role == 'prefill':
-            bs_vec = np.array([st.num_prefills for st in states], dtype=np.float32)
-            ils_vec = np.array([st.prefill_len_sum for st in states], dtype=np.float32)
-            ilm_vec = np.array([st.prefill_len_mean for st in states], dtype=np.float32)
-            ilsd_vec = np.array([st.prefill_len_std for st in states], dtype=np.float32)
+            freq_arr = np.log1p(freq_choices, dtype=np.float32)
+            bs_vec = np.log1p([st.num_prefills for st in states], dtype=np.float32)
+            ils_vec = np.log1p([st.prefill_len_sum for st in states], dtype=np.float32)
+            ilm_vec = np.log1p([st.prefill_len_mean for st in states], dtype=np.float32)
+            ilsd_vec = np.log1p([st.prefill_len_std for st in states], dtype=np.float32)
         else:
             bs_vec = np.array([st.num_decodes for st in states], dtype=np.float32)
             ils_vec = np.array([st.decode_len_sum for st in states], dtype=np.float32)
@@ -661,32 +665,39 @@ class _MPNvmlFreqModulatorServer:
         # Keep numpy arrays; avoid converting to Python lists and back.
         n_rows = n_states * n_freqs
 
-        # Select appropriate latency model for inference
-        latency_model = (self.latency_model_prefill
-                 if self.engine_role == 'prefill'
-                 else self.latency_model_decode)
-
-        # Build input feed for the latency model using numpy arrays directly
-        # Build model column using np.full to avoid intermediate Python list
         model_col = np.full((n_rows, 1), self.model, dtype=str)
-        input_feed = {
-            "model": model_col,
-            "batch_size": batch_sizes.reshape(n_rows, 1).astype(np.float32),
-            "input_len_sum": input_len_sums.reshape(n_rows, 1).astype(np.float32),
-            "input_len_mean": input_len_means.reshape(n_rows, 1).astype(np.float32),
-            "input_len_std": input_len_stds.reshape(n_rows, 1).astype(np.float32),
-            "tp_degree": tp_degrees.reshape(n_rows, 1).astype(np.float32),
-            "freq_mhz": freqs.reshape(n_rows, 1).astype(np.float32),
-        }
+        # Select appropriate latency model for inference
+        if self.engine_role == 'prefill':
+            latency_model = self.latency_model_prefill
+            input_feed = np.stack([
+                                    np.zeros_like(batch_sizes, dtype=np.float32),  # placeholder for model name, not used in prefill model
+                                    np.zeros_like(batch_sizes, dtype=np.float32),
+                                    np.zeros_like(batch_sizes, dtype=np.float32),
+                                    np.zeros_like(batch_sizes, dtype=np.float32),
+                                    batch_sizes,
+                                    input_len_sums,
+                                    input_len_means,
+                                    input_len_stds,
+                                    tp_degrees,
+                                    freqs,
+                                ], axis=1).astype(np.float32)
+            out = latency_model.predict(input_feed)
+            out = np.exp(out)
+            out = np.clip(out, 0.005, None)
+        else:
+            latency_model = self.latency_model_decode
+            input_feed = {
+                            "model": model_col,
+                            "batch_size": batch_sizes.reshape(n_rows, 1).astype(np.float32),
+                            "input_len_sum": input_len_sums.reshape(n_rows, 1).astype(np.float32),
+                            "input_len_mean": input_len_means.reshape(n_rows, 1).astype(np.float32),
+                            "input_len_std": input_len_stds.reshape(n_rows, 1).astype(np.float32),
+                            "tp_degree": tp_degrees.reshape(n_rows, 1).astype(np.float32),
+                            "freq_mhz": freqs.reshape(n_rows, 1).astype(np.float32),
+                        }
+            out = latency_model.run(None, input_feed)[0]
+            out = np.clip(out, 0.005, None)
 
-        out = latency_model.run(None, input_feed)[0]
-
-        # Mark rows with batch_size == 0 so we can override model output after inference.
-        batch_size_col = batch_sizes.reshape(n_rows)
-        zero_mask = batch_size_col == 0
-        out[zero_mask] = 0.005
-        
-        out = np.asarray(out)
         latency_mat = out.reshape(n_states, n_freqs)
         return latency_mat
 
@@ -808,7 +819,7 @@ class _MPNvmlFreqModulatorServer:
             output_arr = out.reshape(n_future, n_freqs)
         return output_arr
 
-    def _persistent_gpu_worker(physical_gpu_index: int, queue: multiprocessing.Queue):
+    def _persistent_gpu_worker(physical_gpu_index: int, queue: multiprocessing.Queue, log_dir: str):
         """
         Worker process that initializes NVML for a specific GPU and waits for
         frequency commands.
@@ -822,26 +833,37 @@ class _MPNvmlFreqModulatorServer:
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_index)
             logger.info(f"Frequency daemon started for GPU index {physical_gpu_index}")
+            csv_writer = CSVWriter(col_names=[
+                'now',
+                'freq_app_time',
+                'target_freq'
+            ],
+            filename=log_dir / f'freq_apply_log_{physical_gpu_index}.csv')
             while True:
                 # This blocks until a frequency is sent from the main process
-                freq = queue.get()
+                freq, now = queue.get()
                 # Poison pill to stop the process
-                if freq == -1:
+                if freq == -1 and now == -1:
                     break
 
                 if not queue.empty():
                     qsize = queue.qsize()
                     for _skipped in range(qsize):
-                        freq = queue.get()
-                        if freq == -1:
+                        freq, now = queue.get()
+                        if freq == -1 and now == -1:
                             break
 
-                if freq == -1:
+                if freq == -1 and now == -1:
                     break
                     
                 try:
                     # Apply the frequency
                     pynvml.nvmlDeviceSetGpuLockedClocks(handle, freq, freq)
+                    csv_writer.add_row([
+                        now, 
+                        time.time(),
+                        freq,
+                    ])
                 except pynvml.NVMLError as e:
                     logger.error(f"Daemon GPU {physical_gpu_index} failed to set freq {freq}: {e}")
 
@@ -853,6 +875,7 @@ class _MPNvmlFreqModulatorServer:
                 pynvml.nvmlShutdown()
             except:
                 pass
+            csv_writer.close()
 
 
     def start_frequency_manager(self):
@@ -876,7 +899,7 @@ class _MPNvmlFreqModulatorServer:
         for physical_idx in gpu_indices:
             q = ctx.Queue()
             # Use the unbound function object from the class dict to avoid pickling the instance.
-            p = ctx.Process(target=self.__class__._persistent_gpu_worker, args=(physical_idx, q))
+            p = ctx.Process(target=self.__class__._persistent_gpu_worker, args=(physical_idx, q, self.log_dir))
             p.start()
             
             self._freq_daemon_queues.append(q)
@@ -884,7 +907,7 @@ class _MPNvmlFreqModulatorServer:
         logger.info(f"Started {len(self._freq_daemon_procs)} GPU frequency daemon processes.")
 
 
-    def set_frequency_manager(self, freq: int):
+    def set_frequency_manager(self, freq: int, now: float):
         """
         Sends the new frequency to all waiting GPU processes.
         This function returns immediately after putting the freq in the queue.
@@ -894,7 +917,7 @@ class _MPNvmlFreqModulatorServer:
             return
 
         for q in self._freq_daemon_queues:
-            q.put(freq)
+            q.put((freq, now))
 
 
     def stop_frequency_manager(self):
@@ -904,7 +927,7 @@ class _MPNvmlFreqModulatorServer:
         logger.info("Stopping frequency daemons...")
         
         for q in self._freq_daemon_queues:
-            q.put(-1)  # Poison pill
+            q.put((-1, -1))  # Poison pill
 
         for p in self._freq_daemon_procs:
             p.join()
@@ -952,6 +975,8 @@ if __name__ == '__main__':
             waiting_queue_tokens=[1200, 1200, 1200],
             waiting_queue_pre_computed_tokens=[0, 0, 0],
             waiting_queue_wait_time=[0.15, 0.15, 0.15],
+            fromWho="scheduler",
+            batch_ID=0,
         ),
         # FreqModMsg(
         #     now=0.0,
@@ -987,4 +1012,3 @@ if __name__ == '__main__':
     for i in range(len(msg)):
         q.put(msgspec.msgpack.encode(msg[i]))
     s.run()
-
