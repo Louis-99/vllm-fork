@@ -69,7 +69,7 @@ def calc_stats_prefill(expr_dir: Path) -> list[LatencyAndShape]:
 
 def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame, df_power: pd.DataFrame) -> list[LatencyAndShape]:
     # get single freq_mhz for all gpus
-    df_power['freq_mhz'] = df_power[[col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]].mean(axis=1)
+    df_power['freq_mhz'] = df_power[[col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]].max(axis=1)
 
     df_perf_metric_decode_steady['request_ids_iter_tbt_evald'] = df_perf_metric_decode_steady['request_ids_iter_tbt'].apply(eval)
     df_perf_metric_decode_steady['inter_token_latencies_iter_evald'] = df_perf_metric_decode_steady['inter_token_latencies_iter'].apply(eval)
@@ -110,7 +110,7 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
         latencies = row.inter_token_latencies_iter_evald
         latency_decode_s = np.median(latencies) if len(latencies) > 0 else np.nan
 
-        freq_mhz = np.median(df_power[(df_power['Timestamp'] >= row.now - 0.05) & (df_power['Timestamp'] <= row.now + 0.05)]['freq_mhz'])
+        freq_mhz = np.max(df_power[(df_power['Timestamp'] >= row.now - 0.05) & (df_power['Timestamp'] <= row.now + 0.05)]['freq_mhz'])
         tp = len([col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")])
 
         return LatencyAndShape(
@@ -134,7 +134,7 @@ def calc_stats_single_instance_decode(df_perf_metric_decode_steady: pd.DataFrame
 
 def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFrame, df_power: pd.DataFrame) -> list[LatencyAndShape]:
     # get single freq_mhz for all gpus
-    df_power['freq_mhz'] = df_power[[col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]].mean(axis=1)
+    df_power['freq_mhz'] = df_power[[col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]].max(axis=1)
 
     df_perf_metric_prefill_steady['request_ids_iter_ttft_evald'] = df_perf_metric_prefill_steady['request_ids_iter_ttft'].apply(eval)
     df_perf_metric_prefill_steady['time_to_first_tokens_iter_evald'] = df_perf_metric_prefill_steady['time_to_first_tokens_iter'].apply(eval)
@@ -166,7 +166,7 @@ def calc_stats_single_instance_prefill(df_perf_metric_prefill_steady: pd.DataFra
         latencies = [row.step_with_batch_queue_time_ms / 1000.0]
         latency_prefill_s = np.median(latencies) if len(latencies) > 0 else np.nan
 
-        freq_mhz = np.median(df_power[(df_power['Timestamp'] >= row.now - 0.05) & (df_power['Timestamp'] <= row.now + 0.05)]['freq_mhz'])
+        freq_mhz = np.max(df_power[(df_power['Timestamp'] >= row.now - 0.05) & (df_power['Timestamp'] <= row.now + 0.05)]['freq_mhz'])
         tp = len([col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")])
 
         return LatencyAndShape(
