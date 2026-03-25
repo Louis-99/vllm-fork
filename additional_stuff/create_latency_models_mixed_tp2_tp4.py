@@ -151,11 +151,11 @@ def get_param_grid():
     """Define parameter grid for hyperparameter search"""
     param_grid = {
         'boosting_type': ['gbdt'],
-        'learning_rate': [0.1],
-        'linear_lambda': [1e-3, 5e-3],
-        'min_child_samples': [30, 40, ],
+        'learning_rate': [0.08, 0.1],
+        'linear_lambda': [1e-3],
+        'min_child_samples': [30, 40, 50],
         'num_iterations': [400],
-        'num_leaves': [80],
+        'num_leaves': [70, 80],
         'reg_lambda': [1e-2, 1e-3],
         'monotonic_cst': [[0, 0, 0, 0, 0, 0, 0, 0, 0, -1]]
     }
@@ -389,16 +389,11 @@ def main():
 
     # Data path for mixed
     CSV_PATH_MIXED = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/combined_profiling_results.csv"
-    CSV_PATH_MIXED_2 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/mixed_inference_results_tp2.csv"
-    CSV_PATH_MIXED_4 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/mixed_inference_results_tp4.csv"
-    CSV_PATH_MIXED_8 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/mixed_inference_results_tp8.csv"
-    CSV_PATH_DECODE_2 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/decode_inference_results_tp2.csv"
-    CSV_PATH_DECODE_4 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/decode_inference_results_tp4.csv"
-    CSV_PATH_DECODE_8 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/decode_inference_results_tp8.csv"
+    CSV_PATH_MIXED_2 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/tp2/mixed_latencies.csv"
+    CSV_PATH_MIXED_4 = "/export2/obasit/ClusterLevelServing/vllm_profiler_logs/older_style_latency_only_profiling/tp4/mixed_latencies.csv"
 
     # together ai logs
     CSV_PATH_MIXED1 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/placeonly_collo/mixed_latencies.csv"
-    CSV_PATH_MIXED2 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/dynamo/mixed_latencies.csv"
     CSV_PATH_P1 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/placeonly_disag/prefill_latencies.csv"
     CSV_PATH_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/placeonly_disag/decode_latencies.csv"
 
@@ -455,14 +450,9 @@ def main():
     print('\n--- Loading data from profiler ---')
     df_mixed = load_and_prepare_mixed(CSV_PATH_MIXED, 'Llama-3.3-70B-Instruct')
     df_mixed1 = load_and_prepare_mixed(CSV_PATH_MIXED1, 'Llama-3.3-70B-Instruct')
-    df_mixed2 = load_and_prepare_mixed(CSV_PATH_MIXED2, 'Llama-3.3-70B-Instruct')
     df_mixed_2 = load_and_prepare_mixed(CSV_PATH_MIXED_2, 'Llama-3.3-70B-Instruct')
     df_mixed_4 = load_and_prepare_mixed(CSV_PATH_MIXED_4, 'Llama-3.3-70B-Instruct')
-    df_mixed_8 = load_and_prepare_mixed(CSV_PATH_MIXED_8, 'Llama-3.3-70B-Instruct')
-    df_decode_2 = load_and_prepare_mixed(CSV_PATH_DECODE_2, 'Llama-3.3-70B-Instruct')
-    df_decode_4 = load_and_prepare_mixed(CSV_PATH_DECODE_4, 'Llama-3.3-70B-Instruct')
-    df_decode_8 = load_and_prepare_mixed(CSV_PATH_DECODE_8, 'Llama-3.3-70B-Instruct')
-    df_mixed = pd.concat([df_mixed, df_mixed1, df_mixed2, df_mixed_2, df_mixed_4, df_mixed_8, df_decode_2, df_decode_4, df_decode_8], ignore_index=True)
+    df_mixed = pd.concat([df_mixed, df_mixed1, df_mixed_2, df_mixed_4], ignore_index=True)
     print(f"Total mixed samples: {len(df_mixed)}")
     print(f' TP2 mixed samples: {len(df_mixed[(df_mixed["tp_degree"]==2) & (df_mixed["test_name"].str.contains("mixed"))])}, prefill samples: {len(df_mixed[(df_mixed["tp_degree"]==2) & (df_mixed["test_name"].str.contains("prefill"))])}, decode samples: {len(df_mixed[(df_mixed["tp_degree"]==2) & (df_mixed["test_name"].str.contains("decode"))])}')
     print(f' TP4 mixed samples: {len(df_mixed[(df_mixed["tp_degree"]==4) & (df_mixed["test_name"].str.contains("mixed"))])}, prefill samples: {len(df_mixed[(df_mixed["tp_degree"]==4) & (df_mixed["test_name"].str.contains("prefill"))])}, decode samples: {len(df_mixed[(df_mixed["tp_degree"]==4) & (df_mixed["test_name"].str.contains("decode"))])}')
