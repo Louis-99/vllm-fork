@@ -65,7 +65,7 @@ def calc_stats_single_instance_mixed(
     combine them into mixed workload records.
     """
     # get single freq_mhz for all gpus    
-    freq_mhz = df_power[[col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]].mean(axis=1).median()
+    freq_mhz = df_power[[col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")]].max(axis=1).max()
     tp_degree = len([col for col in df_power.columns if col.startswith("GPU_") and col.endswith("_freq_mhz")])
     # Prepare prefill data
     df_perf_metric_prefill_steady = df_perf_metric_prefill[df_perf_metric_prefill['KV_usage_perc'] < 0.95].copy()
@@ -74,8 +74,10 @@ def calc_stats_single_instance_mixed(
     df_perf_metric_prefill_steady['inter_token_latencies_iter_evald'] = df_perf_metric_prefill_steady['inter_token_latencies_iter'].apply(eval)
     
     lat_and_shape_list = []
+    chunked_ctx_lats_iter = 0
     for row in df_perf_metric_prefill_steady.itertuples():
         if len(row.num_prompt_tokens_reqs_evald) == 0 and len(row.max_num_generation_tokens_iter_evald) == 0:
+            chunked_ctx_lats_iter = 0
             continue
 
         prefill_lens = []
@@ -84,21 +86,34 @@ def calc_stats_single_instance_mixed(
         gen_tokens = row.max_num_generation_tokens_iter_evald
         for i, (prompt_len, gen_tok) in enumerate(zip(prompt_lens, gen_tokens)):
             if gen_tok == 1:
-                # This is a prefill request
-                prefill_lens.append(prompt_len)
+                # adjust chunked prefill first
+                if chunked_ctx_lats_iter > 0:
+                    len_to_add = prompt_len - chunked_ctx_lats_iter
+                    assert len_to_add > 0, f"Chunked prefill logic error: len_to_add={len_to_add} should be non-negative"
+                    chunked_ctx_lats_iter = 0
+                    prefill_lens.append(len_to_add)
+                else:
+                    # This is a prefill request
+                    prefill_lens.append(prompt_len)
             else:
                 # This is a decode request
                 # Total KV cache size = prompt_len + gen_tokens
                 decode_lens.append(prompt_len + gen_tok)
 
+        # checking for chunked prefill
+        if row.token_budget_used > sum(prefill_lens) + len(decode_lens):
+            assert row.token_budget_used - sum(prefill_lens) - len(decode_lens) > 0, "Token budget logic error"
+            prefill_lens.append(row.token_budget_used - sum(prefill_lens) - len(decode_lens))
+
+
         lat_and_shape_list.append(LatencyAndShape(
             test_name=expr_dir.name,
             num_prefill_reqs=len(prefill_lens),
-            sum_ctx_len=sum(prefill_lens),
+            sum_ctx_len=sum(prefill_lens) if prefill_lens else 0,
             mean_ctx_len=np.mean(prefill_lens) if prefill_lens else 0,
             std_ctx_len=np.std(prefill_lens) if prefill_lens else 0,
             num_decode_reqs=len(decode_lens),
-            sum_decode_len=sum(decode_lens),
+            sum_decode_len=sum(decode_lens) if decode_lens else 0,
             mean_decode_len=np.mean(decode_lens) if decode_lens else 0,
             std_decode_len=np.std(decode_lens) if decode_lens else 0,
             frequency=freq_mhz,
