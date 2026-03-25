@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 import msgspec
 import numpy as np
 import onnxruntime as ort
+import lightgbm as lgb
 from scipy.interpolate import interpn
 import pynvml
 
@@ -317,7 +318,7 @@ class _MPNvmlFreqModulatorServer:
 
         self.power_model_prefill: ort.InferenceSession
         self.power_model_decode: ort.InferenceSession
-        self.latency_model_prefill: ort.InferenceSession
+        self.latency_model_prefill: lgb.Booster
         self.latency_model_decode: ort.InferenceSession
 
         self.last_applied_freq: int = 2000
@@ -336,12 +337,12 @@ class _MPNvmlFreqModulatorServer:
         dec = None
         pre = None
         dec_path = PATH_TO_MODELS / "decode_model_latency.onnx"
-        pre_path = PATH_TO_MODELS / "prefill_model_latency.onnx"
+        pre_path = PATH_TO_MODELS / "unified_latency_model_tp2_tp4_use_for_prefill.txt"
         power_dec_path = PATH_TO_MODELS / "decode_model_power.onnx"
         if dec_path.exists():
             self.latency_model_decode = ort.InferenceSession(dec_path)
         if pre_path.exists():
-            self.latency_model_prefill = ort.InferenceSession(pre_path)
+            self.latency_model_prefill = lgb.Booster(model_file=pre_path)
         if power_dec_path.exists():
             self.power_model_decode = ort.InferenceSession(power_dec_path)             
 
@@ -643,10 +644,11 @@ class _MPNvmlFreqModulatorServer:
 
         freq_arr = np.array(freq_choices, dtype=np.float32)
         if self.engine_role == 'prefill':
-            bs_vec = np.array([st.num_prefills for st in states], dtype=np.float32)
-            ils_vec = np.array([st.prefill_len_sum for st in states], dtype=np.float32)
-            ilm_vec = np.array([st.prefill_len_mean for st in states], dtype=np.float32)
-            ilsd_vec = np.array([st.prefill_len_std for st in states], dtype=np.float32)
+            freq_arr = np.log1p(freq_choices, dtype=np.float32)
+            bs_vec = np.log1p([st.num_prefills for st in states], dtype=np.float32)
+            ils_vec = np.log1p([st.prefill_len_sum for st in states], dtype=np.float32)
+            ilm_vec = np.log1p([st.prefill_len_mean for st in states], dtype=np.float32)
+            ilsd_vec = np.log1p([st.prefill_len_std for st in states], dtype=np.float32)
         else:
             bs_vec = np.array([st.num_decodes for st in states], dtype=np.float32)
             ils_vec = np.array([st.decode_len_sum for st in states], dtype=np.float32)
@@ -663,32 +665,39 @@ class _MPNvmlFreqModulatorServer:
         # Keep numpy arrays; avoid converting to Python lists and back.
         n_rows = n_states * n_freqs
 
-        # Select appropriate latency model for inference
-        latency_model = (self.latency_model_prefill
-                 if self.engine_role == 'prefill'
-                 else self.latency_model_decode)
-
-        # Build input feed for the latency model using numpy arrays directly
-        # Build model column using np.full to avoid intermediate Python list
         model_col = np.full((n_rows, 1), self.model, dtype=str)
-        input_feed = {
-            "model": model_col,
-            "batch_size": batch_sizes.reshape(n_rows, 1).astype(np.float32),
-            "input_len_sum": input_len_sums.reshape(n_rows, 1).astype(np.float32),
-            "input_len_mean": input_len_means.reshape(n_rows, 1).astype(np.float32),
-            "input_len_std": input_len_stds.reshape(n_rows, 1).astype(np.float32),
-            "tp_degree": tp_degrees.reshape(n_rows, 1).astype(np.float32),
-            "freq_mhz": freqs.reshape(n_rows, 1).astype(np.float32),
-        }
+        # Select appropriate latency model for inference
+        if self.engine_role == 'prefill':
+            latency_model = self.latency_model_prefill
+            input_feed = np.stack([
+                                    np.zeros_like(batch_sizes, dtype=np.float32),  # placeholder for model name, not used in prefill model
+                                    np.zeros_like(batch_sizes, dtype=np.float32),
+                                    np.zeros_like(batch_sizes, dtype=np.float32),
+                                    np.zeros_like(batch_sizes, dtype=np.float32),
+                                    batch_sizes,
+                                    input_len_sums,
+                                    input_len_means,
+                                    input_len_stds,
+                                    tp_degrees,
+                                    freqs,
+                                ], axis=1).astype(np.float32)
+            out = latency_model.predict(input_feed)
+            out = np.exp(out)
+            out = np.clip(out, 0.005, None)
+        else:
+            latency_model = self.latency_model_decode
+            input_feed = {
+                            "model": model_col,
+                            "batch_size": batch_sizes.reshape(n_rows, 1).astype(np.float32),
+                            "input_len_sum": input_len_sums.reshape(n_rows, 1).astype(np.float32),
+                            "input_len_mean": input_len_means.reshape(n_rows, 1).astype(np.float32),
+                            "input_len_std": input_len_stds.reshape(n_rows, 1).astype(np.float32),
+                            "tp_degree": tp_degrees.reshape(n_rows, 1).astype(np.float32),
+                            "freq_mhz": freqs.reshape(n_rows, 1).astype(np.float32),
+                        }
+            out = latency_model.run(None, input_feed)[0]
+            out = np.clip(out, 0.005, None)
 
-        out = latency_model.run(None, input_feed)[0]
-
-        # Mark rows with batch_size == 0 so we can override model output after inference.
-        batch_size_col = batch_sizes.reshape(n_rows)
-        zero_mask = batch_size_col == 0
-        out[zero_mask] = 0.005
-        
-        out = np.asarray(out)
         latency_mat = out.reshape(n_states, n_freqs)
         return latency_mat
 
@@ -951,7 +960,7 @@ if __name__ == '__main__':
                                    optim_target='power',
                                    mod_interval=1,
                                    future_window=8,
-                                   engine_role='prefill',    
+                                   engine_role='decode',    
                                    tbt_sla=0.1,
                                    ttft_sla=0.6,
                                    token_budget=2048,
@@ -966,6 +975,8 @@ if __name__ == '__main__':
             waiting_queue_tokens=[1200, 1200, 1200],
             waiting_queue_pre_computed_tokens=[0, 0, 0],
             waiting_queue_wait_time=[0.15, 0.15, 0.15],
+            fromWho="scheduler",
+            batch_ID=0,
         ),
         # FreqModMsg(
         #     now=0.0,

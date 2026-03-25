@@ -79,8 +79,8 @@ def build_pipeline(role):
                                             learning_rate=0.05,
                                             l2_regularization=0.5,
                                             max_depth=None,
-                                            max_leaf_nodes=None,
-                                            min_samples_leaf=10,)
+                                            max_leaf_nodes=4095,
+                                            min_samples_leaf=20,)
 
     return Pipeline([('pre', pre), ('est', est)])
 
@@ -114,8 +114,8 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
             'est__max_iter': [200],
             'est__max_depth': [None],
             'est__l2_regularization': [0.5],
-            'est__max_leaf_nodes': [None],
-            'est__min_samples_leaf': [10],
+            'est__max_leaf_nodes': [4095],
+            'est__min_samples_leaf': [20],
         }
     else:
         param_grid = {}
