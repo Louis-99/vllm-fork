@@ -670,14 +670,14 @@ class _MPNvmlFreqModulatorServer:
         if self.engine_role == 'prefill':
             latency_model = self.latency_model_prefill
             input_feed = np.stack([
-                                    np.zeros_like(batch_sizes, dtype=np.float32),  # placeholder for model name, not used in prefill model
-                                    np.zeros_like(batch_sizes, dtype=np.float32),
-                                    np.zeros_like(batch_sizes, dtype=np.float32),
-                                    np.zeros_like(batch_sizes, dtype=np.float32),
                                     batch_sizes,
                                     input_len_sums,
                                     input_len_means,
                                     input_len_stds,
+                                    np.zeros_like(batch_sizes, dtype=np.float32),  # placeholder for model name, not used in prefill model
+                                    np.zeros_like(batch_sizes, dtype=np.float32),
+                                    np.zeros_like(batch_sizes, dtype=np.float32),
+                                    np.zeros_like(batch_sizes, dtype=np.float32),
                                     tp_degrees,
                                     freqs,
                                 ], axis=1).astype(np.float32)
