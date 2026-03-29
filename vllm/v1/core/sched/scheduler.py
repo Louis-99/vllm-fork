@@ -919,13 +919,6 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
 
-        if self.freq_modulator and \
-            self.vllm_config.kv_transfer_config and \
-            self.vllm_config.kv_transfer_config.is_kv_producer:
-            self.freq_modulator.step_update_batch_ID_end(
-                batch_ID=scheduler_output.batch_ID,
-            )
-
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
 
@@ -1165,21 +1158,6 @@ class Scheduler(SchedulerInterface):
             if num_waiting_reqs == 0:
                 return
 
-            stats = NVMLFreqModulatorStats(
-                now=now,
-                num_running_reqs=None,
-                num_waiting_reqs=len(self.waiting),
-                running_computed_tokens_list=None,
-                waiting_computed_tokens_list=waiting_computed_tokens_list,
-                running_reqs_num_tokens=None,
-                waiting_reqs_num_tokens=waiting_reqs_num_tokens,
-                running_reqs_num_time=None,
-                waiting_reqs_num_time=waiting_reqs_num_time,
-                kv_cache_usage=self.kv_cache_manager.usage,
-
-            )
-            self.freq_modulator.step_update_wait_q(
-                scheduler_stats=stats)
 
     def add_request(self, request: Request) -> None:
         self.waiting.add_request(request)

@@ -19,7 +19,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, QuantileTransformer
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, HistGradientBoostingRegressor
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import mean_absolute_error
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType, StringTensorType
@@ -62,7 +62,6 @@ def build_pipeline(role):
 
     # Choose defaults by role but allow overrides
     if role == 'prefill':
-        # est = RandomForestRegressor(n_estimators=6, random_state=42, n_jobs=-1, max_depth=20, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
         est = HistGradientBoostingRegressor(max_iter=1000,
                                             loss='absolute_error',
                                             learning_rate=0.05,
@@ -74,8 +73,14 @@ def build_pipeline(role):
                                             verbose=2,
                                             )
     elif role == 'decode':
-        # est = RandomForestRegressor(n_estimators=10, random_state=42, n_jobs=-1, max_depth=20, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
-        est = HistGradientBoostingRegressor(max_iter=100, random_state=42, monotonic_cst=[0, 0, 0, 0, 0, 0, -1])
+        est = HistGradientBoostingRegressor(max_iter=200, 
+                                            random_state=42, 
+                                            monotonic_cst=[0, 0, 0, 0, 0, 0, -1],
+                                            learning_rate=0.05,
+                                            l2_regularization=0.5,
+                                            max_depth=None,
+                                            max_leaf_nodes=4095,
+                                            min_samples_leaf=20,)
 
     return Pipeline([('pre', pre), ('est', est)])
 
@@ -92,7 +97,44 @@ def train_and_save(df, feature_cols, target_col, out_name, model_dir, convert_on
     y = df_t[target_col].astype(float)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     pipe = build_pipeline(role=role)
-    pipe.fit(X_train, y_train)
+
+    # Role-specific grid search to tune estimator hyperparameters.
+    if role == 'prefill':
+        param_grid = {
+            'est__learning_rate': [0.02, 0.05, 0.07],
+            'est__max_iter': [100, 200, 400],
+            'est__max_depth': [None, 8, 10, 12],
+            'est__l2_regularization': [0.4, 0.5, 0.6],
+            'est__max_leaf_nodes': [None, 31, 63],
+            'est__min_samples_leaf': [10, 20, 30],
+        }
+    elif role == 'decode':
+        param_grid = {
+            'est__learning_rate': [0.05],
+            'est__max_iter': [200],
+            'est__max_depth': [None],
+            'est__l2_regularization': [0.5],
+            'est__max_leaf_nodes': [4095],
+            'est__min_samples_leaf': [20],
+        }
+    else:
+        param_grid = {}
+
+    if param_grid:
+        grid = GridSearchCV(
+            pipe,
+            param_grid=param_grid,
+            scoring='neg_mean_absolute_percentage_error',
+            n_jobs=-1,
+            cv=3,
+            verbose=2,
+        )
+        grid.fit(X_train, y_train)
+        pipe = grid.best_estimator_
+        print(f"Best params for {target_col}: {grid.best_params_}")
+    else:
+        pipe.fit(X_train, y_train)
+
     y_pred = pipe.predict(X_test)
     mae = mean_absolute_error(y_test, y_pred)
     mape = (abs(y_test - y_pred) / y_test).mean() * 100
@@ -192,7 +234,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train prefill and decode latency models')
     parser.add_argument('--no-prefill', action='store_true', help='Disable training prefill model')
     parser.add_argument('--no-decode', action='store_true', help='Disable training decode model')
-    parser.add_argument('--model-dir', default=('/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/models_tree/H100'), help='Directory to store trained models')
+    parser.add_argument('--model-dir', default=('/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/models_tree_disag/H100'), help='Directory to store trained models')
     args = parser.parse_args()
 
     CSV_PATH_TP2_D = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/default_log_path/decode_latencies.csv"
@@ -201,6 +243,8 @@ def main():
     CSV_PATH_TP4_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov12_TP4_decode_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
     CSV_PATH_TP4_D2 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov19_TP4_decode_latency_largebatch/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
     CSV_PATH_TP4_D3 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov21_TP4_decoder_latency_batchgt512/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/decode_latencies.csv"
+    CSV_PATH_D1 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/distserve/decode_latencies.csv"
+    CSV_PATH_D2 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/placeonly_disag/decode_latencies.csv"
 
 
     CSV_PATH_TP2_P = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP2Prefill_1xTP2/default_log_path/prefill_latencies.csv"
@@ -211,6 +255,9 @@ def main():
     CSV_PATH_TP4_P1 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov12_TP4_prefill_latency_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/prefill_latencies.csv"
     CSV_PATH_TP4_P2 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov13_TP24_prefill_latency_smallfreq/meta-llama/Llama-3.3-70B-Instruct/H100/1xTP4Prefill_1xTP4/prefill_latencies.csv"
     CSV_PATH_TP4_P3 = "/export2/obasit/ClusterLevelServing/vllm_logs/latency_profiler_logs/profiler_logs_Nov25_prefill_chunked2k_profiling/tp4/prefill_latencies.csv"
+    CSV_PATH_P1 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/distserve/prefill_latencies.csv"
+    CSV_PATH_P2 = "/export2/obasit/ClusterLevelServing/vllm_logs/4_nodes_logs_together_ai/kube_results/profiler_logs_0/placeonly_disag/prefill_latencies.csv"
+
 
     MODEL_DIR = os.path.join(args.model_dir)
 
@@ -247,7 +294,11 @@ def main():
         print(f"prefill samples {len(df_p41.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_P1}")
         print(f"prefill samples {len(df_p42.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_P2}")
         print(f"prefill samples {len(df_p43.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_P3}")
-        df_prefill = pd.concat([df_p2, df_p21, df_p22, df_p23, df_p4, df_p41, df_p42, df_p43], ignore_index=True).dropna(subset=[PREFILL_TARGET]+PREFILL_FEATURE_COLS)
+        df_p_t1 = load_and_prepare(CSV_PATH_P1, 'Llama-3.3-70B-Instruct', numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        df_p_t2 = load_and_prepare(CSV_PATH_P2, 'Llama-3.3-70B-Instruct', numeric_cols=PREFILL_FEATURE_COLS + [PREFILL_TARGET])
+        print(f"prefill samples {len(df_p_t1.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_P1}")
+        print(f"prefill samples {len(df_p_t2.get(PREFILL_TARGET, pd.Series()).dropna())} from {CSV_PATH_P2}")
+        df_prefill = pd.concat([df_p2, df_p21, df_p22, df_p23, df_p4, df_p41, df_p42, df_p43, df_p_t1, df_p_t2], ignore_index=True).dropna(subset=[PREFILL_TARGET]+PREFILL_FEATURE_COLS)
         df_prefill = filter_inputs(df_prefill)
         df_prefill.to_csv(os.path.join(MODEL_DIR, 'prefill_cleaned.csv'), index=False)
         stats_prefill = train_and_save(df_prefill, PREFILL_FEATURE_COLS, PREFILL_TARGET, PREFILL_OUT, MODEL_DIR, convert_onnx=True, role='prefill')
@@ -269,7 +320,11 @@ def main():
         print(f"Decode samples {len(df_d41.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D1}")
         print(f"Decode samples {len(df_d42.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D2}")
         print(f"Decode samples {len(df_d43.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_TP4_D3}")
-        df_decode = pd.concat([df_d2, df_d21, df_d4, df_d41, df_d42, df_d43], ignore_index=True).dropna(subset=[DECODE_TARGET]+DECODE_FEATURE_COLS)
+        df_d1 = load_and_prepare(CSV_PATH_D1, 'Llama-3.3-70B-Instruct', numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
+        df_d2 = load_and_prepare(CSV_PATH_D2, 'Llama-3.3-70B-Instruct', numeric_cols=DECODE_FEATURE_COLS + [DECODE_TARGET])
+        print(f"Decode samples {len(df_d1.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_D1}")
+        print(f"Decode samples {len(df_d2.get(DECODE_TARGET, pd.Series()).dropna())} from {CSV_PATH_D2}")
+        df_decode = pd.concat([df_d2, df_d21, df_d4, df_d41, df_d42, df_d43, df_d1, df_d2], ignore_index=True).dropna(subset=[DECODE_TARGET]+DECODE_FEATURE_COLS)
         df_decode = filter_inputs(df_decode)
         df_decode.to_csv(os.path.join(MODEL_DIR, 'decode_cleaned.csv'), index=False)
         stats_decode = train_and_save(df_decode, DECODE_FEATURE_COLS, DECODE_TARGET, DECODE_OUT, MODEL_DIR, convert_onnx=True, role='decode')

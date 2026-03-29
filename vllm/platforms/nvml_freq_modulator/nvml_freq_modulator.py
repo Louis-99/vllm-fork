@@ -83,14 +83,6 @@ class NvmlFreqModulatorInterface(ABC):
              scheduler_stats: Optional[NVMLFreqModulatorStats],) -> None:
         ...
     
-    @abstractmethod
-    def step_update_wait_q(self,
-                             scheduler_stats: Optional[NVMLFreqModulatorStats],) -> None:
-        ...
-
-    def step_update_batch_ID_end(self,
-                                 batch_ID: int) -> None:
-        ...
 
     @abstractmethod
     def close(self):
@@ -179,7 +171,7 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
             freq_choices: list[int],
             log_dir: Path,
             mod_interval: int = 1,
-            future_window: int = 8,
+            future_window: int = 1,
             tbt_sla: float = 0.1,
             ttft_sla: float = 0.6,
             optim_target: str = 'power',  # 'energy' or 'power'factory
@@ -224,37 +216,6 @@ class MPNvmlFreqModulatorClient(NvmlFreqModulatorInterface):
             msg_encoded = msgspec.msgpack.encode(msg)
             self.q.put(msg_encoded)
 
-    def step_update_wait_q(self,
-             scheduler_stats: NVMLFreqModulatorStats) -> None:
-        if self.stat_buffer is None:
-            return
-        with self.stat_buffer_lock:
-            time_elapsed = scheduler_stats.now - self.stat_buffer.now
-            scheduler_stats.num_running_reqs = self.stat_buffer.num_running_reqs
-            scheduler_stats.running_computed_tokens_list = self.stat_buffer.running_computed_tokens_list
-            scheduler_stats.running_reqs_num_tokens = self.stat_buffer.running_reqs_num_tokens
-            scheduler_stats.running_reqs_num_time = [x + time_elapsed for x in self.stat_buffer.running_reqs_num_time]
-            scheduler_stats.batch_ID = self.stat_buffer.batch_ID
-        msg = self.build_msg(scheduler_stats, fromWho="request_update")
-        msg_encoded = msgspec.msgpack.encode(msg)
-        self.q.put(msg_encoded)
-
-    def step_update_batch_ID_end(self,
-                                 batch_ID: int) -> None:
-        msg = FreqModMsg(
-            now = time.time(),
-            running_queue_tokens = [],
-            running_queue_pre_computed_tokens = [],
-            running_queue_wait_time = [],
-            kv_cache_usage = 0.0,
-            waiting_queue_tokens = [],
-            waiting_queue_pre_computed_tokens = [],
-            waiting_queue_wait_time = [],
-            fromWho="request_end",
-            batch_ID=batch_ID,
-        )
-        msg_encoded = msgspec.msgpack.encode(msg)
-        self.q.put(msg_encoded)
 
     def close(self):
         self.q.put(None)
@@ -372,11 +333,6 @@ class _MPNvmlFreqModulatorServer:
                                                      type=FreqModMsg)
             # logger.info('freq_mod_msg: %s', msg)
             logger.debug('freq_mod_msg: %s', msg)
-            if msg.fromWho == "request_end":
-                with self.underprediction_lock:
-                    if msg.batch_ID > self.last_finished_ID:
-                        self.last_finished_ID = msg.batch_ID
-                continue
 
             future_states, prefill_cycles = self.get_future_states(
                 msg, self.future_windows)
@@ -394,12 +350,6 @@ class _MPNvmlFreqModulatorServer:
                     self.last_applied_freq = selected_freq
 
             freq_mod_end = time.perf_counter()
-            if self.engine_role == 'prefill':
-                timer_to_check_underpred = threading.Timer(float(pred_batch_lat+0.005),
-                                                           self.check_underprediction, 
-                                                           args=(msg.batch_ID,))
-                timer_to_check_underpred.daemon = True
-                timer_to_check_underpred.start()
 
             
             self.csv_writer.add_row([
@@ -417,21 +367,6 @@ class _MPNvmlFreqModulatorServer:
                     msg.waiting_queue_wait_time) > 0 else 0.0,
             ])
         self.csv_writer.close()
-
-    def check_underprediction(self, ID: int,):
-        """
-        Check if the latency model underpredicted the actual latency.
-        If yes, update the last known state for future corrections.
-        """
-        with self.underprediction_lock:
-            if (self.last_finished_ID >= ID):
-                # The running queue has changed since we set the timer.
-                # Skip this check.
-                return
-            if self.last_applied_freq is not max(self.freq_choices):
-                self.set_frequency_manager(max(self.freq_choices), time.time())
-                self.last_applied_freq = max(self.freq_choices)
-                logger.info('Underprediction detected, applied max freq')
 
     def _get_next_freq(self, freq_mod_msg: FreqModMsg,
                           future_states: list[FutureState], prefill_cycles):
@@ -959,11 +894,11 @@ if __name__ == '__main__':
                                    log_dir=Path('./logs'),
                                    optim_target='power',
                                    mod_interval=1,
-                                   future_window=8,
+                                   future_window=1,
                                    engine_role='prefill',    
                                    tbt_sla=0.1,
                                    ttft_sla=0.6,
-                                   token_budget=2048,
+                                   token_budget=1024,
                                    )
     msg = [
         FreqModMsg(
@@ -978,36 +913,42 @@ if __name__ == '__main__':
             fromWho="scheduler",
             batch_ID=0,
         ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[200, 512],
-        #     running_queue_pre_computed_tokens=[0, 0],
-        #     running_queue_wait_time=[0.001, 0.002],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[1200],
-        #     waiting_queue_pre_computed_tokens=[0],
-        #     waiting_queue_wait_time=[0.15],
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[16],
-        #     running_queue_pre_computed_tokens=[0],
-        #     running_queue_wait_time=[0.001],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[],
-        #     waiting_queue_pre_computed_tokens=[],
-        #     waiting_queue_wait_time=[],
-        # ),
-        # FreqModMsg(
-        #     now=0.0,
-        #     running_queue_tokens=[1024, 512],
-        #     running_queue_pre_computed_tokens=[520, 0],
-        #     running_queue_wait_time=[0.01, 0.02],
-        #     kv_cache_usage=0.1,
-        #     waiting_queue_tokens=[1200, 1200, 1200, 777, 666, 555, 888],
-        #     waiting_queue_pre_computed_tokens=[0, 0, 0, 0, 0, 0, 0],
-        #     waiting_queue_wait_time=[0.11, 0.12, 0.13, 0.13, 0.14, 0.157, 0.20],
-        # ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[200, 512],
+            running_queue_pre_computed_tokens=[0, 0],
+            running_queue_wait_time=[0.001, 0.002],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[1200],
+            waiting_queue_pre_computed_tokens=[0],
+            waiting_queue_wait_time=[0.15],
+            fromWho="scheduler",
+            batch_ID=0,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[16],
+            running_queue_pre_computed_tokens=[0],
+            running_queue_wait_time=[0.001],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[],
+            waiting_queue_pre_computed_tokens=[],
+            waiting_queue_wait_time=[],
+            fromWho="scheduler",
+            batch_ID=0,
+        ),
+        FreqModMsg(
+            now=0.0,
+            running_queue_tokens=[1024, 512],
+            running_queue_pre_computed_tokens=[520, 0],
+            running_queue_wait_time=[0.01, 0.02],
+            kv_cache_usage=0.1,
+            waiting_queue_tokens=[1200, 1200, 1200, 777, 666, 555, 888],
+            waiting_queue_pre_computed_tokens=[0, 0, 0, 0, 0, 0, 0],
+            waiting_queue_wait_time=[0.11, 0.12, 0.13, 0.13, 0.14, 0.157, 0.20],
+            fromWho="scheduler",
+            batch_ID=0,
+        ),
         ]
     for i in range(len(msg)):
         q.put(msgspec.msgpack.encode(msg[i]))
