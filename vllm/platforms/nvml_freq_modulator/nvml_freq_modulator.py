@@ -161,7 +161,7 @@ def nvml_freq_modulator(config: VllmConfig,
         mod_interval=1,
         log_dir=Path(config.log_dir),
         tbt_sla=0.095,
-        ttft_sla=0.54,
+        ttft_sla=0.53,
         optim_target='power',
     )
 
