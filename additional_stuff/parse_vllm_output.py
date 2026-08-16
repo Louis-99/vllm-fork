@@ -75,6 +75,7 @@ def calc_perf_stats(expr_dir: Path) -> PerfStats:
     decode_energy = sum(p.energy_j for k, p in perfstats_list if "decode" in k)
 
     total_power_df = build_cluster_power_series(total_power_samples)
+    total_power_df.to_csv(expr_dir / 'total_power.csv', index=False)
     if not total_power_df.empty:
         total_power_mean = float(total_power_df['power_w'].mean())
         total_power_p99 = float(percentile_or_nan(total_power_df['power_w'].to_numpy(), q=99))
