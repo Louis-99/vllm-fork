@@ -21,6 +21,8 @@ class PerfStats:
     tpot_p90: float
     tpot_p99: float
     power_w: float
+    power_mean: float
+    power_p99: float
     energy_j: float
     energy_per_token: float
     energy_prefill: float
@@ -49,12 +51,16 @@ def calc_perf_stats(expr_dir: Path) -> PerfStats:
     perfstats_list = []
     ttft_list = []
     tpot_list = []
+    total_power_samples = []
     for k, v in raw_logs_dict_steady.items():
         decode, prefill, power = v
         perfstats, ttft, tpot = calc_perf_stats_single_instance(k, decode, prefill, power)
         perfstats_list.append((k, perfstats))
         ttft_list = ttft + ttft_list
         tpot_list = tpot + tpot_list
+        power_samples = summed_power_by_timestamp(power)
+        if not power_samples.empty:
+            total_power_samples.append(power_samples)
         
     total_xput = sum(p.throughput_rps for k, p in perfstats_list if "prefill" in k)
     total_requests = sum(p.num_requests for k, p in perfstats_list if "prefill" in k)
@@ -68,6 +74,14 @@ def calc_perf_stats(expr_dir: Path) -> PerfStats:
     decode_decodes = sum(p.num_tokens_decoded for k, p in perfstats_list if "decode" in k)
     decode_energy = sum(p.energy_j for k, p in perfstats_list if "decode" in k)
 
+    total_power_df = build_cluster_power_series(total_power_samples)
+    if not total_power_df.empty:
+        total_power_mean = float(total_power_df['power_w'].mean())
+        total_power_p99 = float(percentile_or_nan(total_power_df['power_w'].to_numpy(), q=99))
+    else:
+        total_power_mean = np.nan
+        total_power_p99 = np.nan
+
     total_perfstats = PerfStats(
         throughput_rps=total_xput,
         ttft_mean=np.mean(ttft_list),
@@ -77,6 +91,8 @@ def calc_perf_stats(expr_dir: Path) -> PerfStats:
         tpot_p90=np.percentile(tpot_list, 90),
         tpot_p99=np.percentile(tpot_list, 99),
         power_w=total_energy / total_duration,
+        power_mean=total_power_mean,
+        power_p99=total_power_p99,
         energy_j=total_energy,
         energy_prefill=prefill_energy,
         energy_decode=decode_energy,
@@ -138,13 +154,16 @@ def calc_perf_stats_single_instance(root_name: str,
     freq_arr_list = []
     # Sum energy across all GPU_i_power_w columns
     energy_j_steady = 0.0
+    power_samples = summed_power_by_timestamp(df_power_steady)
     for col in df_power_steady.columns:
         if col.startswith('GPU_') and col.endswith('_power_w'):
-            energy_j_steady += np.trapezoid(
+            energy_j_steady += np.trapz(
                 df_power_steady[col], df_power_steady['Timestamp'])
         if col.startswith('GPU_') and col.endswith('_freq_mhz'):
             freq_arr_list.append(df_power_steady[col].to_numpy())
     power_w = energy_j_steady / duration
+    power_mean = float(power_samples['power_w'].mean()) if not power_samples.empty else np.nan
+    power_p99 = float(percentile_or_nan(power_samples['power_w'].to_numpy(), q=99)) if not power_samples.empty else np.nan
 
     # unique request IDs = num requests served
     # prefer prefill as prefill df is filled when chunked prefill is used
@@ -241,6 +260,8 @@ def calc_perf_stats_single_instance(root_name: str,
         decode_energy_per_token=0,
         avg_req_len=avg_req_len,
         p99_req_len=p99_req_len,
+        power_mean=power_mean,
+        power_p99=power_p99,
     ), ttft_list, tpot_list
 
 def percentile_or_nan(a, q):
@@ -248,6 +269,57 @@ def percentile_or_nan(a, q):
         return np.percentile(a, q)
     else:
         return np.nan
+
+
+def summed_power_by_timestamp(df_power: pd.DataFrame) -> pd.DataFrame:
+    if df_power.empty:
+        return pd.DataFrame(columns=['Timestamp', 'power_w'])
+
+    power_cols = [
+        col for col in df_power.columns
+        if col.startswith('GPU_') and col.endswith('_power_w')
+    ]
+    if not power_cols:
+        return pd.DataFrame(columns=['Timestamp', 'power_w'])
+
+    total_power = df_power[['Timestamp'] + power_cols].copy()
+    total_power['power_w'] = total_power[power_cols].sum(axis=1)
+    return total_power[['Timestamp', 'power_w']]
+
+
+def build_cluster_power_series(power_samples_list: list[pd.DataFrame]) -> pd.DataFrame:
+    if not power_samples_list:
+        return pd.DataFrame(columns=['Timestamp', 'power_w'])
+
+    prepared_series = []
+    for power_samples in power_samples_list:
+        if power_samples.empty:
+            continue
+        series = power_samples.sort_values('Timestamp').groupby('Timestamp', as_index=False)['power_w'].mean()
+        if not series.empty:
+            prepared_series.append(series)
+
+    if not prepared_series:
+        return pd.DataFrame(columns=['Timestamp', 'power_w'])
+
+    base_index = max(range(len(prepared_series)), key=lambda idx: len(prepared_series[idx]))
+    aligned_power = prepared_series[base_index].rename(columns={'power_w': 'power_w_0'}).copy()
+
+    next_col_idx = 1
+    for idx, series in enumerate(prepared_series):
+        if idx == base_index:
+            continue
+        aligned_power = pd.merge_asof(
+            aligned_power.sort_values('Timestamp'),
+            series.sort_values('Timestamp').rename(columns={'power_w': f'power_w_{next_col_idx}'}),
+            on='Timestamp',
+            direction='nearest',
+        )
+        next_col_idx += 1
+
+    power_cols = [col for col in aligned_power.columns if col.startswith('power_w_')]
+    aligned_power['power_w'] = aligned_power[power_cols].sum(axis=1)
+    return aligned_power[['Timestamp', 'power_w']]
 
 def load_logs(expr_dir: Path) -> dict:
     logs = {}
