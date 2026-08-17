@@ -160,7 +160,7 @@ def nvml_freq_modulator(config: VllmConfig,
         freq_choices=freq_choices,
         mod_interval=1,
         log_dir=Path(config.log_dir),
-        tbt_sla=0.095,
+        tbt_sla=0.045,
         ttft_sla=0.53,
         optim_target='power',
     )
@@ -961,7 +961,7 @@ if __name__ == '__main__':
                                    mod_interval=1,
                                    future_window=8,
                                    engine_role='prefill',    
-                                   tbt_sla=0.1,
+                                   tbt_sla=0.05,
                                    ttft_sla=0.6,
                                    token_budget=2048,
                                    )
