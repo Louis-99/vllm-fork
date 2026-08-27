@@ -289,8 +289,8 @@ class _MPNvmlFreqModulatorServer:
         self.dynamic_tbt_sla = tbt_sla       # starts at max
         self._last_batch_end_time: Optional[float] = None
         # AIMD parameters
-        self._aimd_additive_step = (tbt_sla - self.tbt_sla_min) / 500.0  # additive increase step 
-        self._aimd_mult_decrease = float(1/1.6)       # multiplicative decrease factor on violation 
+        self._aimd_additive_step = (tbt_sla - self.tbt_sla_min) / float(os.environ.get('AIMD_A', 500.0))  # additive increase step
+        self._aimd_mult_decrease = float(1 / float(os.environ.get('AIMD_M', 1.6)))       # multiplicative decrease factor on violation
         self._last_violation: float = 0.0    # last violation indicator (for logging)
 
 
